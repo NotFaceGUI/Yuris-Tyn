@@ -19,7 +19,7 @@ yuris-kernel/
 │   ├── yuris-format/           # L0+L1：YPF / YSTB / YSCF / YSCM / XOR / zlib
 │   ├── yuris-value/            # Value 类型 + 变量存储
 │   ├── yuris-script/           # L2：变长字节码 → Instruction IR
-│   ├── yuris-expr/             # 表达式：Token → AST → Evaluator
+│   ├── (yuris-expr 已于 2026-10-18 删除：13 行骨架、零依赖；表达式由 yuris-script 承担)
 │   ├── yuris-vm/               # L3：PC / 栈 / 调用栈 / 挂起恢复
 │   ├── yuris-scene/            # L5：Scene / Layer / 动画状态（纯数据）
 │   ├── yuris-resource/         # 资源管理器：懒加载 + LRU
@@ -59,7 +59,7 @@ yuris-kernel/
 | 你的提案 | 本设计 | 理由 |
 |---|---|---|
 | — | **新增 `yuris-value`** | Value 系统 + 变量存储被 VM / Expr / Scene / Save 四处依赖，独立成 crate 避免循环依赖 |
-| — | **新增 `yuris-expr`** | 你的第 9 条要求表达式引擎独立。它是纯函数式求值器，无 VM 依赖，可单独测试 |
+| — | **新增 `yuris-expr`** | 你的第 9 条要求表达式引擎独立。它是纯函数式求值器，无 VM 依赖，可单独测试。**2026-10-18 已删除**（13 行骨架、零依赖；见 PROGRESS 成果 192） |
 | `yuris-core` | 收窄为「错误 + 版本 Profile + 字节工具」 | 不承载业务逻辑，保持稳定 |
 | `yuris-render/audio/input` | 定位为 **Backend 实现**，trait 放 `yuris-runtime` | 保证依赖单向：`render → runtime`，而不是互相依赖 |
 | `yuris-tools` 与 `yuris-cli` 并列 | 保留 | tools 面向开发（无 GUI），cli 面向运行 |
@@ -325,6 +325,8 @@ pub struct OpcodeSpec {
 ```
 
 ### 3.5 `yuris-expr`
+
+> **已删除(2026-10-18,成果 192)**:本节为原始设计记录,保留以存史;该 crate 已从 workspace 移除。
 
 ```rust
 pub enum Expr {

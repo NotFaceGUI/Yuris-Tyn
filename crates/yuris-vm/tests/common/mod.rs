@@ -1,5 +1,9 @@
 //! 测试共用工具:合成 YSTB 构造。
-use yuris_format::ystb::YstbFile;
+//!
+//! 本模块被多个测试二进制各自编译,每个文件只用到其中一部分 ⇒
+//! 「never used」在这里是假阳性(2026-10-18 清理告警时确认),统一允许。
+
+#![allow(dead_code)]
 
 /// 构造一个最小 YSTB:header + part1(命令组表) + commands(窗口表) +
 /// content + part4,各区独立 `key[i % 4]` XOR(编译器 004160ac 分区模型)。

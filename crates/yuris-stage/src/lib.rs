@@ -56,14 +56,6 @@ pub fn fnv1a(b: &[u8]) -> u64 {
 /// 精确值待 `FONT`/文本子系统取证(U27);此处只锁**相对档位**。
 pub const TEXT_Z: i64 = 1500;
 
-/// `YURIS_TRACE_STAGE` 门控(层属性/批提交流水;成果 161 的取证仪器)。
-///
-/// **热路径**:批内每条命令都会问一次 —— 环境进程内不变,进程级快照。
-pub(crate) fn trace_stage_enabled() -> bool {
-    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| std::env::var_os("YURIS_TRACE_STAGE").is_some())
-}
-
 /// `YURIS_TRACE_BLIT` 门控(BlitSize 失败/缺源诊断;**缺省静默**)。
 ///
 /// 这两条以前是无门控 `trace_forced!`:boot 期每帧数百条 `format!`,

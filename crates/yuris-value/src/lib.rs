@@ -548,6 +548,7 @@ fn watch_site() -> String {
 }
 
 #[derive(Debug, Clone)]
+/// 变量存储:标量按 id 直接索引,字符串/数组走辅助表(见各字段)。
 pub struct VariableStore {
     /// **标量:按 id 直接索引**(`vars[id]`)。
     ///

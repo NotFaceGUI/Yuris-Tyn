@@ -8,7 +8,6 @@
 
 use yuris_format::yscm::YscmTable;
 use yuris_vm::host::{ScriptHost, YpfScriptHost};
-use yuris_script::Insn;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -36,7 +35,7 @@ fn main() {
     let pack = packs
         .iter()
         .find(|p| {
-            let Ok(mut h) = YpfScriptHost::open(p) else { return false };
+            let Ok(h) = YpfScriptHost::open(p) else { return false };
             h.entry_names()
                 .iter()
                 .any(|e| e.to_ascii_lowercase().ends_with(r"ysbin\ysl.ybn"))

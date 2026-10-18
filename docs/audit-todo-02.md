@@ -110,8 +110,8 @@
 ## P2 —— 结构/工程
 
 ### T27. `yuris-expr` 死 crate + 死依赖
-- **状态:依赖边已断(成果 150,2026-10-16)**;crate 目录保留待主人审阅
-  (未删文件,只在 `yuris-vm/Cargo.toml` 断依赖 + 留注释)。
+- **状态:✅ 已关闭(2026-10-18,成果 192)**——依赖边早于成果 150 断开;crate 目录与
+  workspace/workspace.dependencies 条目已在成果 192 一并删除。
 - **审查发现**:`yuris-expr` 仅 13 行骨架;`yuris-vm/Cargo.toml:18` 声明依赖但 `src/` 零使用
   (`grep yuris_expr` 0 命中)。表达式实际由 `yuris-script` 承担。
 - **动作**:删依赖与 crate(或留壳但在 workspace 注明 unused)——纯搬运级清理。

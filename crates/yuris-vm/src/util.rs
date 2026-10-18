@@ -244,6 +244,9 @@ pub(crate) fn value_truthy(v: &Value) -> Result<bool> {
 }
 
 
+/// 把窗口内属于**声明族**的命令应用到变量存储(数组维数/字符串初值),返回消费条数。
+///
+/// 当前按「命令名是否属声明族」判族(见 PROGRESS 成果 190 的残余说明)。
 pub fn consume_declarations_into(
     store: &mut yuris_value::VariableStore,
     ctx: &ScriptCtx,

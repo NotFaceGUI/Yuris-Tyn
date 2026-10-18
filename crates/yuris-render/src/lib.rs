@@ -202,7 +202,6 @@ pub struct WgpuBackend {
     pipeline_layout: wgpu::PipelineLayout,
     shader: wgpu::ShaderModule,
     color_format: wgpu::TextureFormat,
-    uniform_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
     aux_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -229,6 +228,9 @@ pub struct WgpuBackend {
     /// 图层组的离屏合成目标缓存(成果 134;键 = 源层 id)。
     group_targets: HashMap<u64, GroupTarget>,
     /// 组的图像尺寸缓存(供 `draw_layer` 之后按组尺寸算变换)。
+    ///
+    /// **当前无读者**(2026-10-18 清理告警时发现):组的变换改由 `group_targets` 承担。
+    #[allow(dead_code)]
     group_dims: HashMap<u64, (u32, u32)>,
 }
 
@@ -418,14 +420,14 @@ impl WgpuBackend {
             view_formats: &[],
         });
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &white,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &[255u8, 255, 255, 255],
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4),
                 rows_per_image: Some(1),
@@ -462,7 +464,6 @@ impl WgpuBackend {
             pipeline_layout,
             shader,
             color_format: format,
-            uniform_layout,
             texture_layout,
             aux_layout,
             sampler,
@@ -795,8 +796,8 @@ mod letterbox_tests {
             ] {
                 let m = letterbox_matrix(lw, lh, w, h);
                 let (x0, y0) = apply(&m, 0.0, 0.0);
-                let (x1, y1) = apply(&m, 100.0, 0.0);
-                let (x2, y2) = apply(&m, 0.0, 100.0);
+                let (x1, _y1) = apply(&m, 100.0, 0.0);
+                let (_x2, y2) = apply(&m, 0.0, 100.0);
                 let px_x = (x1 - x0) * w / 2.0;
                 let px_y = (y2 - y0) * h / 2.0;
                 // Y 翻转 → 比较幅值
@@ -923,7 +924,7 @@ impl GraphicsBackend for WgpuBackend {
         // 基准矩阵**,uniform 可以共享(一次 write_buffer 仍然成立)。
         // SX/SY 的范围遮罩语义未取证到像素级(挂号 G13),此处不近似。
         let mut group_ids: Vec<u64> = Vec::new();
-        let mut push_g = |v: &mut Vec<u64>, id: u64| {
+        let push_g = |v: &mut Vec<u64>, id: u64| {
             if !v.contains(&id) {
                 v.push(id);
             }
@@ -964,7 +965,7 @@ impl GraphicsBackend for WgpuBackend {
         // 图层下标 → draw 下标(同层在「组 pass」与「顶层 pass」复用它)。
         let mut draw_of: HashMap<usize, usize> = HashMap::new();
         let mut skipped_blend = 0usize;
-        let mut skipped_no_tex = 0usize;
+        let skipped_no_tex = 0usize;
         let mut slot = 0usize;
         for (li, layer) in layers.iter().enumerate() {
             // 纹理来源:别名(COPY/COPY2)> 直接素材 > 组的合成结果。
@@ -1396,14 +1397,14 @@ impl WgpuBackend {
             view_formats: &[],
         });
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &rgba[..],
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * w),
                 rows_per_image: Some(h),
@@ -1577,15 +1578,15 @@ impl WgpuBackend {
                 label: Some("yuris-render offscreen copy"),
             });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded),
                     rows_per_image: Some(h),

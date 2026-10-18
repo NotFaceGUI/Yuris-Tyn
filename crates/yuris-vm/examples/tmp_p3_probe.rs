@@ -10,7 +10,7 @@ fn main() {
     let pac = std::path::Path::new(&dir).join("pac");
 
     let mut cgsys = YpfReader::open(&pac.join("cgsys_ec.ypf"), 0xC9).unwrap();
-    let mut cg = YpfReader::open(&pac.join("cg.ypf"), 0xC9).unwrap();
+    let cg = YpfReader::open(&pac.join("cg.ypf"), 0xC9).unwrap();
 
     // ---- 计数(包内名为反斜杠分隔 + 虚拟根前缀) ----
     let names: Vec<String> = cgsys

@@ -6,7 +6,6 @@ members = [
     "crates/yuris-format",
     "crates/yuris-value",
     "crates/yuris-script",
-    "crates/yuris-expr",
     "crates/yuris-vm",
     "crates/yuris-scene",
     "crates/yuris-resource",
@@ -18,7 +17,6 @@ members = [
     "crates/yuris-scenario",
     "crates/yuris-stage",
     "crates/yuris-tools",
-    "crates/yuris-debug",
     "crates/yuris-player-core",
     "crates/yuris-cli",
 ]
@@ -42,7 +40,6 @@ yuris-log      = { path = "crates/yuris-log" }
 yuris-format   = { path = "crates/yuris-format" }
 yuris-value    = { path = "crates/yuris-value" }
 yuris-script   = { path = "crates/yuris-script" }
-yuris-expr     = { path = "crates/yuris-expr" }
 yuris-vm       = { path = "crates/yuris-vm" }
 yuris-scene    = { path = "crates/yuris-scene" }
 yuris-resource = { path = "crates/yuris-resource" }
@@ -52,7 +49,8 @@ yuris-audio    = { path = "crates/yuris-audio" }
 yuris-input    = { path = "crates/yuris-input" }
 yuris-save     = { path = "crates/yuris-save" }
 yuris-scenario = { path = "crates/yuris-scenario" }
-yuris-debug    = { path = "crates/yuris-debug" }
+yuris-stage    = { path = "crates/yuris-stage" }
+yuris-player-core = { path = "crates/yuris-player-core" }
 
 # --- externals ---
 thiserror          = "2"

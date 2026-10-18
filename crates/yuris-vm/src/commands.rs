@@ -486,6 +486,7 @@ impl CommandDispatch {
             .cloned()
     }
 
+    /// 命令序号 → 命令名(按当前分派表 = 游戏自身 `ysc.ybn` 口径)。
     pub fn name_of(&self, index: u16) -> Option<&str> {
         self.profile.name_of(index)
     }

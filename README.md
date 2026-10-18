@@ -32,7 +32,6 @@ Cargo workspace,18 个 crate 按层次划分:
 | L0/L1 | `yuris-format` | YPF 封包 / YSTB / YSCF / YSCM / YSER / YSSD+SNP 格式解码 |
 | L2 | `yuris-script` | 变长 VM 字节码 → `Instruction` IR |
 | L3 | `yuris-vm` | 组级执行 VM:PC、帧、GOSUB/LOOP、系统变量、挂起恢复 |
-| L3 | `yuris-expr` | 表达式引擎(Token → AST → Evaluator) |
 | L3 | `yuris-value` | INT/FLT/STR 三类型语义与变量存储 |
 | L4 | `yuris-runtime` | RuntimeApi / Graphics / Audio / Input / Storage 后端 trait |
 | L5 | `yuris-scene` | Scene / Layer / Animation 纯状态模型 |

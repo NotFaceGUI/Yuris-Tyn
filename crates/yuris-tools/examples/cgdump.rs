@@ -103,7 +103,7 @@ fn main() {
                     // 靠 COPY/TEXSSCOPY/SETSTR 等槽从别处搬过来,这里逐槽打全。
                     let fx: Vec<String> = effects
                         .iter()
-                        .map(|(slot, pname, v)| match v {
+                        .map(|(_slot, pname, v)| match v {
                             yuris_vm::EffectValue::Int(n) => format!("{pname}={n}"),
                             yuris_vm::EffectValue::Float(f) => format!("{pname}={f}"),
                             yuris_vm::EffectValue::Str(t) => format!("{pname}={t:?}"),

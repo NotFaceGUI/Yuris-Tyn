@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use yuris_format::yslb::YslbTable;
-use yuris_vm::host::{ScriptHost, YpfScriptHost, is_script_entry};
+use yuris_vm::host::{YpfScriptHost, is_script_entry};
 
 fn main() {
     let mut args = std::env::args().skip(1);

@@ -14,7 +14,7 @@ use yuris_format::ypf::{YpfIndex, YpfReader};
 fn main() {
     let mut args = std::env::args().skip(1);
     let dir = std::path::PathBuf::from(args.next().expect("usage: boot_probe <游戏目录> [key_hex]"));
-    let key_given = args
+    let _key_given = args
         .next()
         .map(|s| u8::from_str_radix(s.trim_start_matches("0x"), 16).unwrap());
 

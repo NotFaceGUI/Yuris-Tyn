@@ -53,7 +53,6 @@ pub use commands::{CmdKind, CommandDispatch, DeclElem};
 pub use input::{EngineInputSettings, InputSnapshot};
 pub(crate) use event::GoOutcome;
 pub use event::{event_json, EffectValue, JumpKind, ResumeResponse, VmEvent, VmState, VmSuspend};
-pub(crate) use exec::Action;
 pub use util::consume_declarations_into;
 pub(crate) use util::mstring;
 pub(crate) use util::VarTarget;
@@ -530,8 +529,6 @@ pub struct GroupVm {
     pending_effects: Vec<crate::task::Effect>,
     /// 窗口切片复用缓冲(稳态零分配)。
     windows_buf: Vec<yuris_format::ystb::CommandSlot>,
-    /// 指令解码复用缓冲。
-    insn_buf: Vec<yuris_script::insn::Instruction>,
     /// 窗口字节复用缓冲。
     bytes_buf: Vec<u8>,
     /// **求值槽位缓冲**（跨调用存活 ⇒ 稳态零分配）。
@@ -686,6 +683,9 @@ pub struct GroupVm {
     /// 必须按实例去重：`GO` 未命中会**每帧重入**（脚本停在原 pc 上继续跑），
     /// 旧实现每次 `alert!` 都同步写 stderr —— 一次 3.3MB 包的启动链里
     /// 实测把帧率压到个位数（每帧几十条横幅 × 终端写锁）。
+    // **当前无读者**(2026-10-18 清理告警时发现):label 未命中去重当前由上方几个
+    // 集合承担。保留字段与上述帧率依据,待确认后删除。
+    #[allow(dead_code)]
     label_miss_alerted: std::cell::RefCell<std::collections::HashSet<(u16, usize)>>,
     /// **未建模参数槽告警去重集**:每 `(命令下标, 槽号)` 只打一次。
     unknown_slot_warned: std::cell::RefCell<std::collections::HashSet<(u8, u8)>>,
@@ -891,7 +891,6 @@ impl GroupVm {
             task_names: Vec::new(),
             pending_effects: Vec::new(),
             windows_buf: Vec::new(),
-            insn_buf: Vec::new(),
             bytes_buf: Vec::new(),
             slot_scratch: Vec::new(),
             insn_cache: rustc_hash::FxHashMap::default(),
@@ -1263,12 +1262,12 @@ impl GroupVm {
         self.host = Some(host);
     }
 
-    /// 注入游戏虚拟 FS 存在性索引(FILEINFO EXIST 查询用;P5.2)。
     /// 注入光标逻辑坐标(@133/@138;播放器每帧调用,P9.2)。
     pub fn set_input_cursor(&mut self, x: i64, y: i64) {
         self.input_cursor = (x, y);
     }
 
+    /// 注入游戏虚拟 FS 存在性索引(FILEINFO EXIST 查询用;P5.2)。
     pub fn set_file_probe(&mut self, probe: std::sync::Arc<crate::host::PacFileIndex>) {
         self.file_probe = Some(probe);
     }
@@ -1625,7 +1624,7 @@ impl GroupVm {
         let prefix: u8 = match e.ty {
             1 | 2 => 0x40, // INT/FLT -> @
             3 | 0 => 0x24, // STR -> $
-            other => {
+            _other => {
                 return Err(Error::Unimplemented("YSVR 条目类型 Unknown(不猜)"));
             }
         };
@@ -2186,7 +2185,7 @@ impl GroupVm {
                 locals.set_elem(&r, &[*slot as i64], Value::Str(v.to_vec()))?;
             }
         }
-        let from = self.pc;
+        let _from = self.pc;
         let from_script = self.ctx.script_id;
         self.frames.push(GosubFrame {
             return_pc: usize::MAX,
@@ -2537,36 +2536,16 @@ impl GroupVm {
         }
     }
 
-    /// **窗口解码缓存**(成果 184):`(offset,len)` → 已解码指令。
+    /// **窗口 → 已解码指令**(缓存优先,命中时**不取字节、不分配**;成果 184)。
     ///
-    /// 热路径依据:`LET` 占全部组的 40.4%(345k/854k),每组两个窗口;
-    /// 稳态每帧约 70 万次求值。窗口字节在脚本装载后**完全不变**,
-    /// 而旧实现每次 `decode_window` 都重新切分并新建 `Vec`。
+    /// 热路径依据:`LET` 占全部组的 40.4%(345k/854k),每组两个窗口,稳态每帧
+    /// 约 70 万次求值;窗口字节在脚本装载后**完全不变**。缓存按**脚本**隔离
+    /// (键带 `script_id`),换脚本无需清空也不串味。
     ///
-    /// 缓存按**脚本**隔离:键里带 `script_id`,换脚本无需清空也不串味
-    /// (也避免 `swap_exec` 换执行位时误命中别的脚本)。
-    fn decode_cached(
-        &mut self,
-        offset: u32,
-        len: u32,
-        bytes: &[u8],
-    ) -> std::result::Result<std::sync::Arc<[yuris_script::insn::Instruction]>, yuris_core::Error>
-    {
-        let key = (self.ctx.script_id, offset, len);
-        if let Some(hit) = self.insn_cache.get(&key) {
-            return Ok(std::sync::Arc::clone(hit));
-        }
-        let v = yuris_script::decode_window(bytes)?;
-        let arc: std::sync::Arc<[yuris_script::insn::Instruction]> = v.into();
-        self.insn_cache.insert(key, std::sync::Arc::clone(&arc));
-        Ok(arc)
-    }
-
-    /// **窗口 → 已解码指令**（缓存优先，命中时**不取字节、不分配**）。
-    ///
-    /// 与 [`Self::decode_cached`] 的区别：后者要求调用方先拿到 `&[u8]`
-    ///（跨 content/part4 时那是一次 `Vec` 分配）。热路径每帧调用约 70 万次，
-    /// 而缓存命中近乎 100%，故这里先查缓存，只有**未命中**才取窗口字节。
+    /// 旧变体 `decode_cached(offset,len,bytes)` 要求调用方先取 `&[u8]`,在跨
+    /// content/part4 时那是一次 `Vec` 分配,已被本函数取代(2026-10-18 删除)。
+    /// 热路径每帧调用约 70 万次,而缓存命中近乎 100%,故这里先查缓存,
+    /// 只有**未命中**才取窗口字节。
     ///
     /// 调用方须先自行校验 `window_fits_pool`（本函数不做越界判断，
     /// 未命中时会因取字节失败而返回错误）。

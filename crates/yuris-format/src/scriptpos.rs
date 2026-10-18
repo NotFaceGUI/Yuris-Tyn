@@ -38,13 +38,6 @@
 /// 魔数（引擎 `.rdata` `0x5b4090`）。
 pub const MAGIC: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
-/// 帧编码后的字符数。
-const GOSUB_FRAME_CHARS: usize = 18;
-/// 块帧每项字符数。
-const BLOCK_CHARS: usize = 20;
-/// 循环帧每项字符数。
-const LOOP_CHARS: usize = 34;
-
 /// 一个 GOSUB 帧的位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GosubPos {
@@ -178,7 +171,7 @@ impl ScriptPos {
     pub fn decode(s: &str) -> Result<Self, ScriptPosError> {
         let b = s.as_bytes();
         let mut pos = 0usize;
-        let mut take_nib = |pos: &mut usize| -> Result<u8, ScriptPosError> {
+        let take_nib = |pos: &mut usize| -> Result<u8, ScriptPosError> {
             let c = *b
                 .get(*pos)
                 .ok_or_else(|| ScriptPosError::Malformed("意外结束".into()))?;
@@ -190,7 +183,7 @@ impl ScriptPos {
             }
             Ok(c - b'a')
         };
-        let mut take_u8 = |pos: &mut usize| -> Result<u8, ScriptPosError> {
+        let take_u8 = |pos: &mut usize| -> Result<u8, ScriptPosError> {
             Ok((take_nib(pos)? << 4) | take_nib(pos)?)
         };
         let mut magic = [0u8; 8];

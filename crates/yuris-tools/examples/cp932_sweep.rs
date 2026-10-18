@@ -1,6 +1,6 @@
 //! 只读探针:在**全部封包条目解压后**搜索 CP932 字节串(定位台词/按钮标签来源)。
 //! 用法: cargo run --release -p yuris-tools --example cp932_sweep -- <游戏目录> <hex>
-use yuris_vm::host::{ScriptHost, YpfScriptHost};
+use yuris_vm::host::YpfScriptHost;
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();

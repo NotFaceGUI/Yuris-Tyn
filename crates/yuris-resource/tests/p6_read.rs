@@ -6,7 +6,6 @@
 //! - update1.ypf 与 cg.ypf 同名条目(cg\ev 族)→ 后挂载优先读取。
 //! 样本缺失时测试跳过。
 
-use yuris_format::ypf::YpfReader;
 use yuris_resource::{ResourceError, ResourceStack};
 
 fn game_dir() -> Option<std::path::PathBuf> {

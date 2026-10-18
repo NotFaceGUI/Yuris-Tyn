@@ -95,7 +95,7 @@ fn main() {
                 _ => (0x40u8, spec.clone()),
             };
             let id = u16::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0);
-            let needle: Vec<u8> = {
+            let _needle: Vec<u8> = {
                 let mut v = vec![prefix];
                 v.extend_from_slice(&id.to_le_bytes());
                 v

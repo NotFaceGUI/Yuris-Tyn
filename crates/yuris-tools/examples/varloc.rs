@@ -31,9 +31,9 @@ fn main() {
     let dir = std::path::PathBuf::from(args.next().expect("usage: varloc <dir> <varid_dec> [sid] [space: @|$|#|`]"));
     let want_id: u16 = args.next().and_then(|s| s.parse().ok()).expect("变量 id");
     let only_sid: Option<u16> = args.next().and_then(|s| s.parse().ok());
-    /// 变量空间前缀字符(`@`=0x40 数值 / `$`=0x24 字符串 / `#`=0x23 标签 /
-    /// `` ` ``=0x60 其它)。**旧版写死 `@`** ⇒ 查字符串变量(`$3655` 这类)
-    /// 恒 0 命中,会得出"没人写它"的假结论(实测踩到)。
+    // 变量空间前缀字符(`@`=0x40 数值 / `$`=0x24 字符串 / `#`=0x23 标签 /
+    // `` ` ``=0x60 其它)。**旧版写死 `@`** ⇒ 查字符串变量(`$3655` 这类)
+    // 恒 0 命中,会得出"没人写它"的假结论(实测踩到)。
     let space: u8 = args
         .next()
         .and_then(|s| s.chars().next())
@@ -54,7 +54,7 @@ fn main() {
     let pack = packs
         .iter()
         .find(|p| {
-            let Ok(mut h) = YpfScriptHost::open(p) else { return false };
+            let Ok(h) = YpfScriptHost::open(p) else { return false };
             h.entry_names().iter().any(|e| e.to_ascii_lowercase().ends_with(r"ysbin\ysl.ybn"))
         })
         .cloned()

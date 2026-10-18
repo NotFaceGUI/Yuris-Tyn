@@ -20,7 +20,7 @@ fn diag_bootstrap_event_flow() {
     };
     let booted = boot.boot().unwrap();
     let mut vm = booted.vm;
-    let mut last = 0usize;
+    let last = 0usize;
     // 主循环每帧 WAIT(FRAME=1);无后端环境以固定组数预算为界
     let budget = 2_000_000usize;
     loop {

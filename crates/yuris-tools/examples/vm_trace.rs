@@ -164,7 +164,6 @@ fn main() {
             }
             println!("[{tick:4}] {line}");
         }
-        drop(fresh);
         cursor = vm.trim_consumed_events(consumed);
         if let Some(s) = susp {
             println!(

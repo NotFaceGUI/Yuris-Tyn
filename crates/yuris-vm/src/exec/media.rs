@@ -7,15 +7,14 @@
 
 use yuris_core::{Error, Result};
 use yuris_format::ystb::{CommandGroup, CommandSlot};
-use yuris_value::{Value, VariableStore};
+use yuris_value::Value;
 
-use crate::event::{EffectValue, GoOutcome, JumpKind, VmEvent, VmState, VmSuspend};
+use crate::event::{EffectValue, VmEvent, VmSuspend};
 use crate::exec::Action;
 use crate::util::{
-    consume_declarations_into, extract_var_target, mstring, sjis_char_len, value_summary,
-    value_truthy, varact_ascii_case, varact_byte_to_char, varact_char_to_byte, VarTarget,
+    extract_var_target, value_summary, VarTarget,
 };
-use crate::{GosubFrame, GroupVm, IfFrame, LoopFrame, SavedExec, MAX_TASKS};
+use crate::GroupVm;
 
 /// CG 注册表条目的命中尺寸（逻辑像素）。
 ///
@@ -93,7 +92,7 @@ impl GroupVm {
     }
 
     /// 处理 `Word`(从 `run_main` 拆出;语义逐行照搬)。
-    pub(crate) fn cmd_word(&mut self, g: CommandGroup, windows: &[CommandSlot]) -> Result<Action> {
+    pub(crate) fn cmd_word(&mut self, _g: CommandGroup, windows: &[CommandSlot]) -> Result<Action> {
         // WORD(v494 索引 106;SDK 命令字典参数数 = 1,无名)。
         //
         // **窗口形态 = 裸 SJIS 字面量,不是字节码**(Confirmed):
@@ -462,7 +461,7 @@ impl GroupVm {
                 }
             };
             if Some(slot_no) == s_id {
-                if let Value::Str(bytes) = &v {
+                if let Value::Str(_bytes) = &v {
                     id = Some(v.str_as_string());
                 }
             } else if Some(slot_no) == s_file {
@@ -1059,7 +1058,7 @@ impl GroupVm {
     }
 
     /// 处理 `CgEnd`(从 `run_main` 拆出;语义逐行照搬)。
-    pub(crate) fn cmd_cgend(&mut self, g: CommandGroup, windows: &[CommandSlot]) -> Result<Action> {
+    pub(crate) fn cmd_cgend(&mut self, _g: CommandGroup, windows: &[CommandSlot]) -> Result<Action> {
         // 引擎 LAB_0043ad14(cmd 0x03;命令表 slot 11):ID(槽0,字符串)
         // = 结束显示的 CG 名。P7.1(成果 62):同步从 CG 状态
         // 注册表移除(显示结束 ⇒ 后续 CGINFO 查询走「不存在」路径)。

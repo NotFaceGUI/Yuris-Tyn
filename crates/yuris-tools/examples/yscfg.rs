@@ -6,7 +6,7 @@
 //!
 //! 用法: `yscfg <游戏目录>`
 
-use yuris_vm::host::{is_script_entry, ScriptHost, YpfScriptHost};
+use yuris_vm::host::{is_script_entry, YpfScriptHost};
 
 fn main() {
     let mut args = std::env::args().skip(1);

@@ -7,15 +7,14 @@
 
 use yuris_core::{Error, Result};
 use yuris_format::ystb::{CommandGroup, CommandSlot};
-use yuris_value::{Value, VariableStore};
+use yuris_value::Value;
 
-use crate::event::{GoOutcome, JumpKind, VmEvent, VmState, VmSuspend};
+use crate::event::VmEvent;
 use crate::exec::Action;
 use crate::util::{
-    consume_declarations_into, extract_var_target, mstring, sjis_char_len, value_summary,
-    value_truthy, varact_ascii_case, varact_byte_to_char, varact_char_to_byte, VarTarget,
+    extract_var_target, value_summary,
 };
-use crate::{cmd, GosubFrame, GroupVm, IfFrame, LoopFrame, SavedExec, MAX_TASKS};
+use crate::{cmd, GroupVm};
 impl GroupVm {
 
 

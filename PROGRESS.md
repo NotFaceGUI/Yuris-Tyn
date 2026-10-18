@@ -10458,3 +10458,60 @@ cargo test --workspace --no-fail-fast  # 482 passed / 0 failed / 1 ignored(exit 
 在 `origin/main` 中**已公开**,改它无隐私收益且会与上游冲突;其中
 `crates/yuris-format/tests/sample.rs` 的 `assert_eq!(f.caption, ...)` 是对真实样本数据的断言,不可改。
 `.gitignore` 的 `AnimalTrailGirlishSquare 2/` 同理 —— 它是功能性忽略规则,删掉有把游戏目录提交进来的风险。
+
+## 2026-10-18(模块清理)— 成果 192:**删死模块 `yuris-expr`/`yuris-debug` 与两条死依赖;非文档类告警清零** —— Confirmed(cargo check 0 error + 474 测试全绿)
+
+**删了什么**
+- `crates/yuris-expr`(13 行骨架、零依赖):补齐 `docs/audit-todo-02.md` T27 的验收 ——
+  「依赖图无 yuris-expr」此前只断了依赖边,这次把 crate 目录与 `Cargo.toml` 的
+  members / workspace.dependencies 条目一并删除。
+- `crates/yuris-debug`(1805 行:透明覆盖层 HUD、遥测、缓动、文本图集)及其在 `yuris-cli`
+  中的**全部接线 10 处**(`--debug`/`YURIS_DEBUG_HUD` 开关、F3 开合、resumed 建层、
+  Moved/Resized 跟随、逐帧喂数、事件分流、帮助文本、`AppWrapper` 两个字段)。
+  **该 crate 自带的 8 个测试随之移除**(缓动端点/收敛、环形缓冲、字号钳制、配色回退、
+  无字体降级)⇒ 全量测试口径 482 → **474 passed / 0 failed / 1 ignored**。
+- 死依赖两条:`yuris-save` 在 `yuris-cli`、`yuris-player-core` 里 `grep yuris_save` 均 0 命中
+  (crate 本身是文档化的骨架边界,保留;同 T27 的处理方式)。
+
+**告警清理**:清理前 337 条告警消息 / **176 条唯一**(lib 与 test 双目标各报一次);
+现在 **63 条唯一且全部是 `missing_docs`,非文档类 0 条**。
+- `cargo fix` 批量处理:未用导入、未用变量、多余 `mut`、未用文档注释。
+- 判断后**删除**(确认被新实现取代,非接线缺失):`FRAME_INTERVAL`(已被 FPS 派生的
+  `frame_gap` 取代)、`decode_cached`(被 `decode_cached_slot` 取代,成果 184 的依据并入后者文档)、
+  `insn_buf`(被 `insn_cache`/`slot_scratch` 取代)、`uniform_layout`(uniform 绑定组已即时创建)、
+  scriptpos 的 3 个帧长常量(数值已在模块文档与行内注释记明)、`trace_stage_enabled`
+  (实际用内联 `env::var_os`,同文件 3 处)、测试内 `approx`/`instrs`、`drop(&x)` 空操作 2 处、
+  `vmvars` 不可达 match 臂、`sample.rs` panic 前的死存储。
+- wgpu 24 弃用别名 7 处改名:`ImageCopyTexture`→`TexelCopyTextureInfo`、
+  `ImageDataLayout`→`TexelCopyBufferLayout`、`ImageCopyBuffer`→`TexelCopyBufferInfo`。
+- **保留但显式标注**(疑似接线缺失,不静默删除):`strip_layer_prefix`(player-core)、
+  `label_miss_alerted`(vm)、`group_dims`(render)、`pcdump::dump_vars`(tools)——
+  四处加 `#[allow(dead_code)]` 与「当前无读者/无调用者」注记,待主人定夺。
+- `yuris-vm/tests/common/mod.rs` 的「never used」是**共享测试模块的假阳性**
+  (多个测试二进制各自编译、各用一部分):统一 `#![allow(dead_code)]` 并注明原因。
+
+**顺带发现(未修,待定)**
+- `yuris-cli` 的 `--key-hex` 解析结果 `_ystb_key` **无消费者** ⇒ 该开关当前不改变行为
+  (PROGRESS 曾记它用于跨游戏 YSTB 密钥)。
+
+**验证**
+```bash
+cargo check --workspace --all-targets    # 0 error;非文档告警 0(剩 63 条 missing_docs)
+cargo test  --workspace --no-fail-fast   # 474 passed / 0 failed / 1 ignored
+git diff --stat --ignore-cr-at-eol       # 与 git diff --stat 数字一致(无行尾伪改动)
+```
+
+**补记(同日,同条目)**
+- **`missing_docs` 63 条全部补齐**(18 个 crate 主动 `#![warn(missing_docs)]`;集中在
+  player-core 46 处、vm/task.rs 7 处、runtime 4 处、format/ypf 2 处等)。顺带修正一处
+  错位文档:`GroupVm::set_file_probe` 的说明此前挂在 `set_input_cursor` 上。
+  ⇒ `cargo check --workspace --all-targets` 现在 **0 error / 0 warning**。
+- **workspace 依赖写法统一**:根 `[workspace.dependencies]` 此前漏了后加的
+  `yuris-stage` / `yuris-player-core`(所以三个 Cargo.toml 只能写 `path = "../…"`);
+  现补齐两条,并把 4 处改为 `workspace = true`。
+- **死依赖再清 3 条**:`yuris-scenario` 在 `yuris-cli`/`yuris-player-core`/`yuris-tools`
+  中零引用(处理同 `yuris-save`)。
+- **`yuris-scenario` 经核实不是死模块**(主人问询后确认):`crates/yuris-vm/src/scenario.rs`
+  仍 `use yuris_scenario::{Element, Param, Scenario}` 并调用 `parse_scenario_auto` /
+  `decode_text`;被并入 VM 的是**剧本通道运行器**(原在 player-core,2026-10-17 迁入),
+  不是这个解析 crate —— 故保留。

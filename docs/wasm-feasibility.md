@@ -1,5 +1,9 @@
 # wasm 可行性分析（2026-10-17）
 
+> **勘误(2026-10-18,成果 192)**:本文件写于删除动作之前,其中 `yuris-expr` 与 `yuris-debug`
+> 两个 crate 之后已从 workspace 删除(前者 13 行骨架、零依赖;后者为调试 HUD,按需求移除)。
+> 涉及这两个 crate 的命令与结论(B8 等)保留为历史记录,不再适用。
+>
 > 范围：把本仓库（YU-RIS 兼容内核，20 个 crate / 约 22k 行 Rust）编译到
 > `wasm32-unknown-unknown`（浏览器）与 `wasm32-wasip1`（无头）的可行性。
 >
@@ -373,6 +377,8 @@ CLI 处还 `expect("系统 CJK 字体")`。浏览器没有这些路径。
 `yuris-audio/src/engine.rs:76-100` 会记 `device_error` 而不崩）。
 
 ### B8. `yuris-debug` 的 HUD
+
+> **不适用(2026-10-18,成果 192)**:该 crate 已删除,本节保留为历史记录。
 
 除 bytemuck 一行修复外，HUD 的 Windows 分层窗口路径本身是
 `cfg(windows)`；非 Windows 分支走 wgpu surface，但同样依赖同步初始化。

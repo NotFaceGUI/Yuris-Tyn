@@ -5,17 +5,14 @@
 //! `return Ok(Action::Keep)` / `return Ok(Action::Suspend(…))`,由 `run_main`
 //! 的循环统一执行(语义 1:1)。
 
-use yuris_core::{Error, Result};
+use yuris_core::Result;
 use yuris_format::ystb::{CommandGroup, CommandSlot};
 use yuris_value::{Value, VariableStore};
 
 use crate::event::{GoOutcome, JumpKind, VmEvent, VmState, VmSuspend};
 use crate::exec::Action;
-use crate::util::{
-    consume_declarations_into, extract_var_target, mstring, sjis_char_len, value_summary,
-    value_truthy, varact_ascii_case, varact_byte_to_char, varact_char_to_byte, VarTarget,
-};
-use crate::{GosubFrame, GroupVm, IfFrame, LoopFrame, SavedExec, MAX_TASKS};
+use crate::util::value_truthy;
+use crate::{GosubFrame, GroupVm, IfFrame, LoopFrame};
 impl GroupVm {
     /// 处理 `Go`(从 `run_main` 拆出;语义逐行照搬)。
     pub(crate) fn cmd_go(&mut self, g: CommandGroup, windows: &[CommandSlot]) -> Result<Action> {
@@ -188,8 +185,8 @@ impl GroupVm {
     /// 处理 `ReturnBreak`(从 `run_main` 拆出;语义逐行照搬)。
     pub(crate) fn cmd_returnbreak(
         &mut self,
-        g: CommandGroup,
-        windows: &[CommandSlot],
+        _g: CommandGroup,
+        _windows: &[CommandSlot],
     ) -> Result<Action> {
         // RETURNBREAK：编译期标记 / 空操作（Confirmed —— v555 引擎
         // 处理器 0x4634d8 = `xor eax,eax; ret`）。
@@ -448,7 +445,7 @@ impl GroupVm {
     pub(crate) fn cmd_ifblend(
         &mut self,
         g: CommandGroup,
-        windows: &[CommandSlot],
+        _windows: &[CommandSlot],
     ) -> Result<Action> {
         let Some(top) = self.if_nest.last().copied() else {
             if let Some(reason) = self.halt_or_record(self.pc, g.command_type, "IFBLEND 无配对 IF")
@@ -677,7 +674,7 @@ impl GroupVm {
     pub(crate) fn cmd_loopend(
         &mut self,
         g: CommandGroup,
-        windows: &[CommandSlot],
+        _windows: &[CommandSlot],
     ) -> Result<Action> {
         // 引擎 CMDH_00445ce8:counter+1;counter >= limit → 弹帧顺序继续;
         // 否则 PC = body_start(64 位计数,0xffffffff/-1 = 无限标记)
@@ -887,7 +884,7 @@ impl GroupVm {
     }
 
     /// 处理 `IfEnd`(从 `run_main` 拆出;语义逐行照搬)。
-    pub(crate) fn cmd_ifend(&mut self, g: CommandGroup, windows: &[CommandSlot]) -> Result<Action> {
+    pub(crate) fn cmd_ifend(&mut self, g: CommandGroup, _windows: &[CommandSlot]) -> Result<Action> {
         if self.if_nest.pop().is_none() {
             if let Some(reason) = self.halt_or_record(self.pc, g.command_type, "IFEND 无配对 IF")
             {

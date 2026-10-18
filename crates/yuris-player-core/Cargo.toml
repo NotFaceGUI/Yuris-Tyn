@@ -13,19 +13,17 @@ yuris-format = { workspace = true }
 yuris-resource = { workspace = true }
 yuris-vm = { workspace = true }
 yuris-scene = { workspace = true }
-yuris-stage = { path = "../yuris-stage" }
+yuris-stage = { workspace = true }
 yuris-value = { workspace = true }
 fontdue = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-yuris-scenario = { workspace = true }
 encoding_rs = "0.8"
 yuris-runtime = { workspace = true }
 yuris-render = { workspace = true }
 yuris-audio = { workspace = true }
 yuris-input = { workspace = true }
-yuris-save = { workspace = true }
 anyhow = { workspace = true }
 bytemuck = { workspace = true }
 winit = { workspace = true }

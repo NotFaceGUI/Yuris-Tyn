@@ -3853,7 +3853,6 @@ dependencies = [
  "winit",
  "yuris-audio",
  "yuris-core",
- "yuris-debug",
  "yuris-format",
  "yuris-input",
  "yuris-log",
@@ -3861,8 +3860,6 @@ dependencies = [
  "yuris-render",
  "yuris-resource",
  "yuris-runtime",
- "yuris-save",
- "yuris-scenario",
  "yuris-scene",
  "yuris-stage",
  "yuris-value",
@@ -3876,28 +3873,6 @@ dependencies = [
  "byteorder",
  "serde",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "yuris-debug"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "fontdue",
- "pollster",
- "raw-window-handle",
- "wgpu",
- "winit",
- "yuris-log",
-]
-
-[[package]]
-name = "yuris-expr"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.20",
- "yuris-core",
- "yuris-value",
 ]
 
 [[package]]
@@ -3948,8 +3923,6 @@ dependencies = [
  "yuris-render",
  "yuris-resource",
  "yuris-runtime",
- "yuris-save",
- "yuris-scenario",
  "yuris-scene",
  "yuris-stage",
  "yuris-value",
@@ -4060,7 +4033,6 @@ dependencies = [
  "yuris-input",
  "yuris-render",
  "yuris-runtime",
- "yuris-scenario",
  "yuris-script",
  "yuris-value",
  "yuris-vm",

@@ -65,7 +65,7 @@ fn yst00000_decodes_with_zero_unknown() {
     let f = YstbFile::from_bytes(&blob, [0x2B, 0x90, 0x4F, 0x93]).unwrap();
 
     let mut total = 0usize;
-    let mut unknown = 0usize;
+    let unknown = 0usize;
     let mut pushes = 0usize;
     for s in f.slots() {
         let w = f.slot_content(s).unwrap();
@@ -77,7 +77,6 @@ fn yst00000_decodes_with_zero_unknown() {
             total += 1;
             match &ins.kind {
                 Insn::Unknown { raw_op, .. } => {
-                    unknown += 1;
                     panic!("意外 Unknown op={raw_op:#04x} @ slot off={}", s.offset);
                 }
                 Insn::PushInt(_) | Insn::PushFloat(_) | Insn::PushStr(_) | Insn::PushVar(_) => {
@@ -214,7 +213,7 @@ fn yst00000_m_strings_are_quoted() {
 /// (Unimplemented / UnresolvedOpcode / 未定义变量)。**零 panic**。
 #[test]
 fn yst00000_evaluator_smoke() {
-    use yuris_script::{Evaluator, VarSpace};
+    use yuris_script::Evaluator;
     use yuris_value::VariableStore;
 
     let Some(ypf) = open_sample() else {

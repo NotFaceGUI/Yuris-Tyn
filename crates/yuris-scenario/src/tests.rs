@@ -16,7 +16,7 @@ fn vo_le_lt_mainstream() {
         .iter()
         .map(|e| match e {
             Element::LineId { .. } => "lineid",
-            Element::Command { name, .. } => "cmd",
+            Element::Command { name: _, .. } => "cmd",
             _ => "other",
         })
         .collect();

@@ -51,7 +51,7 @@ fn main() {
     let pack = packs
         .iter()
         .find(|p| {
-            let Ok(mut h) = YpfScriptHost::open(p) else { return false };
+            let Ok(h) = YpfScriptHost::open(p) else { return false };
             h.entry_names()
                 .iter()
                 .any(|e| e.to_ascii_lowercase().ends_with(r"ysbin\ysl.ybn"))

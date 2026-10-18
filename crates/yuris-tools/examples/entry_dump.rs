@@ -6,7 +6,7 @@
 //! 用法:
 //!   cargo run -p yuris-tools --release --example entry_dump -- <游戏目录> <名字后缀>
 
-use yuris_vm::host::{is_script_entry, ScriptHost, YpfScriptHost};
+use yuris_vm::host::{is_script_entry, YpfScriptHost};
 
 fn main() {
     let mut args = std::env::args().skip(1);

@@ -74,7 +74,7 @@ fn main() {
     let script_pack = packs
         .into_iter()
         .find(|p| {
-            let Ok(mut h) = YpfScriptHost::open(p) else {
+            let Ok(h) = YpfScriptHost::open(p) else {
                 return false;
             };
             h.entry_names()

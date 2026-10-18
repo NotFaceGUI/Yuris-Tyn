@@ -1,6 +1,6 @@
 //! 只读探针:打印游戏自身 YSCM 的「序号 → 命令名」全表(诊断用)。
 //! 用法: cargo run -p yuris-tools --release --example cmdlist -- <游戏目录>
-use yuris_vm::host::{is_script_entry, ScriptHost, YpfScriptHost};
+use yuris_vm::host::{is_script_entry, YpfScriptHost};
 fn main() {
     let dir = std::path::PathBuf::from(std::env::args().nth(1).expect("usage: cmdlist <dir>"));
     let mut packs: Vec<std::path::PathBuf> = Vec::new();

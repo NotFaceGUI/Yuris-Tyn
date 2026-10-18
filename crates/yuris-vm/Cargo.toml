@@ -19,9 +19,7 @@ yuris-script = { workspace = true }
 yuris-format = { workspace = true }
 # 剧本通道(v555 明文 .txt 运行器 + 统一文本通道;2026-10-17 从 player-core 迁入)
 yuris-scenario = { workspace = true }
-# yuris-expr 已移除（T27,2026-10-16）：它只是 13 行骨架，VM 侧 `grep yuris_expr`
-# 零命中 —— 表达式求值实际由 yuris-script 承担。保留 crate 目录是为了不删
-# 仓库主人未审阅的文件；若确认无用，删目录即可（workspace 成员见根 Cargo.toml）。
+# 表达式求值由 yuris-script 承担(原 yuris-expr 骨架 crate 已删除;见 PROGRESS.md T27)。
 yuris-scene = { workspace = true }
 yuris-runtime = { workspace = true }
 thiserror = { workspace = true }

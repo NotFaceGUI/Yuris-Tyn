@@ -854,7 +854,7 @@ pub fn event_json(e: &VmEvent) -> String {
         }
         VmEvent::CgInfo { pc, id, evaluated } => {
             let idj = id.clone().map(|s| json_escape(&s)).unwrap_or_else(|| "null".to_string());
-            let ev: Vec<String> = evaluated.iter().map(|(b, v)| format!("{b}:{}", json_escape(v))).collect();
+            let _ev: Vec<String> = evaluated.iter().map(|(b, v)| format!("{b}:{}", json_escape(v))).collect();
             let ev = ev_arr(&evaluated);
             format!(r#"{{"ev":"cginfo","pc":{pc},"id":"{idj}","ev_":{ev}}}"#)
         }
@@ -867,7 +867,7 @@ pub fn event_json(e: &VmEvent) -> String {
             format!(r#"{{"ev":"load","pc":{pc},"file_hex":"{fj}","ev_":{ev}}}"#)
         }
         VmEvent::VarQuery { pc, command, evaluated } => {
-            let ev: Vec<String> = evaluated.iter().map(|(b,v)| format!("{b}:{v}")).collect();
+            let _ev: Vec<String> = evaluated.iter().map(|(b,v)| format!("{b}:{v}")).collect();
             let ev = ev_arr(&evaluated);
             format!(r#"{{"ev":"varquery","pc":{pc},"cmd":{command},"ev_":{ev}}}"#)
         }

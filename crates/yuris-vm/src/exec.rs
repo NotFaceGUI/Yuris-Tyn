@@ -31,7 +31,6 @@
 //!
 //! 命名与 REA `docs/engine/command-layer.md` 的 `CMDH_*` 处理器一一对应。
 
-use yuris_core::Result;
 
 use crate::event::{VmSuspend, VmEvent};
 

@@ -115,8 +115,8 @@ impl Viewport {
         }
         let (ox, oy) = self.offset();
         // 受限轴：宽受限时 x 恰为引擎的 x*lw/w，y 也以同一分母换算。
-        let width_limited =
-            self.window_w as f64 * self.logical_h as f64 <= self.window_h as f64 * self.logical_w as f64;
+        let width_limited = self.window_w as f64 * self.logical_h as f64
+            <= self.window_h as f64 * self.logical_w as f64;
         let (num, den) = if width_limited {
             (self.logical_w as f64, self.window_w as f64)
         } else {
@@ -147,10 +147,6 @@ impl Viewport {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn approx(a: f64, b: f64) {
-        assert!((a - b).abs() < 1e-6, "{a} != {b}");
-    }
 
     #[test]
     fn exact_aspect_maps_one_to_one() {

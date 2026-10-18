@@ -92,6 +92,9 @@ fn main() {
 }
 
 /// 导出小 id 变量族(帧局部 `@53`/`@54`/`$55` + 全局字符串 0x0e00..0x0f80)。
+///
+/// **当前无调用者**(2026-10-18 清理告警时发现):探针保留备用,确认不需要可删。
+#[allow(dead_code)]
 fn dump_vars(vm: &yuris_vm::GroupVm, sid: u16) {
     use yuris_value::{VarRef, VarSpace, Value};
     let print_one = |space: VarSpace, id: u16, idx: Option<i64>| {

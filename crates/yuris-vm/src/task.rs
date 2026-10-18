@@ -111,6 +111,7 @@ pub struct TaskNode {
     pub id: Vec<u8>,
     /// 主线节点(链序第 0 位;由 `GroupVm::load` 建立,不是 TASK 产物)。
     pub is_main: bool,
+    /// 该节点所属脚本 id(`GroupVm::load` 装载的脚本号)。
     pub script_id: u16,
     /// 脚本 pc(官方记录 +0x20)。
     pub pc: usize,
@@ -212,6 +213,7 @@ impl TaskScheduler {
         Self::with_pump_cap(cap)
     }
 
+    /// 以给定的每帧泵上限构造(`None` = 不限;缺省入口见 [`Self::from_env`])。
     pub fn with_pump_cap(pump_cap: Option<usize>) -> Self {
         TaskScheduler {
             nodes: Vec::new(),
@@ -274,22 +276,27 @@ impl TaskScheduler {
         }
     }
 
+    /// 任务节点数。
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
+    /// 是否无任务节点。
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
+    /// 按下标取节点(链序)。
     pub fn node(&self, index: usize) -> Option<&TaskNode> {
         self.nodes.get(index)
     }
 
+    /// 按下标取可变节点(链序)。
     pub fn node_mut(&mut self, index: usize) -> Option<&mut TaskNode> {
         self.nodes.get_mut(index)
     }
 
+    /// 按 TASK ID 槽(**原始字节**)查节点。
     pub fn find_by_id(&self, id: &[u8]) -> Option<&TaskNode> {
         self.nodes.iter().find(|n| n.id == id)
     }
@@ -343,11 +350,7 @@ impl TaskScheduler {
     /// 语义与 [`Self::run_frame_chain`] 的单帧步进完全相同(FRAME 递减 /
     /// TIME 期限 / 每任务一步),只是不消费续帧标志:旧 API 一次调用不是
     /// 「vsync 链」,没有上屏边界可言。
-    pub fn step_tasks_only(
-        &mut self,
-        exec: &mut dyn TaskExecutor,
-        now_ms: u32,
-    ) -> ChainReport {
+    pub fn step_tasks_only(&mut self, exec: &mut dyn TaskExecutor, now_ms: u32) -> ChainReport {
         let mut report = ChainReport::default();
         self.extra_frame = false;
         self.frame = self.frame.wrapping_add(1);
@@ -397,13 +400,7 @@ struct Walk<'a> {
 
 impl Walk<'_> {
     /// 遍历一条链的 `[begin, end)` 区段(官方按入口计数快照递减遍历)。
-    fn run_list(
-        &mut self,
-        nodes: &mut Vec<TaskNode>,
-        begin: usize,
-        end: usize,
-        skip_main: bool,
-    ) {
+    fn run_list(&mut self, nodes: &mut Vec<TaskNode>, begin: usize, end: usize, skip_main: bool) {
         let mut i = begin;
         while i < end {
             // —— 只读分支:启用位 / 子树容器(避免跨递归持有借词)——
@@ -559,11 +556,15 @@ mod tests {
             self
         }
         fn effects_on_first(mut self, id: &str, effects: Vec<Effect>) -> Self {
-            self.effects_on_first.insert(id.as_bytes().to_vec(), effects);
+            self.effects_on_first
+                .insert(id.as_bytes().to_vec(), effects);
             self
         }
         fn count(&self, id: &str) -> usize {
-            self.calls.iter().filter(|c| c.as_slice() == id.as_bytes()).count()
+            self.calls
+                .iter()
+                .filter(|c| c.as_slice() == id.as_bytes())
+                .count()
         }
     }
 
@@ -683,8 +684,16 @@ mod tests {
             .script("a", vec![StepOutcome::Yield])
             .script("b", vec![StepOutcome::Yield]);
         s.run_frame_chain(&mut exec, 0);
-        let ia = exec.calls.iter().position(|c| c.as_slice() == b"a").unwrap();
-        let ib = exec.calls.iter().position(|c| c.as_slice() == b"b").unwrap();
+        let ia = exec
+            .calls
+            .iter()
+            .position(|c| c.as_slice() == b"a")
+            .unwrap();
+        let ib = exec
+            .calls
+            .iter()
+            .position(|c| c.as_slice() == b"b")
+            .unwrap();
         assert!(ia < ib, "先入链者先步进");
     }
 

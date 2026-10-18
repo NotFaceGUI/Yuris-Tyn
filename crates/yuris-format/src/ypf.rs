@@ -510,7 +510,7 @@ impl YpfIndex {
         f.seek(SeekFrom::Start(0x24))?;
         let mut block = vec![0u8; index_len];
         f.read_exact(&mut block)?;
-        let file_len = std::fs::metadata(path)?.len() as u32;
+        let _file_len = std::fs::metadata(path)?.len() as u32;
 
         let mut names = std::collections::HashSet::with_capacity(file_count as usize);
         let mut flags = Vec::with_capacity(file_count as usize);
@@ -624,6 +624,7 @@ impl YpfIndex {
         true
     }
 
+    /// 按包内特征探测索引方言与置信度(0..1);跨版本语料用。
     pub fn detect_dialect(path: &std::path::Path) -> Result<(IndexDialect, f32)> {
         let file_len = std::fs::metadata(path)?.len() as u32;
         let mut head = [0u8; 0x24];
@@ -982,6 +983,7 @@ impl YpfReader {
         Ok(Self { file, index })
     }
 
+    /// 按路径 + `name_key` 打开:先解析索引,再持有文件句柄供随机读。
     pub fn open(path: &std::path::Path, name_key: u8) -> Result<Self> {
         let index = YpfIndex::from_path(path, name_key)?;
         let file = std::fs::File::open(path)?;

@@ -35,6 +35,9 @@ pub use scenario::{ScenarioHost, ScenarioPlayer, TitleMenuAction};
 ///
 /// 语料实测：脚本 `SOUND[ID=":/S0/" + …]` 的 ID 是**层组命名空间**，
 /// 而 `FILE=` 才是磁盘/VFS 名字；两者都可能带此前缀。
+///
+/// **当前无调用者**(2026-10-18 清理告警时发现):保留依据待接线;若确认不需要可删。
+#[allow(dead_code)]
 fn strip_layer_prefix(name: &str) -> &str {
     let Some(rest) = name.strip_prefix(":/") else {
         return name;
@@ -747,8 +750,11 @@ fn tri_state_pass(
 
 /// scenario 层资源/图层 id 基(与 SceneBridge 的 VM 层错开)。
 pub const SC_BG: u64 = 0x5C_0000_0001;
+/// 淡入淡出覆盖层 id。
 pub const SC_FADE: u64 = 0x5C_0000_0002;
+/// 台词窗文本层 id。
 pub const SC_TEXT: u64 = 0x5C_0000_0003;
+/// 台词窗框层 id。
 pub const SC_WIN: u64 = 0x5C_0000_0004;
 /// 崩坏级错误窗图层 id（最高 z；不参与 Stage 实体表）。
 pub const SC_FATAL: u64 = 0x5C_0000_00FA;
@@ -757,10 +763,13 @@ pub const SC_FATAL_TEX: u64 = 0x5C_0000_00FB;
 
 /// 淡入淡出覆盖层动画状态。
 pub struct FadeState {
+    /// 方向标志(由剧本 `FADEIN`/`FADEOUT` 语义给定;消费见 `PlayerCore::update_fade`)。
     pub out: bool,
     /// 起点(动画逻辑时钟口径,ms;见 `PlayerCore::anim_now`)。
     pub start: f64,
+    /// 时长(ms)。
     pub ms: u64,
+    /// 覆盖色 RGB。
     pub color: [u8; 3],
 }
 
@@ -806,22 +815,36 @@ pub const TITLE_SE_CANCEL: &str = "sse06";
 /// 子画面层 id 基(P3:LOAD / EXTRA / CG 鉴赏 / BGM 鉴赏 / END 确认;
 /// 与标题 0x5C_7000_* 与台词窗 SC_* 错开;z 在 50..=61 段)。
 pub const UI_LOAD_BASE: u64 = 0x5C_8000_0000;
+/// EXTRA(鉴赏入口)子画面层 id 基。
 pub const UI_EXTRA_BASE: u64 = 0x5C_9000_0000;
+/// EXTRA CG 鉴赏子画面层 id 基。
 pub const UI_CG_BASE: u64 = 0x5C_B000_0000;
+/// BGM 鉴赏子画面层 id 基。
 pub const UI_BGM_BASE: u64 = 0x5C_D000_0000;
+/// END 确认对话框层 id 基。
 pub const UI_CONFIRM_BASE: u64 = 0x5C_E000_0000;
 
 /// 子画面路由钮 id(常量而非算术 —— match 模式需要)。
 pub const UI_LOAD_BACK: u64 = UI_LOAD_BASE + 1;
+/// CG 鉴赏:返回。
 pub const UI_CG_BACK: u64 = UI_CG_BASE + 1;
+/// CG 鉴赏:上一页。
 pub const UI_CG_PREV: u64 = UI_CG_BASE + 0x90;
+/// CG 鉴赏:下一页。
 pub const UI_CG_NEXT: u64 = UI_CG_BASE + 0x91;
+/// CG 鉴赏:切到 BGM 页签。
 pub const UI_CG_TAB_BGM: u64 = UI_CG_BASE + 0xA1;
+/// BGM 鉴赏:返回。
 pub const UI_BGM_BACK: u64 = UI_BGM_BASE + 1;
+/// BGM 鉴赏:上一页。
 pub const UI_BGM_PREV: u64 = UI_BGM_BASE + 0x90;
+/// BGM 鉴赏:下一页。
 pub const UI_BGM_NEXT: u64 = UI_BGM_BASE + 0x91;
+/// BGM 鉴赏:切到 CG 页签。
 pub const UI_BGM_TAB_CG: u64 = UI_BGM_BASE + 0xA0;
+/// END 确认:是。
 pub const UI_CONFIRM_YES: u64 = UI_CONFIRM_BASE + 2;
+/// END 确认:否。
 pub const UI_CONFIRM_NO: u64 = UI_CONFIRM_BASE + 3;
 
 /// 播放器子画面状态(P3)。均在 `Wait::TitleMenu` 等待下叠加显示,
@@ -859,8 +882,11 @@ pub struct TitleButton {
 
 /// 播放核心(实现 ScenarioHost;与 scenario 分裂借用)。
 pub struct PlayerCore {
+    /// 主封包索引(资源懒加载用)。
     pub index: Arc<PacFileIndex>,
+    /// 组级 VM 实例(脚本执行主体)。
     pub vm: GroupVm,
+    /// VM ↔ 场景投影桥(显隐/文本/层 z 同步)。
     pub bridge: SceneBridge,
     /// 渲染帧计数(`YURIS_LOG=1` 下的周期诊断用;与游戏逻辑无关)。
     pub debug_frames: u64,
@@ -878,7 +904,9 @@ pub struct PlayerCore {
     /// 我们的 `vm.cg_z()` 在 CGEND 后查不到 ⇒ fallback 落 0 ⇒ 层沉底/错位
     /// (实测:开屏 環境設定 页 z998→0)。本表在投影时记录,永不因 CGEND 清除。
     pub layer_z_memo: HashMap<u64, i64>,
+    /// 已上传过纹理的资源 id(避免重复上传)。
     pub loaded: HashSet<u64>,
+    /// 渲染后端(`None` = 尚未建窗或初始化失败)。
     pub backend: Option<WgpuBackend>,
     /// 已消费的 vm.events() 游标。
     pub events_cursor: usize,
@@ -893,10 +921,15 @@ pub struct PlayerCore {
     pub input_touch: yuris_input::TouchAdapter,
     /// 光标逻辑坐标(@133/@138 注入)。
     pub cursor_logical: (i64, i64),
+    /// 按键脉冲:注入点击/按键置起,主循环按帧计数并回写 VM 按键态。
     pub key_pulse: bool,
+    /// 脉冲已持续的帧数(超过 120 帧清键)。
     pub key_pulse_frames: u32,
+    /// 系统 CJK 字体(台词与 UI 文本栅格化用)。
     pub font: fontdue::Font,
+    /// 当前淡入淡出覆盖层(`None` = 无)。
     pub fade: Option<FadeState>,
+    /// 本帧是否有点击(派生缓存;输入层有事件时以输入层为准)。
     pub clicked: bool,
     /// scenario 已生成的精灵层(id)。
     pub sprites: Vec<u64>,
@@ -919,11 +952,13 @@ pub struct PlayerCore {
     pub float_clock: Instant,
     /// 音频包索引 + 播放器(P9.1)。
     pub audio_packs: Arc<PacFileIndex>,
+    /// 音频后端(SE/BGM;P9.1)。
     pub audio: crate::audio::Audio,
     /// 活动选择肢(文本 + 命中区)。
     pub choices: Option<Vec<(String, [f32; 4])>>,
     /// 最近 CursorMoved 原始像素(winit 0.30 无 cursor_position 轮询)。
     pub last_cursor_px: Option<(f64, f64)>,
+    /// 本帧是否发生过点击(防同一次点击推进两帧)。
     pub frame_clicked: bool,
     /// 标题按钮(命中区 + 三态资源;成果 78)。
     pub title_buttons: Vec<TitleButton>,
@@ -944,10 +979,13 @@ pub struct PlayerCore {
     pub request_load_path: Option<std::path::PathBuf>,
     /// EXTRA CG:ev 清单(剥根规范名)与页码、正在查看的全图层。
     pub ev_list: Vec<String>,
+    /// EXTRA CG 当前页码。
     pub cg_page: usize,
+    /// 正在查看的全图层资源(`None` = 停在列表)。
     pub cg_view: Option<ResourceId>,
     /// EXTRA BGM:曲目名(去目录/扩展名)与列表页码。
     pub bgm_tracks: Vec<String>,
+    /// EXTRA BGM 当前页码。
     pub bgm_page: usize,
     /// 已进入过标题画面(P8.2b 门控:厂商 CG 阶段不建 VM UI 层)。
     pub title_seen: bool,
@@ -991,6 +1029,7 @@ pub struct PlayerCore {
     pub fatal_scroll: i32,
     /// 上次排版得到的可滚动上限（物理像素；0 = 一屏放得下）。
     pub fatal_max_scroll: i32,
+    /// 游戏安装目录(封包与 `save/` 路径基准)。
     #[allow(dead_code)]
     pub game_dir: std::path::PathBuf,
 }
@@ -4320,12 +4359,18 @@ impl PlayerCore {
     }
 }
 
+/// 播放器:播放核心 + 剧本播放器 + 窗口;平台壳持有它并每帧调 [`Player::tick`]。
 pub struct Player {
+    /// 游戏安装目录(封包与 `save/` 路径基准)。
     #[allow(dead_code)]
     pub game_dir: std::path::PathBuf,
+    /// 播放核心(VM / 场景投影 / 输入 / 音频)。
     pub core: PlayerCore,
+    /// scenario 剧本播放器(明文 `.txt` 运行器)。
     pub scenario: ScenarioPlayer,
+    /// winit 窗口(未建窗或建窗失败为 `None`)。
     pub window: Option<Arc<winit::window::Window>>,
+    /// 上一帧开始时刻(帧耗时统计用)。
     pub last_frame: Instant,
     /// 上次 present 完成时刻(≈ vblank;帧节拍锚点,成果 127)。
     ///
@@ -4345,6 +4390,7 @@ pub struct Player {
 }
 
 impl Player {
+    /// 推进一帧:错误窗优先 → 输入帧提交 → VM 泵 → 场景投影。
     pub fn tick(&mut self) {
         // **崩坏级错误**：画布中央错误窗优先于一切游戏推进。错误窗自身
         // 由渲染循环持续 present；这里只负责排版/撤层。
@@ -4497,7 +4543,6 @@ impl Player {
                 .request_load_path
                 .take()
                 .unwrap_or_else(|| core.game_dir.join("save").join("yskernel_qsave.json"));
-            drop(core);
             self.restore_from(&path);
             return;
         }
@@ -4614,6 +4659,7 @@ impl Player {
         yuris_log::info!("[player] 注入点击 ({x},{y})");
     }
 
+    /// 注入一次按键(无头复现/对拍用),并推进 VM 按键态。
     pub fn inject_key(&mut self, key: &str) {
         match self.core.vm.inject_input_key(key.as_bytes()) {
             Ok(()) => {
@@ -4625,6 +4671,7 @@ impl Player {
         }
     }
 
+    /// F5 快存:写 `save/yskernel_qsave.json`;无可存锚点时升为致命错误窗。
     pub fn quick_save(&mut self) {
         let Some((file, label)) = self.scenario.save_point().ok() else {
             // **无可存锚点**:存档请求落空。以前一行 warn;现在按用户要求
@@ -4670,6 +4717,7 @@ impl Player {
         }
     }
 
+    /// F9 快读:从 `save/yskernel_qsave.json` 恢复。
     pub fn quick_load(&mut self) {
         self.restore_from(&self.game_dir.join("save").join("yskernel_qsave.json"));
     }

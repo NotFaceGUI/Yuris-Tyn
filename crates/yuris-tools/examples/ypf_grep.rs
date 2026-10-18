@@ -6,7 +6,6 @@
 //! 用法:
 //!   cargo run --release -p yuris-tools --example ypf_grep -- <游戏目录> <名字子串(UTF-8)> [最多条数]
 
-use yuris_vm::host::YpfScriptHost;
 
 fn main() {
     let mut args = std::env::args().skip(1);

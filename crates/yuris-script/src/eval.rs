@@ -774,16 +774,11 @@ pub fn decode_pushstr(payload: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode_window;
     use crate::insn::{VarRef, VarSpace};
 
     fn run(window: &[u8]) -> Result<Vec<Value>> {
         let mut store = VariableStore::new();
         Evaluator::new(&mut store).eval_window(window)
-    }
-
-    fn instrs(window: &[u8]) -> Vec<Instruction> {
-        decode_window(window).unwrap()
     }
 
     #[test]

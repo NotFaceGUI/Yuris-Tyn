@@ -8,16 +8,15 @@
 use yuris_core::{Error, Result};
 use yuris_format::ystb::{CommandGroup, CommandSlot};
 use yuris_script::Evaluator;
-use yuris_value::{Value, VarRef, VariableStore};
+use yuris_value::{Value, VarRef};
 
-use crate::event::{GoOutcome, JumpKind, VmEvent, VmState, VmSuspend};
+use crate::event::{VmEvent, VmSuspend};
 use crate::exec::Action;
 use crate::util::{
-    consume_declarations_into, extract_var_target, mstring, sjis_char_len, value_summary,
-    value_truthy, varact_ascii_case, varact_byte_to_char, varact_char_to_byte, VarTarget,
+    extract_var_target, value_summary, VarTarget,
 };
 use crate::{
-    CmdKind, GosubFrame, GroupVm, IfFrame, LoopFrame, SavedExec, DEFAULT_FONT_PX, MAX_TASKS,
+    CmdKind, GroupVm, DEFAULT_FONT_PX, MAX_TASKS,
 };
 impl GroupVm {
     /// `MATH` 运算写回(T22;引擎处理体 `0x4482c4`)。
@@ -1090,7 +1089,7 @@ impl GroupVm {
                 let mut color: Option<(i64, i64)> = None;
                 let mut bold: Option<i64> = None;
                 let mut drawmode: Option<i64> = None;
-                let mut sel: Option<(i64, i64)> = None;
+                let _sel: Option<(i64, i64)> = None;
                 let mut bno: Option<i64> = None;
                 let mut no: Option<i64> = None;
                 let mut aa: Option<i64> = None;

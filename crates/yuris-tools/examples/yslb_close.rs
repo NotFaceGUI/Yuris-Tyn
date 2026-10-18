@@ -14,7 +14,7 @@
 //!   cargo run -p yuris-tools --release --example yslb_close -- <游戏目录> [脚本号]
 
 use yuris_format::yslb::YslbTable;
-use yuris_vm::host::{ScriptHost, YpfScriptHost};
+use yuris_vm::host::YpfScriptHost;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -37,7 +37,7 @@ fn main() {
         .find(|p| {
             let n = p.file_name().map(|s| s.to_string_lossy().to_ascii_lowercase());
             // 脚本包 = 含 ysbin\ysl.ybn 的那个(逐包试开)。
-            let Ok(mut h) = YpfScriptHost::open(p) else { return false };
+            let Ok(h) = YpfScriptHost::open(p) else { return false };
             let _ = &n;
             h.entry_names()
                 .iter()

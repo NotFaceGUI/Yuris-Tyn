@@ -45,7 +45,6 @@ fn show(v: &Value) -> String {
             let lossy = String::from_utf8_lossy(b).replace('\u{FFFD}', "");
             format!("Str {lossy:?} ({} 字节: {:02x?})", b.len(), b)
         }
-        other => format!("{other:?}"),
     }
 }
 

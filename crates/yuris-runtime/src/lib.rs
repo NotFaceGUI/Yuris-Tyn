@@ -91,13 +91,29 @@ pub trait RuntimeApi {
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum RuntimeEvent {
     /// 一帧提交。
-    FrameSubmitted { index: u64 },
+    FrameSubmitted {
+        /// 帧序号(自启动递增)。
+        index: u64,
+    },
     /// 图层绘制。
-    LayerDrawn { id: u64, resource: Option<ResourceId> },
+    LayerDrawn {
+        /// 图层 id。
+        id: u64,
+        /// 该层绑定的资源(无资源层为 `None`)。
+        resource: Option<ResourceId>,
+    },
     /// 文本绘制。
-    TextDrawn { bytes: usize },
+    TextDrawn {
+        /// 本帧提交的文本字节数。
+        bytes: usize,
+    },
     /// 资源加载。
-    ImageLoaded { id: ResourceId, bytes: usize },
+    ImageLoaded {
+        /// 资源 id。
+        id: ResourceId,
+        /// 计数字节(预算/诊断用)。
+        bytes: usize,
+    },
 }
 
 pub mod null {

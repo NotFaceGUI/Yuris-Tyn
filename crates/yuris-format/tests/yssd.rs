@@ -180,7 +180,7 @@ fn yssd_real_sample_blocks() {
             yssd.block_count(),
             nblk
         );
-        for (dno, var_id, ty, dims, dlen) in blocks.iter() {
+        for (dno, var_id, ty, dims, _dlen) in blocks.iter() {
             let Some(blk) = yssd.block(*dno) else {
                 // 引擎可能改写 DNO 布局:按 var_id 兜底定位
                 eprintln!("{fname}: DNO {dno} 不在(引擎改写,跳过)");

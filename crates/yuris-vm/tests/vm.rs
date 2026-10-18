@@ -327,9 +327,9 @@ fn let_array_element_compound_and_readback() {
         (cmd::IFEND, 0, 0), // g3
         (cmd::RETURN, 0, 0),// g4
     ];
-    let tag_let_add = [0x00, 0x00, 0x00, 0x01]; // B3=1 → 0x01000000(LE)
-    let tag_let_set = [0x00, 0x00, 0x00, 0x00];
-    let tag_if_cond = [0x00, 0x00, 0x01, 0x00]; // B2=1(@INT 求值表)
+    let _tag_let_add = [0x00, 0x00, 0x00, 0x01]; // B3=1 → 0x01000000(LE)
+    let _tag_let_set = [0x00, 0x00, 0x00, 0x00];
+    let _tag_if_cond = [0x00, 0x00, 0x01, 0x00]; // B2=1(@INT 求值表)
     let windows = &[
         ([0x00, 0x00, 0x00, 0x01], w_lhs.len() as u32, 0, w_lhs),
         ([0x00, 0x00, 0x00, 0x00], w_rhs3.len() as u32, 0, w_rhs3),
@@ -695,7 +695,7 @@ fn cg_emits_cg_event_with_position() {
 /// RETURN 返回后帧丢弃,全局不受污染。
 #[test]
 fn gosub_frame_local_let_readwrite() {
-    use yuris_value::{VarRef, VarSpace, Value};
+    use yuris_value::{VarRef, VarSpace};
     let key = [0x2b, 0x90, 0x4f, 0x93];
     // g0 GOSUB(条件真) → g2(SUB);g1 RETURN(帧空=结束)
     // g2 = SUB: 三条 LET 帧局部 + 一条 RETURN
@@ -708,7 +708,7 @@ fn gosub_frame_local_let_readwrite() {
     let w_lhs33: &[u8] = &[0x56, 3, 0, 0x40, 0x33, 0x00];
     let w_rhs_read32: &[u8] = &[0x48, 3, 0, 0x40, 0x32, 0x00];
     // 帧局部计数:gparam 位图 int=(u16&0xff)>>3 → 给 0x08(含 1 个 INT)
-    let groups: &[(u8, u8, u16)] = &[
+    let _groups: &[(u8, u8, u16)] = &[
         (cmd::GOSUB, 2, 0x08),  // g0(条件窗+标签窗相间;实际组 2 窗)
         (cmd::RETURN, 0, 0),    // g1 帧空结束
         (cmd::LET, 2, 0),       // g2 w0
@@ -764,7 +764,7 @@ fn gosub_frame_local_let_readwrite() {
 #[test]
 fn cross_script_gosub_and_return() {
     use yuris_format::ystb::YstbFile;
-    use yuris_vm::host::{InMemoryHost, ScriptHost};
+    use yuris_vm::host::InMemoryHost;
     let key = [0x2b, 0x90, 0x4f, 0x93];
 
     // 脚本 A(id=0x20): g0 GOSUB(真,跨脚本 → SUB@script 0x21) g1 RETURN(帧空=结束)
@@ -1107,7 +1107,7 @@ fn sample_script190_varinfo_group_executes() {
 /// CGACT:ID 字符串(B0=0)+ 数值参数摘要;事件化,不挂起。
 #[test]
 fn cgact_emits_cgact_event() {
-    use yuris_value::Value;
+    
     let key = [0x2b, 0x90, 0x4f, 0x93];
     let w_id: &[u8] = &[0x4d, 7, 0, b'"', b'l', b'a', b'y', b'e', b'r', b'"'];
     let w_set: &[u8] = &[0x42, 1, 0, 1];
@@ -1376,7 +1376,7 @@ fn save_sets_bitmap_target() {
     // 引擎 STR 分支走显示层;此处用 INT 标量验证位图写
     let w_set_int: &[u8] = &[0x76, 3, 0, 0x40, 0x71, 0x17];
     // SET 值窗(槽3 亦可携带 int 值):pushint8 1
-    let w_val: &[u8] = &[0x42, 1, 0, 1];
+    let _w_val: &[u8] = &[0x42, 1, 0, 1];
     let windows = &[
         ([0x02, 0x00, 0x00, 0x00], w_dno.len() as u32, 0, w_dno),
         ([0x03, 0x00, 0x00, 0x00], w_set_int.len() as u32, 0, w_set_int),

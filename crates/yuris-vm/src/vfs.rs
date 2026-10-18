@@ -287,7 +287,7 @@ impl VfsIndex {
     /// [`normalize_request_bytes`] —— 不做字符串往返,CP932 名零损耗。
     pub fn resolve_bytes(&self, raw: &[u8]) -> Option<EntryRef> {
         let key = normalize_request_bytes(raw);
-        let mut hit = |st: ResolveStage, r: (u32, u32)| {
+        let hit = |st: ResolveStage, r: (u32, u32)| {
             Some(EntryRef { source: r.0, index: r.1, stage: st })
         };
         if let Some(&r) = self.index.get(&key) {
@@ -355,7 +355,7 @@ impl VfsIndex {
     pub fn resolve(&self, request: &str) -> Option<EntryRef> {
         let key = normalize_request(request);
         let trace = std::env::var_os("YURIS_TRACE_VFS").is_some();
-        let mut hit = |st: ResolveStage, r: (u32, u32)| {
+        let hit = |st: ResolveStage, r: (u32, u32)| {
             if trace && yuris_log::enabled(yuris_log::Level::Trace) {
                 yuris_log::trace_forced!(
                     "[vfs] {:?} ← {:?} (源{} 条目{})",

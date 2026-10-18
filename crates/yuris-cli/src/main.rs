@@ -24,11 +24,6 @@ use yuris_vm::host::PacFileIndex;
 use yuris_player_core::{load_cjk_font, Player, PlayerCore, ScenarioPlayer};
 use yuris_stage;
 
-/// 目标帧间隔(60fps;成果 124)。
-///
-/// 与 vsync 双保险:事件循环按此刻度休眠,`present()` 再对齐垂直同步。
-const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_667);
-
 /// 记一行日志（统一走 `yuris-log`；等级由 `YURIS_LOG_LEVEL` 控制）。
 macro_rules! plog {
     ($lvl:expr, $($arg:tt)*) => {
@@ -66,9 +61,8 @@ fn main() {
 
     if cmd != "run" {
         yuris_log::error!(
-            "用法: yuris-cli run <游戏目录> [--lenient] [--at <标签>] [--key-hex <8位>] [--debug]
-             环境变量: YURIS_LOG_LEVEL=trace|debug|info|warn|error|fatal|off  YURIS_LOG_FILE=<路径>
-                       YURIS_DEBUG_HUD=1(同 --debug;F3 随时开合 HUD)"
+            "用法: yuris-cli run <游戏目录> [--lenient] [--at <标签>] [--key-hex <8位>]
+             环境变量: YURIS_LOG_LEVEL=trace|debug|info|warn|error|fatal|off  YURIS_LOG_FILE=<路径>"
         );
         std::process::exit(2);
     }
@@ -88,7 +82,7 @@ fn main() {
         .and_then(|i| rest.get(i + 1).cloned());
     // 调试项:YSTB 4 字节循环 XOR 密钥(不同游戏各异)。缺省 = 本项目样本密钥。
     // 正式方案是启动链对首个 YSTB 条目自动 guess-key(见 yuris ystb guess-key)。
-    let ystb_key: [u8; 4] = rest
+    let _ystb_key: [u8; 4] = rest
         .iter()
         .position(|a| a == "--key-hex")
         .and_then(|i| rest.get(i + 1))
@@ -104,11 +98,6 @@ fn main() {
         .unwrap_or([0x2b, 0x90, 0x4f, 0x93]);
     // 调试项:非 strict 模式 —— Unsupported 命令记录事件后继续(默认 strict 挂起)。
     let lenient = rest.iter().any(|a| a == "--lenient");
-    // ---- 调试框架(成果 163):--debug / YURIS_DEBUG_HUD=1 开调试 HUD ----
-    // 实现全在独立 crate `yuris-debug`(贴合游戏客户区的透明直通覆盖层);
-    // CLI 只做开关、事件分流与逐帧喂数,不侵入 yuris-render 渲染路径。
-    let debug_hud = rest.iter().any(|a| a == "--debug")
-        || std::env::var("YURIS_DEBUG_HUD").as_deref() == Ok("1");
     // --dump-tex <子串>:把封包内匹配的资源解码落 PNG(素材取证;成果 127)。
     let dump_tex: Option<String> = rest
         .iter()
@@ -454,21 +443,6 @@ fn main() {
     plog!(yuris_log::Level::Info, "[player] 窗口标题: {window_title}");
 
     let event_loop = winit::event_loop::EventLoop::new().unwrap();
-    // ---- 调试 HUD(成果 163):覆盖层由事件循环 resumed 时创建 ----
-    // 字体缺失只降级 HUD(HUD 不应拖垮游戏),不阻断运行。
-    let (debug_overlay, telemetry) = if debug_hud {
-        let tele = yuris_debug::Telemetry::new();
-        let overlay = match yuris_player_core::load_cjk_font() {
-            Some(bytes) => Some(yuris_debug::DebugOverlay::new(tele.clone(), bytes)),
-            None => {
-                plog!(yuris_log::Level::Warn, "[debug] 找不到系统 CJK 字体,调试 HUD 不可用");
-                None
-            }
-        };
-        (overlay, Some(tele))
-    } else {
-        (None, None)
-    };
     // 逻辑画布 + 窗口尺寸 = **游戏自身 `yscfg.ybn` 的分辨率**(成果 121)。
     // 内核曾把两者分别写死为 1920×1080 / 1280×720(最初样本 v555 的值),
     // 款款不同 ⇒ 实机「分辨率有问题」「CG 混乱」。缺省回退 1280×720 保持兼容。
@@ -506,8 +480,6 @@ fn main() {
         })),
         title: window_title,
         window_size: game_screen,
-        debug: debug_overlay,
-        telemetry,
     };
     if let Err(e) = event_loop.run_app(&mut wrapper) {
         yuris_log::report_fatal_error(module_path!(), "事件循环异常退出", e);
@@ -566,10 +538,6 @@ struct AppWrapper {
     /// `1920×1080`(逻辑画布)—— 而款款不同(本作 1100×825)。后果即实机
     /// 报告的「分辨率有问题 + CG 位置/缩放全乱」。
     window_size: (u32, u32),
-    /// 调试 HUD 覆盖层(成果 163;`--debug` / F3 开关)。
-    debug: Option<yuris_debug::DebugOverlay>,
-    /// 每帧遥测(HUD 数据源;None = 调试未开)。
-    telemetry: Option<yuris_debug::Telemetry>,
 }
 
 impl winit::application::ApplicationHandler for AppWrapper {
@@ -599,12 +567,6 @@ impl winit::application::ApplicationHandler for AppWrapper {
             Ok(b) => {
                 player.core.backend = Some(b);
                 player.window = Some(window.clone());
-                // 调试 HUD 覆盖层(成果 163):创建后立即贴合游戏客户区。
-                if let Some(d) = self.debug.as_mut() {
-                    d.resumed(event_loop);
-                    d.follow_window(&window);
-                    d.show();
-                }
             }
             Err(e) => {
                 // **崩坏级**:无法创建图形后端 ⇒ 画布错误窗会尽量渲染；
@@ -627,10 +589,6 @@ impl winit::application::ApplicationHandler for AppWrapper {
             // 恢复画面），同时避免满帧重绘白白吃 GPU。
             if let Some(w) = p.window.as_ref() {
                 w.request_redraw();
-            }
-            // 错误窗期间 HUD 以 10Hz 维持重绘(成果 163)。
-            if let Some(d) = self.debug.as_ref() {
-                d.sync_redraw();
             }
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 Instant::now() + std::time::Duration::from_millis(100),
@@ -690,33 +648,16 @@ impl winit::application::ApplicationHandler for AppWrapper {
             if let Some(w) = p.window.as_ref() {
                 w.request_redraw();
             }
-            // 调试 HUD 跟随游戏帧节拍重绘(成果 163;只在 fire 时申请,
-            // 否则 RedrawRequested → about_to_wait → request 会构成忙转)。
-            if let Some(d) = self.debug.as_ref() {
-                d.sync_redraw();
-            }
         }
     }
 
     fn window_event(
         &mut self,
         event_loop: &winit::event_loop::ActiveEventLoop,
-        window_id: winit::window::WindowId,
+        _window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
         let harness = self.harness.clone();
-        // 调试 HUD 覆盖层事件分流(成果 163):绝不进游戏路径 ——
-        // 否则覆盖层的 RedrawRequested 会误触发 player.tick()。
-        if let Some(d) = self.debug.as_mut() {
-            if d.handles(window_id) {
-                match event {
-                    winit::event::WindowEvent::RedrawRequested => d.redraw(Instant::now()),
-                    winit::event::WindowEvent::Resized(size) => d.resized(size),
-                    _ => {}
-                }
-                return;
-            }
-        }
         let Some(player) = self.player.as_mut() else {
             return;
         };
@@ -758,12 +699,6 @@ impl winit::application::ApplicationHandler for AppWrapper {
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::F9) => {
                             player.quick_load();
-                        }
-                        // F3:调试 HUD 开合(成果 163;缓入缓出动画)。
-                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::F3) => {
-                            if let Some(d) = self.debug.as_mut() {
-                                d.toggle();
-                            }
                         }
                         _ => {}
                     }
@@ -931,21 +866,12 @@ impl winit::application::ApplicationHandler for AppWrapper {
                 };
                 player.push_touch(touch.id, phase, touch.location.x, touch.location.y);
             }
-            winit::event::WindowEvent::Moved(_) => {
-                // 游戏窗移动:HUD 覆盖层贴合跟随(成果 163)。
-                if let (Some(w), Some(d)) = (player.window.as_ref(), self.debug.as_mut()) {
-                    d.follow_window(w);
-                }
-            }
+            winit::event::WindowEvent::Moved(_) => {}
             winit::event::WindowEvent::Resized(size) => {
                 if let Some(b) = player.core.backend.as_mut() {
                     b.resize(size.width, size.height);
                 }
                 player.resize_input(size.width, size.height);
-                // 游戏窗改尺寸:HUD 覆盖层贴合跟随(成果 163)。
-                if let (Some(w), Some(d)) = (player.window.as_ref(), self.debug.as_mut()) {
-                    d.follow_window(w);
-                }
             }
             winit::event::WindowEvent::RedrawRequested => {
                 let frame_t = std::time::Instant::now();
@@ -1075,23 +1001,6 @@ impl winit::application::ApplicationHandler for AppWrapper {
                     } else {
                         RENDER_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
-                }
-                // ---- 调试遥测(成果 163):本帧实测耗时喂给调试 HUD ----
-                if let Some(t) = &self.telemetry {
-                    let vm_state = match player.core.vm.state() {
-                        yuris_vm::VmState::Idle => yuris_debug::VmRunState::Idle,
-                        yuris_vm::VmState::Running => yuris_debug::VmRunState::Running,
-                        yuris_vm::VmState::Finished => yuris_debug::VmRunState::Finished,
-                        yuris_vm::VmState::Error => yuris_debug::VmRunState::Error,
-                    };
-                    t.push_frame(yuris_debug::FrameSample {
-                        at: frame_t,
-                        vm_ns: vm_ns as u64,
-                        render_ns: render_ns as u64,
-                        total_ns: frame_t.elapsed().as_nanos() as u64,
-                        vm_state,
-                        fps_target: player.core.vm.fps.unwrap_or(0),
-                    });
                 }
                 // ---- 截图(成果 127):逻辑画布分辨率,对拍/排错取证 ----
                 let this_frame = {
