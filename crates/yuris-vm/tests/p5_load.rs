@@ -164,7 +164,11 @@ fn load_yssd_int_array() {
     let idx = yuris_vm::host::PacFileIndex::scan_game_dir(dir.path(), 0xC9).unwrap();
     vm.set_file_probe(std::sync::Arc::new(idx));
     let s = vm.run(100).unwrap();
-    assert!(matches!(s, VmSuspend::Complete), "无挂起: {s:?}");
+    // 成果 132:LOAD 后的基帧 RETURN = 重排队让出(Wait),不再 Complete。
+    assert!(
+        matches!(s, VmSuspend::Wait { counter: None, time_ms: None }),
+        "无挂起: {s:?}"
+    );
     for (i, expect) in [1i64, 2, 3].iter().enumerate() {
         assert_eq!(
             vm.store().get_elem(&target, &[i as i64]).unwrap(),

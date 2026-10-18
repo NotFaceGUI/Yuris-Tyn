@@ -95,6 +95,16 @@ PC = label.目标组PC
 ```
 1. FUN_00442d01() 求值条件窗口（w0）→ 假则直接返回（不跳）
 2. gparam 解码本帧局部数组维数: int=(u16&0xff)>>3, flt=(u16&7)*4+(u16>>14), str=(u16>>9)&0x1f
+
+   > **勘误（2026-10-13，实体语料实测）**：上式对**调用类命令（GOSUB/GO）不成立**。
+   > 该位图编码属**声明类命令**（`F_INT`/`G_INT` 族）的数组维数。实测第三方发行版
+   > （引擎 494）全语料 **43001 个 GOSUB/GO 组**：`gparam` **恒等于**
+   > 「实参窗个数 = 最大实参槽号」；按上式解码在 **40778 组**上得到的槽数
+   > 不足以容纳实际实参 —— 后果是帧局部**根本没被写入**（被调方读空串，
+   > 场景存在性判定恒假，画面全黑）。
+   > **发现方式**：`crates/yuris-tools --example corpus gmap`（按
+   > `(gparam, 窗口数, 各类最大槽号, 实参个数)` 组合做直方图，三列判据全部 `Y`）。
+   > **现行实现**：以实参窗槽号定上界（见 PROGRESS.md 成果 97）。
 3. 压帧: frame[ret_pc=pc+1, 脚本号(u16), 记录指针, 字符状态×2]；depth++
    （帧 0x328B：INT 局部 +8(8B/个) FLT +0x90 STR +0x120；
      返回值区 INT +0x160 FLT +0x1e8 STR +0x278；计数 +700/+0x2cd/+0x2de）
@@ -155,6 +165,15 @@ for i in 1..=count:
     attr2 校验: 1/2=下限, 3..0x17=[min,max] 表(DAT_0059b5c0/620), 0x18:<0x1000001,
                0x19:>=0x1000000, 0x1a/0x1b:<=count-1, 0x1c:0<=v<4
 ```
+
+> **补记（2026-10-13，实体语料实测）**：GOSUB 的实参可以**缺席**，编译器对其发射
+> 形态是「`PushInt(0)` 紧跟一个**未填右操作数**的 `0x41`(bit-and)」——
+> 实测字节 `42 01 00 00 41 00 00`。全语料共 20 个窗口以 `41 00 00` 结尾，
+> **19 个**左右操作数齐全（`X & 0xff` 掩码族），**唯一**缺操作数的那个正是
+> 「无值」的实参。手册侧概念对应系统变量 `@_PFLG(n)` =
+> 「GOSUB 跳转源**是否存在** PINT/PFLT/PSTR」。本内核只承认这一种已观测形态
+> （`yuris_script::is_absent_arg_idiom`），其余「操作数不足」照旧报错 ——
+> 引擎对该形态的机械行为仍属 Unknown。见成果 102。
 
 求值表（FUN_00468160 初始化）：
 `int[1]=00420bdc int[2]=00420c0c int[3]=00420bdc int[4]=00420c0c`
@@ -245,6 +264,22 @@ tail(1045B) = **37 个 C 串（CRT 错误消息，日文）+ 256 字节映射表
 字段 {+0 类别, +1 类型(1=INT/2=FLT/3=STR), +2 维数, +4.. 各维边界}）。
 LET 的 LHS id 是**声明命令 id**（0x32=INT/0x33=FLT/0x34=STR/0x35=LET 局部/
 0x75+ 系统变量族）——名字只在编译期（ERIS 源码）存在。
+
+> **补记（2026-10-13，实体语料实测）**：上面的「变量 = 纯 id」在**运行期寻址**上也成立 ——
+> 表达式操作数里的**前缀字符字节不参与寻址**。
+>
+> - 编译器侧：操作数 3 字节 = `[前缀字符][id:u16]`，前缀是 fixup 回填的**名字解析结果**
+>   （`docs/reverse/yscom-compiler-notes.md` §4.3）。
+> - 语料侧：某第三方发行版（引擎 494）的 s91 `ES.DEBUG.DEFINE` 用**反引号前缀**
+>   （`` ` `` = 0x60）读 `` `[0x0489][n] ``；反引号**全语料只出现 5 次**、
+>   **没有任何声明窗**，而 `id 0x0489` 在 YSVR 里是 `INT[8192]` —— 引擎只能按 id 寻址。
+>   官方手册（`マニュアル/YU-RIS/html` 全站）里反引号出现 **0 次**，说明它不是文档化的源码前缀。
+> - YSVR 侧：该作 2568 条目 = **2568 个不同 var_id，0 重复、0 类型冲突** ——
+>   一个 id 只有一份存储。
+>
+> **落地**：`VariableStore` 精确 `(前缀,id)` 未登记时回退到该 id 的**唯一**登记；
+> 多于一处 = 有歧义 → 保持未定义（不猜）。见 `crates/yuris-value/src/lib.rs`
+> 的 `fallback_key`；成果 101。
 
 **变量定义表 = `%ysbin\ysv.ybn`（YSVR）**，引擎 FUN_0046b7a0 载入
 `DAT_0087280c`、FUN_00451348 消费（探针 `probe_vartab.py`，
@@ -345,6 +380,39 @@ VM 落地:`Evaluator::loop_counter` 注入(`yuris-script/src/eval.rs` load_auto/
 (`yuris-vm/src/lib.rs`);回归测试 `sysvar_at48_is_loop_iteration`
 (`crates/yuris-vm/tests/runtime_loop.rs`)。
 
+## 11. 第三方发行版（引擎 494）的**命令分派表锚点**（Confirmed，2026-10-13）
+
+样本:`<game-b>.exe`（引擎 494 / YPF v494,sha256 `1ff3135d…c508cea8`,x86）。
+
+> **勘误(2026-10-16,成果 148)**:本节初版把 `0x802ba0` 判为命令处理器表——**错**。
+> `0x802ba0` 实为**表达式 opcode 表(30 项)**,`0x448110` 是 MATH 主入口;
+> 真正的命令处理器表 = **`0x7aae40`**(119 项,步长 4;初始化器 `FUN_0045cd30`
+> memset 共享 stub 后逐条赋值;读取点 `0x451b09 MOV ESI,[ECX*4+0x7aae40]`);
+> 执行链 = 帧驱动 → `FUN_00464fa4`(每任务一步,只调分派一次) → `FUN_0045177d`
+> (`CALL [handler[idx]]`)。逐条 idx→处理器地址见 `docs/engine/v494-handler-table.md`。
+> 下文保留 2026-10-13 原始记录,其中「EDX = 命令下标」的解读按本勘误更正。
+
+分派指令本身即锚点（`inspect_native_instruction 0x448426`）：
+
+```
+0x448426   CALL dword ptr [EDX*0x4 + 0x802ba0]      ; EDX = 命令下标(v494 的 119 条序号)
+```
+
+- **表基址 = VA `0x802ba0`**；同一 imm32 在 `.text` 内共 16 处读取点,
+  全部落在 `0x448426`–`0x4486b0` 这条分派链上（`0x44424d` 是通用分支）。
+- **表体落在 `.data` 的未初始化区**：段布局 `.text 0x401000-0x58b800` /
+  `.rdata 0x58c000-0x5b3a00` / `.data 0x5b4000-0x8075a4`（**文件映像只到 `0x5d1600`**）
+  / `_RDATA 0x808000-0x80e200`。
+  ⇒ 静态扫不出来（全文件扫「≥112 个散布代码指针」零命中;
+  扫 `mov reg, 0x802ba0` 只有上面那 16 个读取点）——**必须找初始化器**。
+  v555 侧的对应物是 `FUN_0046305c`（写 `DAT_0078b020`）；本构建的**尚未定位**。
+- v494 的「序号 → 命令名」表可由游戏自身 `ysbin\ysc.ybn` 直接解出:
+  `cargo run -p yuris-tools --example cmdlist -- "<游戏目录>"`。
+- 小 id 系统变量族（`id < 1000`,§9c）在两版之间**语义稳定**：
+  本构建 `@1`（case 0x01,timeGetTime 派生毫秒计时）与 §9c 表一致 ——
+  语料侧佐证:全语料 **1504 处** `@1[1]`,**只用下标 1**,用法恒为「时间差」。
+
+
 ## 10. 未解清单（更新）
 
 | # | 项 | 状态 |
@@ -361,3 +429,148 @@ VM 落地:`Evaluator::loop_counter` 注入(`yuris-script/src/eval.rs` load_auto/
 | U9 | ~~FUN_00451348~~ | **已解除** = YSVR 变量初值应用器（§9）；标签注册仍在（疑 FUN_00463c7c 或 FUN_004637d8） |
 | U10 | 双处理器数组选择标志的精确语义（skip 模式） | Likely |
 | U11 | YSTD（yst.ybn 16B）/ YSLB（ysl.ybn 139KB）/ YSER 结构 | Unknown（新发现） |
+| U12 | ~~v494 命令分派表(`0x802ba0`)的**初始化器**~~ | **已解除（成果 148，Confirmed）**：初始化器 = `FUN_0045cd30`（memset 共享 stub 后逐条赋 119 项）；命令处理器表 = **`0x7aae40`**（步长 4）。**勘误**：`0x802ba0` 是表达式 opcode 表（30 项），不是命令表。逐条 idx→处理器地址见 `docs/engine/v494-handler-table.md` |
+| U13 | `WORD`(索引 106) 的**显示语义** | 窗口形态已证（裸 SJIS 字面量,28992 组）;显示/排版副作用未取证 |
+| U14 | ~~`RETURNCODE`(索引 79) 语义~~ | **已解除(Likely)**：§12a —— v555 处理器实证不改脚本 pc/不弹帧，官方 YCD 参数数 0，语料恒 1 空窗；本内核按「推进 pc 的空操作」实装（`// UNVERIFIED`） |
+| U15 | ~~v494 侧 `RETURNCODE` 对应处理器体~~ | **已解除（成果 148，Confirmed）**：处理器 = `0x44c20c`（由 `0x7aae40` 表 idx 79 映射），副作用全在任务对象（`task+0x0c/0x10`、事件队列追加 `'C'/'0'/'1'/'5'`、`task+0x36`），**不改 pc、不动调用栈** ⇒ 与 v555 双版本同判，U14 的空操作语义由 Likely 升级 Confirmed（`CmdKind::ReturnCode` 的 `// UNVERIFIED` 依据已补齐） |
+| U16 | `EMOTE`/`EMOTEINFO`/`SOUNDINFO`/`SYSTEMINFO` 的**写回槽**（`LET`/`ANIMATION`/`PLAY`/`EXIST`/`E`） | Unknown（本内核只事件化、不写回；无音频与 E-mote 状态可答） |
+| U17 | `@1029`「场景码」从 **100（游戏正篇）** 跳到 **1/2（标题）** 的那一跳由谁负责 | **Unknown（画面出不来的最后一道）**。已证：`s8 g15` = `LET @1029 = @1025`（`@1025` 来自 `es.GSD.SAVE` 族）；`@1029==0` → `s20 g21` 真 → pc29 `@1029=100`；此后 s20 每帧走 `pc55 IF @1029==100` 真分支，派遣链 `pc143/pc149/pc160` **全假**，`pc152`（`GOSUB "GO.TITLE.R2"` 的入口）与 `s20 pc395` **实测 0 次**；全语料**从未建过 `BT.*TITLE.*` 层**，`ES.TITLE.LOOP`(s58 pc2) 与 `SCENARIO_TITLE`(s142) **0 次**。候选推进者：`ES.SCENARIO.FLOW` / `ES.SCENARIO.BtnLoop` 两个 `es._task` 任务体，或 `es.GSD` 读取路径。 |
+| U18 | ~~`TASK` 的任务体调度未实装~~ | **已解除（成果 118，Confirmed）**：按「任务 = 独立执行位，由本 VM 并行步进」实装（`SavedExec`/`VmTask`/`swap_exec`/`step_tasks`）—— `es.SCENARIO.FLOW`(s21 pc0) 与 `ES.SCENARIO.BtnLoop`(s20 pc184) 现已执行。**遗留**：`TASK_QUANTUM` 与「主线让出时才推一次」的时机是 `UNVERIFIED` 工程取值（**2026-10-16 更新(成果 148)**：引擎步进器 `FUN_00464fa4` 每任务一步只执行一条命令、无指令计数器 ⇒ 「量子 = 失控保护」的定位确认，U24 解除）。原文见成果 118 的勘误段 |
+
+
+## 12. `RETURN` 家族三分与 v494 命令表装载器（2026-10-13，成果 117）
+
+### 12a. 三个命令的区别（这是「画面出不来」的第二道真结）
+
+| 名字 | v494/495 索引 | 参数数（官方 `YSCom.ycd`） | 语料组数 | 语义 |
+|---|---|---|---|---|
+| `RETURN` | 77 | 48（`RINT*16`/`RFLT*16`/`RSTR*16`） | 1749 | **弹帧返回**；帧空 = 脚本结束 |
+| `RETURNBREAK` | 78 | 0 | —（本作 0 组） | **编译期标记 / 空操作** |
+| `RETURNCODE` | 79 | 0 | **28299** | **调用点返回标记**，不改控制流 |
+
+**v555 引擎实测处理器（另一条线 `workbench/analysis/opcode_table.tsv`，119 条
+序号来自 `YSCom.ycd`，与引擎启动写入的处理体表逐项核对）**：
+
+- opcode 77 `RETURN` → `0x44c0fc`：`movsx ecx, byte [task+0x140]`（调用栈深度，
+  上限 64）→ 取 `task[depth*4+0x140]` 记录 → 写回返回值区。**真返回**。
+- opcode 78 `RETURNBREAK` → `0x4634d8` = `xor eax,eax; ret`（**与 `ALIAS`/
+  `DEBUGLIST`/`PREP`/`S_FLT` 同址的空操作 stub**）。⇒ **Confirmed 空操作**。
+- opcode 79 `RETURNCODE` → `0x44c390`（**真实处理器**，但作用域只在引擎任务
+  结构上）：
+
+  ```asm
+  mov ecx, [0x80171c]        ; task
+  mov eax, [ecx+0x30]        ; 每脚本数据块指针数组
+  mov edx, [0x801730]        ; 下标
+  mov esi, [eax+edx*4]
+  mov esi, [esi]             ; 块→u32[0]
+  mov [ecx+0xc], esi         ; task+0xc
+  mov eax, [eax+edx*4]
+  mov eax, [eax+4]           ; 块→u32[1]
+  mov [ecx+0x10], eax        ; task+0x10
+  ... 入队 0x43/0x52/0x50/0x45 到引擎状态 0x801800 ...
+  mov byte [task+9], 1
+  mov eax, 0xffffffff; ret
+  ```
+  **不改脚本 pc、不弹调用帧**（调用栈是 `task+0x140`，这里写的是 `task+0xc/0x10`）。
+
+**本作（v494）语料形态（Confirmed，全语料普查）**：`RETURNCODE` **恒为「恰好
+1 个空窗口」**（`wc=1`，`len==0`），窗口 `tag` 是**逐脚本递增序号** 1,2,3,…
+（3559 种取值，max `0xE9B`）—— 即编译期给每个调用点编的号，运行期不需要它。
+`RETURN` 则 1544/1749 组是**零窗口**。
+
+**结构证据（决定性的那一半）**：`ES.CHARNAME.DEFINE`（s84，256 组）的 **pc5**
+就是 `RETURNCODE`。若它与 `RETURN` 同义，则该脚本在第 5 组就返回，
+**其后 250 组（登记约 30 个角色名）全部成为死代码** —— 与脚本用途矛盾。
+⇒ 本内核按「**推进 pc 的空操作**」实现（`CmdKind::ReturnCode`，
+`// UNVERIFIED`：v494 侧处理器体未取证）。**勘误入口 = U15。**
+
+### 12b. 勘误：`FUN_00429f65` 不是命令表装载器
+
+成果 116 记录的「下一步 = 找 `0x802ba0` 的初始化器」方向上，本会话定位到
+`0x44423d` / `0x44424a` 所在函数的**唯一写入者** `FUN_00429f65`
+（VA `0x429f65`，1244 B）——**但它不是命令处理体表的装载器**：
+
+- `memset(&DAT_006821c0, 0, 100)`;
+- 取 `blob = *(byte**)(*(int*)(task+0x30) + script_id*4)`，`count = *(byte*)(script_id + *(int*)(task+0x2c))`；
+- 以 **12 字节记录**步进，把记录字段铺进**每参数槽**的平行数组:
+  `DAT_00680f80[i]` / `DAT_00681120[i]` / `DAT_00681600[i]` /
+  `DAT_006812c0[i]` / `DAT_00681460[i]`（`i` 从 1 起，= 该脚本的**项序号**）；
+- 建 `name→序号` 反查表 `DAT_006821c0[]`；
+- 按每项的类型字节做**参数合法性检查**，失败走 `FUN_00465a00`
+  报错（格式串 id `0x18a92`/`0x18a88`/`0x18a9c`/`0x18aa6`/`0x18b64`/`0x18b5a`）。
+
+⇒ 这是**脚本参数/项表的加载与校验**，作用域是「当前脚本的项」，不是「119 条
+命令的处理器」。~~**U12 的初始化器仍未定位**~~（**2026-10-16 更新(成果 148)**：
+已定位 = `FUN_0045cd30`,命令处理器表 = `0x7aae40`;`0x802ba0` = 表达式 opcode 表
+——见 §11 勘误横幅）；`0x802ba0` 在文件映像里读到的是
+**32 字节全 0**（`read_bytes` 实测），确认是运行期填充。
+
+### 12c. 未实装子系统的四个命令（本内核的处理方式）
+
+| 命令 | 索引 | 语料组数 | YSCM 参数（本作） | 本内核处理 |
+|---|---|---|---|---|
+| `EMOTE` | 12 | 29 | 24：`ID/IDNO/SMOOTH/MESH/QUE/HAIR/BUST/PARTS/WIND*` … | 求值参数 → 事件化 |
+| `EMOTEINFO` | 13 | 3 | 8：`ID/IDNO/LABEL/LET/ANIMATION/PLAY/LOOP/DATA` | 同上（写回未实现） |
+| `SOUNDINFO` | 89 | 25 | 24：`ID/EXIST/E/PLAY/PAUSE/VOLUME/PAN/PITCH/FILE/FILETYPE/…` | 同上（`yuris-audio` 仍为空骨架） |
+| `SYSTEMINFO` | 92 | 8 | 6：`SCRIPTFILE/SCRIPTNUM/TEXTNUM/EMOTE/NO/LET` | 同上 |
+
+`EMOTE` = **E-mote 2D 角色动画**（官方 SDK 示例 `es_Emote.yst` 实证用法：
+`EMOTE[ID=$lid LABEL=$tl PLAY=1]`、`EMOTE[ID=$lid SKIP=1]`、
+`EMOTE[ID=$lid VAR=$n VAR2=@v VARNUM=1 TIME=@t]`）。本内核**无 E-mote**，
+故只如实记录调用，不做动画。
+| U19 | `TASKEND` 后 `TASKINFO EXIST` 是否应转 0 | Unknown（本内核保留名字，只停调度、丢执行位） |
+| U20 | 播放器纹理内存（成果 118：首个镜头组 962 个层 id，一次性 642 MB） | Likely = 上传后不回收的纹理；**非泄漏**（90 s 恒定不动），待做按需/可回收 |
+| U21 | ~~YSVR `ty=3`（字符串）初值 = 裸字符串~~ | **已解除（成果 119，Confirmed）**：该字段是**表达式指令流**（`4d`=PushStr + u16 长度 + 带定界符的字面量），必须解码求值。本作 `ty=3` 306 条中有初值 28 条、28/28 为单条 PushStr；旧实现的裸字节拷贝使 `$es.STARTLABEL` 变 19 字节窗口字节 ⇒ 场景标签查不到 ⇒ **画面恒黑**。**遗留**：v494 引擎侧「谁在启动时求值这些初值」未取证，现按「同一表达式编码 + 同一求值器」建模（实测与官方 SDK 源码语义一致）。 |
+| U22 | `LOOPBREAK`(0 窗) 与配对 `LOOPEND` 的栈交互 | Unknown（成果 119 定位：`s0 pc1080..1091` 中 `LOOPBREAK` 标记 `counter=0/limit=0` 后，配对 `LOOPEND` 仍把 PC 跳回体起点，实测 7,920 次/25 拍；疑点在 GOSUB 帧 `loop_depth` 恢复与 `loops.truncate(keep+1)` 的一致性） |
+| U23 | `TASKINFO` 查询槽的值（`SCRIPTPOS`/`TEXTPOS`/`LINE`/`GOLABEL`…） | Unknown（值是引擎内部**位置串**，`TASK ... SCRIPTPOS=<blob>` 消费；本内核不猜 ⇒ 只记录、不写回。影响：存档续跑 /「回标题」位置记忆） |
+| U24 | v494 引擎的**任务步进量子** | Unknown（语义已定性为「任务跑到自己让出为止」；量子未取证。本内核取 65536，运行期 `YURIS_TASK_QUANTUM` 可覆盖 —— 成果 120 实测该值下启动装载走完、标题脚本开始执行） |
+| U25 | `CG` 的 `E`(显隐)/`MODE`(混合)、`FILE=""`=1×1 黑层、`ID` 尾 `/`=图层组 | Likely（官方手册已给语义，未实装 ⇒ 无关层会同时可见，且游戏自己的 Z 未取到、全部 z=0 —— 观感问题） |
+| U26 | `cg/face/face_back`、`cgsys/main/nextvoice/icon_01` 在封包里读不到（0 字节） | Unknown（待查是否图层组 / 需后缀拼接） |
+
+## 13. YSVR 字符串初值 = 表达式指令流（2026-10-13，成果 119）
+
+**结论（Confirmed）**：`ysv.ybn` 每条 `ty=3`（字符串）条目的初值字段不是字符串，
+而是与 `.ybn` **窗口同一套编码**的表达式指令流：
+
+```
+ty=3 初值 = [u16 len] <len 字节>           ← 外层长度（YSVR 记录内）
+     其中 <len 字节> = 表达式指令流，实测形态恒为单条 PushStr：
+       4d <u16 litlen> <带定界符的字面量>   e.g. 4d 10 00 22 "SCENARIO_START" 22
+       ↑ op=0x4d      ↑ 含定界符的长度
+```
+
+求值口径：`decode_window` → `Evaluator` → 栈顶 `Value::Str`（字面量定界符由
+`decode_pushstr` 剥除）。**本作实测**：`ty=3` 306 条 → 278 条无初值、28 条有初值，
+28/28 首字节 `0x4d`、28/28 单条 PushStr、0 条其他形态。
+
+**为什么以前没发现**：整数/浮点初值是**裸 `i64`/`f64`**，旧实现的「原样取字段」
+恰好正确 —— 于是「整数变量都对」而这个 bug 只在字符串上暴露，而本作的整个场景/
+剧本流转**全靠名字字符串驱动**（`GO[#=$es.STARTLABEL]`）。
+
+**勘误**：`crates/yuris-vm/src/commands.rs` 里「`G_*`/`S_*`/`F_*` 不在运行期写初值」
+的旧判断**错误**。官方 SDK 示例 `ERIS/global.yst` 正是用
+`G_STR[$es.STARTLABEL="SCENARIO_START"]` 这类**带初值**的声明写全局默认值；
+初值经由 YSVR 落到运行期（本作 `ysv.ybn` `id 0x040c` 即该条）。
+
+**对照口径（跨版本通用）**：官方 SDK 0.495 示例作品 ERIS 的源码就是这族命令的
+规范 —— 其任务图（`\_task(es.IDSubTask, ES.SCENARIO.SubLoop, …)`）、场景机
+（`es.S.LBL` + `$S.LBL.LOOP` + `\es.S.GO`）、剧本入口
+（`es_ScenarioFlow.yst:42 GO[#=$es.STARTLABEL]`）与本作的编译产物逐一对上。
+排查跨版本问题时，**先读 ERIS 源码再读编译产物**，比逐条猜命令语义可靠。
+
+## 14. 三条「致命挂起」改为「记录后继续」（2026-10-13，成果 120）
+
+画面从 0 层到标题层的最后三道门，共性都是**旧实现把「未实装」写成了 `return Err`
+（致命挂起）**，于是越靠近启动后段越早死：
+
+| 位置 | 旧行为 | 现行为 | 实机证据 |
+|---|---|---|---|
+| `GO` 标签窗 | 只认 `mstring` 字面量（`GO[#="NAME"]`）；变量窗报「不是 M-串标签」 | 走 `resolve_label_in`：**表达式求值 + murmur2 查表**（与 GOSUB 同路） | 本作 `es.SCENARIO.FLOW`(s21 g8) 标签窗 = `PushVar($1036)`（`$es.STARTLABEL`）；SDK `ERIS/es_ScenarioFlow.yst:42` 即 `GO[#=$es.STARTLABEL]` |
+| `TASKINFO` 非 EXIST 查询槽 | `return Err`（致命） | 记录 `Subsystem` 事件、**不写回、不中止**（与 `EMOTEINFO`/`SOUNDINFO`/`SYSTEMINFO` 同口径） | `s21 g5 TASKINFO[ID=$1037 SCRIPTPOS=1 LET=$1042]`；槽 19 = `SCRIPTPOS` |
+| `SAVE` 引用形槽窗 | 送 `eval_window_condition` → 「窗口以左值引用结尾」致命 | 识别 op `0x56`/`0x76` 为**脚本自备存档槽引用**，记录引用、不求值不写值 | `s12 g664 SAVE[1, @1113]`（0x76 窗） |
+
+**任务步进量子**（同成果 120）：`TASK_QUANTUM` 256 → 65536。引擎语义是
+「任务跑到自己让出（`WAIT`）为止」，量子仅作失控保护；256 会让
+`es.SCENARIO.FLOW` 的启动装载（`\BTDEF.LOAD`）永远走不完（实测 3000 拍仍在其中）。
+运行期可用 `YURIS_TASK_QUANTUM` 覆盖。**等级 Likely**（引擎侧量子未取证 → U24）。

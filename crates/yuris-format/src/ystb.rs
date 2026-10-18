@@ -322,6 +322,16 @@ impl YstbFile {
         None
     }
 
+    /// 窗口是否落在 (content ‖ part4) 池内（**不分配**）。
+    ///
+    /// 热路径用：解码缓存命中时无需取字节，但仍必须做越界校验
+    ///（缓存键不含池长，损坏脚本可能给出池外窗口）。
+    pub fn window_fits_pool(&self, slot: &CommandSlot) -> bool {
+        let start = slot.offset as usize;
+        let end = start.saturating_add(slot.len as usize);
+        end <= self.content.len() + self.part4.len()
+    }
+
     /// 同 [`Self::window_bytes_pooled`]，但返回拷贝（跨 content/part4 边界时）。
     pub fn window_bytes_pooled_copy(&self, slot: &CommandSlot) -> Option<Vec<u8>> {
         let start = slot.offset as usize;

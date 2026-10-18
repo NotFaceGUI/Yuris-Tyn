@@ -8,11 +8,11 @@ description = "L6：GraphicsBackend 实现（软渲染参考实现 / 后续 wgpu
 
 [dependencies]
 yuris-core = { workspace = true }
+yuris-log = { workspace = true }
 yuris-runtime = { workspace = true }
 yuris-scene = { workspace = true }
 yuris-resource = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 image = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
@@ -20,7 +20,6 @@ pollster = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-tracing-subscriber = { workspace = true }
 
 [[example]]
 name = "first_pixel"

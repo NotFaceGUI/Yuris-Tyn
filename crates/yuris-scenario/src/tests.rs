@@ -125,3 +125,70 @@ fn invalid_bytes_report_line() {
         other => panic!("unexpected: {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// T1 + T21:跨层文本编码策略(数据侧判定)
+// ---------------------------------------------------------------------------
+
+/// **数据侧判定**:CP932 语料判为 SJIS,Big5 语料判为 Big5。
+#[test]
+fn detect_encoding_picks_the_valid_one() {
+    // CP932 `テスト`(SJIS 字节)
+    let sjis = b"\x83\x65\x83\x58\x83\x67";
+    assert_eq!(detect_encoding(sjis).unwrap().name(), "Shift_JIS");
+    // Big5 `測試`(0xB4 0xFA 0xB8 0xD5):SJIS 下 0xFA 之后 0xB8 非法
+    let big5 = b"\xb4\xfa\xb8\xd5";
+    assert_eq!(detect_encoding(big5).unwrap().name(), "Big5");
+    // 纯 ASCII:两个方向都合法 → 取引擎默认 SJIS(字节层结果相同)
+    assert_eq!(detect_encoding(b"\\BG(white,200)\r\n").unwrap().name(), "Shift_JIS");
+}
+
+/// **负向**:两种候选都非法 → 显式报错(不静默替换、不猜)。
+#[test]
+fn detect_encoding_rejects_undecodable() {
+    // 0x81 需合法 SJIS 尾字节;0xFE/0xFF 在两个编码族里都非法
+    let bad = b"\x81\xfe\xff\x81";
+    assert_eq!(detect_encoding(bad), Err(UndecodableText));
+    assert_eq!(decode_text(bad), Err(UndecodableText));
+    // parse_scenario_auto 同口径:报 Decode
+    assert!(matches!(
+        parse_scenario_auto(b"\x81\xfe\xff\r\n"),
+        Err(ScenarioError::Decode { .. })
+    ));
+}
+
+/// **`decode_text` 跨层入口**:SJIS 台词与 Big5 台词各自正确解出。
+#[test]
+fn decode_text_handles_both_families() {
+    assert_eq!(decode_text(b"\x83\x65\x83\x58\x83\x67").unwrap(), "テスト");
+    assert_eq!(decode_text(b"\xb4\xfa\xb8\xd5").unwrap(), "測試");
+}
+
+/// **歧义票**(见模块文档):Big5 汉字串恰为 SJIS 合法序列时,
+/// 取半角片假名更少的一方 —— 实测 `開始`(b6 7d a9 6c)在 SJIS 下是
+/// 半角片假名串 `ｶ}ｩl`(3 个半角字),Big5 下是正常汉字 `開始`。
+#[test]
+fn ambiguous_pair_resolved_by_halfwidth_vote() {
+    let ambiguous = b"\xb6\x7d\xa9\x6c"; // Big5 `開始`,SJIS 亦合法
+    assert_eq!(detect_encoding(ambiguous).unwrap().name(), "Big5");
+    assert_eq!(decode_text(ambiguous).unwrap(), "開始");
+    // 反向:日文全角假名经 CP932 无半角片假名,Big5 侧非法 → 判 SJIS
+    let jp = b"\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd"; // こんにちは
+    assert_eq!(detect_encoding(jp).unwrap().name(), "Shift_JIS");
+}
+
+/// **`parse_scenario_auto`**:CP932 剧本按其真实编码解出、不再乱码。
+///
+/// 旧行为:`player-core` 写死 Big5 → CP932 台词整篇乱码(<game-b> 潜伏点)。
+#[test]
+fn parse_scenario_auto_decodes_cp932_text() {
+    // `\LT("テスト")` 的 CP932 形态
+    let src = b"\\LT(\"\x83\x65\x83\x58\x83\x67\")\r\n";
+    let sc = parse_scenario_auto(src).unwrap();
+    match &sc.elements[..] {
+        [Element::Command { params, .. }] => {
+            assert_eq!(params, &[Param::Str("テスト".into())]);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}

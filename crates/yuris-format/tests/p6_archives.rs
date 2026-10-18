@@ -1,8 +1,8 @@
 ﻿//! P6 资源层测试(成果 63/65 勘误后):多包索引解析 + 魔数断言。
 //!
 //! 引擎侧实证(P6.2/P6.3 侦查 + probe_census.py 全包普查):
-//! - 名字段 = 虚拟根字节(1B) + 路径 + [类型码(1B,仅 se 型,XOR 后 0xCB=PNG/
-//!   0xCF=OGG)] + NUL;
+//! - 名字段 = 虚拟根字节(1B) + 路径 + [类型码(1B,仅 se 型,**存储原值**
+//!   0x02=PNG / 0x06=OGG)] + NUL;
 //! - bn 型条目(脚本/文本):NUL 后 flag∈{0,1}(zlib/stored);
 //! - se 型条目(资源):NUL 后直接字段(明文 stored);
 //! - 同一包(update1.ypf)两种布局并存;总开销均为 len+26;
@@ -50,22 +50,22 @@ fn bn_ypf_bn_layout() {
     assert!(idx.names.contains(&b"$ysbin\\yst00034.ybn".to_vec()));
 }
 
-/// se.ypf:se 型布局(OGG 码 0xCF),742 条,双索引可查剥根名。
+/// se.ypf:se 型布局(OGG 码 0x06),742 条,双索引可查剥根名。
 #[test]
 fn se_ypf_se_layout() {
     let Some(dir) = pac_dir() else { return };
     let idx = YpfIndex::from_path(&dir.join("se.ypf"), NAME_KEY).unwrap();
     assert_eq!(idx.header.file_count, 742);
-    // 主体 OGG(XOR 后码 0xCF);剥码后名字以 'g' 结尾
+    // 主体 OGG(存储原值码 0x06);剥码后名字以 'g' 结尾
     assert!(
-        idx.flags.iter().filter(|&&f| f == 0xCF).count() >= 736,
+        idx.flags.iter().filter(|&&f| f == 0x06).count() >= 736,
         "OGG 条目应 ≥736"
     );
     // 双索引:剥根名 se\se017.ogg 可查(根字节被剥)
     assert!(idx.map.contains_key(&b"se\\se017.ogg".to_vec()));
 }
 
-/// cg.ypf:se 型布局(PNG 码 0xCB),5655 条;首条数据头 = 标准 PNG。
+/// cg.ypf:se 型布局(PNG 码 0x02),5655 条;首条数据头 = 标准 PNG。
 #[test]
 fn cg_ypf_png_stored() {
     let Some(dir) = pac_dir() else { return };
@@ -73,7 +73,7 @@ fn cg_ypf_png_stored() {
     let idx = YpfIndex::from_path(&path, NAME_KEY).unwrap();
     assert_eq!(idx.header.file_count, 5655);
     assert_eq!(idx.entries.len(), 5655);
-    assert!(idx.flags.iter().all(|&f| f == 0xCB), "PNG 码恒 0xCB");
+    assert!(idx.flags.iter().all(|&f| f == 0x02), "PNG 码恒 0x02(存储原值)");
     // 首条字段(probe 实测):uncomp=comp=15485, off=0x233edc5e
     let e = &idx.entries[0];
     assert_eq!(e.uncompressed_len, 15485);
@@ -99,8 +99,8 @@ fn update1_mixed_layout() {
     let idx = YpfIndex::from_path(&dir.join("update1.ypf"), NAME_KEY).unwrap();
     assert_eq!(idx.header.file_count, 1306);
     let zlib = idx.flags.iter().filter(|&&f| f == 0x01).count();
-    let png = idx.flags.iter().filter(|&&f| f == 0xCB).count();
-    let ogg = idx.flags.iter().filter(|&&f| f == 0xCF).count();
+    let png = idx.flags.iter().filter(|&&f| f == 0x02).count();
+    let ogg = idx.flags.iter().filter(|&&f| f == 0x06).count();
     assert_eq!(zlib, 18, "zlib txt 条目");
     assert_eq!(png, 194, "PNG 条目");
     assert_eq!(ogg, 1094, "OGG 条目");

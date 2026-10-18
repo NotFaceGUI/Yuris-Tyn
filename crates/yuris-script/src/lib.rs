@@ -21,7 +21,7 @@
 pub mod eval;
 pub mod insn;
 pub use eval::{Evaluator, LValueRef, Slot};
-pub use insn::{BinOp, Cast, Insn, Instruction, UnOp};
+pub use insn::{is_absent_arg_idiom, BinOp, Cast, Insn, Instruction, UnOp};
 pub use yuris_value::{VarRef, VarSpace};
 pub use yuris_core::Result;
 
@@ -34,6 +34,17 @@ use yuris_core::Error;
 /// 任何不闭合(截断/越界)都会报错 —— 窗口必须完整。
 pub fn decode_window(window: &[u8]) -> Result<Vec<Instruction>> {
     let mut out = Vec::new();
+    decode_window_into(window, &mut out)?;
+    Ok(out)
+}
+
+/// 同 [`decode_window`],但把结果写进**调用方复用缓冲**(先 clear)。
+///
+/// **性能(2026-10-17,成果 171)**:解释器每个窗口都要解码一次;boot 单个
+/// 逻辑帧可达 85 万组 ⇒ 逐窗 `Vec::new()` 是百万级分配。调用方持一个
+/// 长期缓冲即可把分配降到零(稳态)。
+pub fn decode_window_into(window: &[u8], out: &mut Vec<Instruction>) -> Result<()> {
+    out.clear();
     let mut p = 0usize;
     while p < window.len() {
         if p + 3 > window.len() {
@@ -60,5 +71,5 @@ pub fn decode_window(window: &[u8]) -> Result<Vec<Instruction>> {
         });
         p = end;
     }
-    Ok(out)
+    Ok(())
 }

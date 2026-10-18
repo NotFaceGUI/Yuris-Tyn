@@ -4,12 +4,54 @@
 //! CMDH_0044272c/CMDH_004428c0/CMDH_0044b418/CMDH_004431ec/CMDH_004432e4/
 //! CMDH_00443434)。
 
+/// 样本缺失时的**可观测**跳过(审查待办 01 T19)。
+///
+/// 旧行为:27 个用例在样本缺失时只 `eprintln!` 一行然后**报 ok** ——
+/// 默认测试输出被捕获,报告里完全看不出"没断言",`ignored` 也恒为 0。
+///
+/// 现在:① 标准前缀 `sample not found, skip:`(单条 grep 可计数);
+/// ② 追加写 `$TEMP/yuris-sample-skips.txt`(捕获也可见,`wc -l` 计数);
+/// ③ `YURIS_REQUIRE_SAMPLE=1` 时改为 panic(CI/本机强制真跑)。
+#[allow(dead_code)]
+fn skip_sample() {
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed>")
+        .to_string();
+    let line = format!("sample not found, skip: {name}\n");
+    eprint!("{line}");
+    let dir = std::env::var_os("TEMP")
+        .or_else(|| std::env::var_os("TMP"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join("yuris-sample-skips.txt");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    if std::env::var_os("YURIS_REQUIRE_SAMPLE").is_some() {
+        panic!("YURIS_REQUIRE_SAMPLE=1 但样本缺失: {name}");
+    }
+}
+
 use std::collections::HashMap;
 
 use yuris_format::ystb::YstbFile;
 use yuris_vm::{GroupVm, JumpKind, ResumeResponse, VmEvent, VmSuspend, VmState, cmd};
 mod common;
 use common::{make_ystb, DUMMY};
+
+/// v555 命令名 → 序号（夹具按**名字**取号，不写死数字 —— 见
+/// `strict_unsupported_halts` 的勘误说明）。
+fn idx(name: &str) -> u8 {
+    u8::try_from(
+        yuris_core::CommandProfile::v555()
+            .index_of(name)
+            .unwrap_or_else(|| panic!("{name} 不在 v555 表内")),
+    )
+    .unwrap()
+}
 
 
 /// 是否为已实现的流程控制命令(启动链评估用)。
@@ -18,6 +60,34 @@ fn is_flow_command(cmd: u8) -> bool {
         cmd,
         0x2a | 0x2b | 0x2c | 0x2d | 0x30 | 0x35 | 0x37 | 0x38 | 0x39 | 0x3a | 0x4f | 0x68 | 0x0d
     )
+}
+
+/// 主线脚本走到基帧 `RETURN`(或 `END`)后的**引擎真语义**断言(成果 132)。
+///
+/// 引擎 `0x44c390` 在 depth==0 时跳出,外层 `FUN_00451640` 判不成立则调
+/// `FUN_00451724` —— 后者**复读 pc/脚本号**,清使命指针、按优先级重排队:
+/// 任务只是**挂起等重入**(与 `WAIT[..] continue` 同构),**不是终结**。
+/// 旧断言 `Complete` / `Finished` 是骨架期近似,已按反编译改掉。
+///
+/// 也接受 `Complete`:脚本**没有** RETURN、组表自然走到末尾(`pc >= groups`)
+/// 时没有可复读的"下一使命",按 `Complete`(引擎侧等价于脚本耗尽)。
+fn assert_main_script_yields(s: &VmSuspend) {
+    assert!(
+        matches!(
+            s,
+            VmSuspend::Wait { counter: None, time_ms: None } | VmSuspend::Complete
+        ),
+        "主线结束 = 可重入让出(引擎 FUN_00451724)或组表耗尽,实得 {s:?}"
+    );
+}
+
+/// 同上:状态应为 `Running`(可重入让出)或 `Finished`(耗尽),二者皆合法。
+fn assert_main_script_yielded_state(vm: &GroupVm) {
+    assert!(
+        matches!(vm.state(), VmState::Running | VmState::Finished),
+        "主线结束态应为 Running(可重入)或 Finished(耗尽),实得 {:?}",
+        vm.state()
+    );
 }
 
 /// IF 条件为假 → 跳 w1.len(ELSE) → ELSE 跳 w2.len(IFEND) → 弹栈 → RETURN 结束。
@@ -46,8 +116,8 @@ fn if_false_else_ifend_flow() {
 
     let mut vm = GroupVm::load(script).unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
-    assert_eq!(vm.state(), VmState::Finished);
+    assert_main_script_yields(&s);
+    assert_main_script_yielded_state(&vm);
 
     // 事件链:IF 假 → 跳 ELSE 起点(2,IF 处理器 w1.len);ELSE(0x0b)0 窗
     //    = "else 块开始"标记 → 顺序执行 else 块 → g3 IFEND 弹栈 → g4 RETURN 结束。
@@ -92,7 +162,7 @@ fn if_true_go_label_flow() {
     vm.set_script_id(0);
 
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     let jumps: Vec<_> = vm
         .events()
         .iter()
@@ -129,8 +199,8 @@ fn gosub_return_roundtrip() {
     vm.set_script_id(0);
 
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
-    assert_eq!(vm.state(), VmState::Finished);
+    assert_main_script_yields(&s);
+    assert_main_script_yielded_state(&vm);
     // 事件:Call(0→2) → Jump{Return}(2→1) → 结束
     assert!(vm
         .events()
@@ -143,20 +213,28 @@ fn gosub_return_roundtrip() {
 }
 
 /// strict(默认):未实现命令 → Unsupported 事件 + Error 挂起;resume 显式报错。
-/// (夹具 0x16 FLASH:P2 后事件化了 0x0e ERROR 等,FLASH 语义仍未逆向)
+///
+/// 夹具 = **`MENU`**(引擎有真实处理器,本内核未实装)。
+///
+/// **勘误(2026-10-16,成果 151)**:旧夹具写死 `0x16`,并注「FLASH 语义仍未逆向」
+/// —— T23/T23b 后 `FLASH` **已实装**(归 `MediaPlay`:置媒体模式 + 立即推进),
+/// 该夹具随即失效。现改为**按名取序号**(`MENU`/`MATH3D` 两族确未实装),
+/// 既消除对某个版本序号的依赖,也不随实装进度失效。
 #[test]
 fn strict_unsupported_halts() {
-    let groups: &[(u8, u8, u16)] = &[(0x16, 0, 0)]; // 命令 0x16(FLASH)未逆向
+    let menu = idx("MENU");
+    let groups: &[(u8, u8, u16)] = &[(menu, 0, 0)];
     let bytes = make_ystb([0x2b, 0x90, 0x4f, 0x93], groups, &[]);
     let script = YstbFile::from_bytes(&bytes, [0x2b, 0x90, 0x4f, 0x93]).unwrap();
 
     let mut vm = GroupVm::load(script).unwrap();
     let s = vm.run(10).unwrap();
-    assert!(matches!(s, VmSuspend::Error(ref m) if m.contains("0x16")));
+    let want = format!("0x{menu:02x}");
+    assert!(matches!(s, VmSuspend::Error(ref m) if m.contains(&want)));
     assert_eq!(vm.state(), VmState::Error);
     assert!(matches!(
         vm.events().first(),
-        Some(VmEvent::Unsupported { command: 0x16, .. })
+        Some(VmEvent::Unsupported { command, .. }) if *command == menu
     ));
     assert!(vm.resume(ResumeResponse::Continue).is_err());
 }
@@ -164,14 +242,17 @@ fn strict_unsupported_halts() {
 /// trace 模式(strict=false):未实现命令记录事件后继续,走完全部组。
 #[test]
 fn trace_mode_continues_past_unsupported() {
-    let groups: &[(u8, u8, u16)] = &[(0x16, 0, 0), (0x3e, 0, 0)]; // FLASH + MENU 未实现
+    // 两个**确证未实装**的命令(按名取序号,不写死版本常量)。
+    // (MATH3D 曾在此列;2026-10-16 实装为 Subsystem 后换成 TRAY —— 引擎
+    // 托盘图标命令,v555 表在册、本内核零实现。)
+    let groups: &[(u8, u8, u16)] = &[(idx("MENU"), 0, 0), (idx("TRAY"), 0, 0)];
     let bytes = make_ystb([0x2b, 0x90, 0x4f, 0x93], groups, &[]);
     let script = YstbFile::from_bytes(&bytes, [0x2b, 0x90, 0x4f, 0x93]).unwrap();
 
     let mut vm = GroupVm::load(script).unwrap();
     vm.set_strict(false);
     let s = vm.run(10).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     assert_eq!(vm.executed_groups(), 2);
     assert_eq!(
         vm.events()
@@ -197,7 +278,7 @@ fn sample_yst00000_first_group_is_declaration() {
             p.exists().then_some(p)
         })
     else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -212,7 +293,7 @@ fn sample_yst00000_first_group_is_declaration() {
     let s = vm.run(1000).unwrap();
     // yst00000 全部为声明组(F_INT/F_STR/F_VAR 等)→ 全作为 Declaration 记录,
     // 到 RETURN 结束
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     assert!(
         vm.events()
             .iter()
@@ -271,7 +352,7 @@ fn let_array_element_compound_and_readback() {
     );
     // 执行:LET @5000[2] += 3 → 0+3=3;IF(aload==3) 真 → 顺序走 g2 覆写 =99 → IFEND → RETURN
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     // 读回:@5000[2] == 99(真路径 LET 覆写,复合赋值与纯赋值先后生效)
     let r = VarRef { space: VarSpace::At, id: 5000 };
     assert_eq!(
@@ -309,7 +390,7 @@ fn let_frame_local_no_frame_halts() {
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
     let s = vm.run(10).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     // 值落在基帧(= 引擎 record[0]),不进全局 store
     let r = yuris_value::VarRef { space: yuris_value::VarSpace::At, id: 0x35 };
     assert_eq!(
@@ -332,7 +413,7 @@ fn ysvr_init_chain() {
             p.exists().then_some(p)
         })
     else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -370,17 +451,17 @@ fn ysvr_init_chain() {
                         _ => continue,
                     };
                     store.declare_array(&r, elem, &e.bounds);
-                    // 初值写入 0 号元素(多维=全零下标)
-                    let zeros = vec![0i64; e.bounds.len()];
+                    // 初值**填满整个数组**(2026-10-17 勘误:旧行为只写 0 号
+                    // 元素,与 VM 的 `apply_ysvr_entry` 同错;此处镜像同步)
                     match init {
                         yuris_format::ysvr::YsvrInit::Int(i) => {
-                            store.set_elem(&r, &zeros, yuris_value::Value::Int(*i)).unwrap()
+                            store.fill_array(&r, yuris_value::Value::Int(*i)).unwrap()
                         }
                         yuris_format::ysvr::YsvrInit::Float(f) => {
-                            store.set_elem(&r, &zeros, yuris_value::Value::Float(*f)).unwrap()
+                            store.fill_array(&r, yuris_value::Value::Float(*f)).unwrap()
                         }
                         yuris_format::ysvr::YsvrInit::Str(b) => {
-                            store.set_elem(&r, &zeros, yuris_value::Value::Str(b.clone())).unwrap()
+                            store.fill_array(&r, yuris_value::Value::Str(b.clone())).unwrap()
                         }
                         _ => {}
                     }
@@ -431,7 +512,7 @@ fn loop_three_iterations_with_let_counter() {
         &[1],
     );
     let s = vm.run(1000).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     // counter 语义:LOOP 置 1;每次 LOOPEND 后 +1;counter>=limit 时退出。
     // limit=3:体执行次数 = 3(counter 1,2,3 → 第 3 次 LOOPEND 时 counter=3>=3 退出)
     // → LET 执行 3 次 → @5001[0] = 3
@@ -489,7 +570,7 @@ fn loop_break_exits_early() {
         &[1],
     );
     let s = vm.run(1000).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     assert_eq!(
         vm.store().get_elem(
             &yuris_value::VarRef { space: yuris_value::VarSpace::At, id: 5001 },
@@ -526,7 +607,7 @@ fn wait_counter_suspends() {
     // resume 后继续到 RETURN
     vm.resume(ResumeResponse::Continue).unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
 }
 
 /// WAIT:无参数 → 不挂起,直接继续。
@@ -538,7 +619,7 @@ fn wait_no_param_no_suspend() {
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
 }
 
 /// TEXT:FILE 字符串参数 → Text 事件(带 let/clear 布尔)。
@@ -555,7 +636,7 @@ fn text_emits_text_event() {
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     assert!(vm.events().iter().any(|e| matches!(
         e,
         VmEvent::Text { file: Some(b), let_flag: false, clear_flag: false, .. }
@@ -579,7 +660,7 @@ fn sound_emits_sound_event() {
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     assert!(vm.events().iter().any(|e| matches!(
         e,
         VmEvent::Sound { id: Some(_), play: Some(1), .. }
@@ -603,7 +684,7 @@ fn cg_emits_cg_event_with_position() {
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     assert!(vm.events().iter().any(|e| matches!(
         e,
         VmEvent::Cg { id: Some(_), position: Some((100, 200, _)), .. }
@@ -670,7 +751,7 @@ fn gosub_frame_local_let_readwrite() {
     vm.set_labels(labels);
     vm.set_script_id(0);
     let s = vm.run(1000).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     // 全局不污染:帧局部 id 0x32/0x33 是声明命令 id,不在全局表
     assert!(vm.store().get_opt(&VarRef { space: VarSpace::At, id: 0x32 }).is_none());
     assert!(vm.store().get_opt(&VarRef { space: VarSpace::At, id: 0x33 }).is_none());
@@ -732,7 +813,7 @@ fn cross_script_gosub_and_return() {
     vm.set_labels(labels);
 
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     // 跨脚本 GOSUB 后,B 的 LET 写到全局 @5000[0] = 5(全局共享;帧局部独立)。
     assert_eq!(
         vm.store().get_elem(
@@ -768,7 +849,7 @@ fn bootstrap_system_start_reaches_end() {
             p.exists().then_some(p)
         })
     else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
@@ -803,7 +884,7 @@ fn bootstrap_system_start_reaches_end() {
                 continue;
             }
             VmSuspend::Complete => {
-                assert_eq!(vm.state(), VmState::Finished);
+                assert_main_script_yielded_state(&vm);
                 break;
             }
             VmSuspend::Wait { .. } => {
@@ -889,7 +970,7 @@ fn varinfo_length_readonly_query() {
         )
         .unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     assert!(vm.events().iter().any(|e| matches!(
         e,
         VmEvent::VarQuery { command: cmd::VARINFO, .. }
@@ -937,7 +1018,7 @@ fn varinfo_search_returns_index() {
             .unwrap();
     }
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     // key=30 从下标 2 起 → 命中下标 3
     assert_eq!(
         vm.store().get(&VarRef { space: VarSpace::At, id: 6000 }).unwrap(),
@@ -979,7 +1060,7 @@ fn sample_script190_varinfo_group_executes() {
             p.exists().then_some(p)
         })
     else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
@@ -1039,7 +1120,7 @@ fn cgact_emits_cgact_event() {
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     assert!(vm.events().iter().any(|e| matches!(
         e,
         VmEvent::CgAct { id: Some(_), .. }
@@ -1059,7 +1140,7 @@ fn load_records_file_path() {
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     assert!(vm.events().iter().any(|e| matches!(
         e,
         // 0x4d 界定符在求值器解码(成果 53)→ 事件携带裸文件名
@@ -1081,7 +1162,7 @@ fn sample_cgact_windows_decode() {
             p.exists().then_some(p)
         })
     else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let ypf = yuris_format::ypf::YpfArchive::from_bytes(std::fs::read(&path).unwrap(), 0xC9).unwrap();
@@ -1139,7 +1220,7 @@ fn let_lvalue_window_0x48_index_is_value_not_ref() {
     );
     vm.store_mut().set(&VarRef { space: VarSpace::At, id: 6001 }, yuris_value::Value::Int(2));
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     let r = VarRef { space: VarSpace::Dollar, id: 6000 };
     assert_eq!(
         vm.store().get_elem(&r, &[2]).unwrap(),
@@ -1190,7 +1271,7 @@ fn varact_copy_substring_and_empty_object_guard() {
         Value::Str(b"abcdef".to_vec()),
     ).unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     assert_eq!(
         vm.store().get(&VarRef { space: VarSpace::At, id: 6002 }).unwrap(),
         &Value::Str(b"abc".to_vec())
@@ -1208,7 +1289,7 @@ fn varact_copy_substring_and_empty_object_guard() {
         Value::Str(Vec::new()),
     ).unwrap();
     let s2 = vm2.run(100).unwrap();
-    assert_eq!(s2, VmSuspend::Complete);
+    assert_main_script_yields(&s2);
     assert_eq!(
         vm2.store().get(&VarRef { space: VarSpace::At, id: 6002 }).unwrap(),
         &Value::Str(Vec::new())
@@ -1307,7 +1388,7 @@ fn save_sets_bitmap_target() {
     // 语料中 SET 目标是标量 INT(位图) — 预置 @6001 = 0
     vm.store_mut().set(&VarRef { space: VarSpace::At, id: 6001 }, Value::Int(0));
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     // 引擎 a0:desc INT → SET 求值(缺省无值窗)位图写 1(语料 [DNO,SET] 全部置位)
     // 注:SET 值窗未给 → set_flag=false → 写 0(清零路径;语料亦存在)
     let v = vm.store().get(&VarRef { space: VarSpace::At, id: 6001 }).unwrap();
@@ -1335,7 +1416,7 @@ fn save_sets_bitmap_target() {
         &[1],
     );
     let s2 = vm2.run(100).unwrap();
-    assert_eq!(s2, VmSuspend::Complete);
+    assert_main_script_yields(&s2);
     assert_eq!(
         vm2.store().get_elem(&VarRef { space: VarSpace::At, id: 6002 }, &[0]).unwrap(),
         &Value::Float(1.0),
@@ -1359,7 +1440,7 @@ fn cgend_emits_event_with_id() {
     let script = YstbFile::from_bytes(&bytes, key).unwrap();
     let mut vm = GroupVm::load(script).unwrap();
     let s = vm.run(100).unwrap();
-    assert_eq!(s, VmSuspend::Complete);
+    assert_main_script_yields(&s);
     let hit = vm.events().iter().any(|e| matches!(
         e,
         yuris_vm::VmEvent::CgEnd { id: Some(txt), .. } if txt.contains("BT.OFF")

@@ -2,6 +2,37 @@
 //!
 //! 样本缺失时跳过;可用 `YURIS_SAMPLE_BNYPF` 指向样本。
 
+/// 样本缺失时的**可观测**跳过(审查待办 01 T19)。
+///
+/// 旧行为:27 个用例在样本缺失时只 `eprintln!` 一行然后**报 ok** ——
+/// 默认测试输出被捕获,报告里完全看不出"没断言",`ignored` 也恒为 0。
+///
+/// 现在:① 标准前缀 `sample not found, skip:`(单条 grep 可计数);
+/// ② 追加写 `$TEMP/yuris-sample-skips.txt`(捕获也可见,`wc -l` 计数);
+/// ③ `YURIS_REQUIRE_SAMPLE=1` 时改为 panic(CI/本机强制真跑)。
+#[allow(dead_code)]
+fn skip_sample() {
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed>")
+        .to_string();
+    let line = format!("sample not found, skip: {name}\n");
+    eprint!("{line}");
+    let dir = std::env::var_os("TEMP")
+        .or_else(|| std::env::var_os("TMP"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join("yuris-sample-skips.txt");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    if std::env::var_os("YURIS_REQUIRE_SAMPLE").is_some() {
+        panic!("YURIS_REQUIRE_SAMPLE=1 但样本缺失: {name}");
+    }
+}
+
 use yuris_format::{ypf::YpfArchive, ystb::{segment_window, YstbFile}};
 use yuris_script::{decode_window, Insn, VarSpace};
 
@@ -27,7 +58,7 @@ fn open_sample() -> Option<YpfArchive> {
 #[test]
 fn yst00000_decodes_with_zero_unknown() {
     let Some(ypf) = open_sample() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
@@ -96,7 +127,7 @@ fn yst00000_decodes_with_zero_unknown() {
 #[test]
 fn yst00000_first_window_semantics() {
     let Some(ypf) = open_sample() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
@@ -123,7 +154,7 @@ fn yst00000_first_window_semantics() {
 #[test]
 fn yst00034_pool_file_decodes() {
     let Some(ypf) = open_sample() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let blob = ypf.read("$ysbin\\yst00034.ybn").unwrap();
@@ -156,7 +187,7 @@ fn yst00034_pool_file_decodes() {
 #[test]
 fn yst00000_m_strings_are_quoted() {
     let Some(ypf) = open_sample() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();
@@ -187,7 +218,7 @@ fn yst00000_evaluator_smoke() {
     use yuris_value::VariableStore;
 
     let Some(ypf) = open_sample() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let blob = ypf.read("$ysbin\\yst00000.ybn").unwrap();

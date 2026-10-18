@@ -5,6 +5,37 @@
 //!   (`VmSuspend::Wait`)用 MockRuntime 走 begin/draw/end + resume,
 //!   断言空循环推进(样本缺失时跳过,同 vm.rs 惯例)。
 
+/// 样本缺失时的**可观测**跳过(审查待办 01 T19)。
+///
+/// 旧行为:27 个用例在样本缺失时只 `eprintln!` 一行然后**报 ok** ——
+/// 默认测试输出被捕获,报告里完全看不出"没断言",`ignored` 也恒为 0。
+///
+/// 现在:① 标准前缀 `sample not found, skip:`(单条 grep 可计数);
+/// ② 追加写 `$TEMP/yuris-sample-skips.txt`(捕获也可见,`wc -l` 计数);
+/// ③ `YURIS_REQUIRE_SAMPLE=1` 时改为 panic(CI/本机强制真跑)。
+#[allow(dead_code)]
+fn skip_sample() {
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed>")
+        .to_string();
+    let line = format!("sample not found, skip: {name}\n");
+    eprint!("{line}");
+    let dir = std::env::var_os("TEMP")
+        .or_else(|| std::env::var_os("TMP"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join("yuris-sample-skips.txt");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    if std::env::var_os("YURIS_REQUIRE_SAMPLE").is_some() {
+        panic!("YURIS_REQUIRE_SAMPLE=1 但样本缺失: {name}");
+    }
+}
+
 use yuris_format::ystb::YstbFile;
 use yuris_runtime::mock::MockRuntime;
 use yuris_runtime::RuntimeApi;
@@ -66,6 +97,14 @@ fn cg_event_maps_to_scene_layer() {
         dumped = evs.len();
         match s {
             VmSuspend::None => break,
+            // 成果 132:基帧 RETURN = 重排队让出(Wait{None,None})—— 对**单脚本
+            // 测试**而言没有外部使命会重入 ⇒ 这就是终止态。必须先于下面的通用
+            // `Wait{..}` 分支匹配(旧顺序被通配吞掉 → 每轮 resume 继续跑,
+            // 事件无限累积,实测内存爆到 35GB 被 OS 杀掉:STATUS_STACK_BUFFER_OVERRUN)。
+            VmSuspend::Wait {
+                counter: None,
+                time_ms: None,
+            } => break,
             VmSuspend::Wait { .. } => {
                 // 帧边界:begin → 逐层绘制 → 文本 → end
                 rt.graphics().begin_frame().unwrap();
@@ -81,7 +120,7 @@ fn cg_event_maps_to_scene_layer() {
                 });
                 vm.resume(ResumeResponse::Continue).unwrap();
             }
-            VmSuspend::Complete => break,
+            VmSuspend::Complete => { /* 语义已由成果 132 取代,保留兜底 */ break }
             VmSuspend::Error(m) => panic!("VM error: {m}"),
         }
     }
@@ -124,7 +163,7 @@ fn mock_backend_runs_game_loop() {
             p.exists().then_some(p)
         })
     else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let bytes = std::fs::read(&path).unwrap();
@@ -170,6 +209,19 @@ fn mock_backend_runs_game_loop() {
                 if last_groups > 3_000_000 {
                     panic!("组数预算耗尽仍未进入帧循环");
                 }
+            }
+            // 成果 132:基帧 RETURN = 重排队让出(Wait{None,None})。单脚本测试
+            // 没有外部使命会重入它 ⇒ 终止(必须先于通用 `Wait{..}` 匹配)。
+            VmSuspend::Wait {
+                counter: None,
+                time_ms: None,
+            } => {
+                eprintln!(
+                    "[mock_loop] 基帧让出(可重入执行位),累计 {} 组,帧 {}",
+                    vm.executed_groups(),
+                    rt.graphics.frames
+                );
+                break;
             }
             VmSuspend::Wait { .. } => {
                 // 每帧:场景 → 后端绘制 → 提交 → resume
@@ -287,9 +339,11 @@ fn gosub_str_frame_local_roundtrip() {
     loop {
         let s = vm.run(100).unwrap();
         match s {
-            VmSuspend::None | VmSuspend::Wait { .. } => {
+            VmSuspend::None | VmSuspend::Wait { counter: Some(_), .. }
+            | VmSuspend::Wait { time_ms: Some(_), .. } => {
                 vm.resume(ResumeResponse::Continue).unwrap();
             }
+            // 成果 132:基帧 RETURN = 重排队让出(无计数/无时效)= 终止
             _ => break,
         }
     }
@@ -348,9 +402,11 @@ fn sysvar_at48_is_loop_iteration() {
     loop {
         let s = vm.run(100).unwrap();
         match s {
-            VmSuspend::None | VmSuspend::Wait { .. } => {
+            VmSuspend::None | VmSuspend::Wait { counter: Some(_), .. }
+            | VmSuspend::Wait { time_ms: Some(_), .. } => {
                 vm.resume(ResumeResponse::Continue).unwrap();
             }
+            // 成果 132:基帧 RETURN = 重排队让出(无计数/无时效)= 终止
             _ => break,
         }
     }

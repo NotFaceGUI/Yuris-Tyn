@@ -16,12 +16,12 @@ yuris-format = { workspace = true }
 yuris-value = { workspace = true }
 yuris-script = { workspace = true }
 yuris-vm = { workspace = true }
+yuris-scenario = { workspace = true }
 yuris-runtime = { workspace = true }
 yuris-render = { workspace = true }
 yuris-audio = { workspace = true }
 yuris-input = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
+encoding_rs = { workspace = true }

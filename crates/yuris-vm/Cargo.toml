@@ -7,12 +7,21 @@ license.workspace = true
 description = "L3：PC / 值栈 / 调用栈 / 变量区。必须支持 suspend/resume，绝不阻塞。"
 
 [dependencies]
+flate2 = { workspace = true }
+# 包内条目名是 CP932(SJIS);路径解析要把 UTF-8 字符串翻回 CP932 才能命中
+# (成果 135:片头 LOGO 的 `cg\ev\サークル.jpg` 就是被这一点挡住的)。
+encoding_rs = { workspace = true }
+rustc-hash = { workspace = true }
 yuris-core = { workspace = true }
+yuris-log = { workspace = true }
 yuris-value = { workspace = true }
 yuris-script = { workspace = true }
 yuris-format = { workspace = true }
-yuris-expr = { workspace = true }
+# 剧本通道(v555 明文 .txt 运行器 + 统一文本通道;2026-10-17 从 player-core 迁入)
+yuris-scenario = { workspace = true }
+# yuris-expr 已移除（T27,2026-10-16）：它只是 13 行骨架，VM 侧 `grep yuris_expr`
+# 零命中 —— 表达式求值实际由 yuris-script 承担。保留 crate 目录是为了不删
+# 仓库主人未审阅的文件；若确认无用，删目录即可（workspace 成员见根 Cargo.toml）。
 yuris-scene = { workspace = true }
 yuris-runtime = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }

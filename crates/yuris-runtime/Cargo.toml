@@ -11,5 +11,4 @@ yuris-core = { workspace = true }
 yuris-value = { workspace = true }
 yuris-scene = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 serde = { workspace = true }

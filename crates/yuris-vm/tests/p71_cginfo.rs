@@ -98,7 +98,10 @@ fn cginfo_sx_sy_color_defaults() {
     );
     let mut vm = vm;
     let s = vm.run(100).unwrap();
-    assert!(matches!(s, VmSuspend::Complete), "{s:?}");
+    assert!(
+        matches!(s, VmSuspend::Wait { counter: None, time_ms: None }),
+        "{s:?}"
+    );  // 成果 132:基帧 RETURN = 重排队让出(Wait)
     assert_eq!(
         vm.store().get(&var(9000)).unwrap(),
         &Value::Int(0),
@@ -131,7 +134,10 @@ fn cginfo_no_file_not_created() {
         ],
     );
     let s = vm.run(100).unwrap();
-    assert!(matches!(s, VmSuspend::Complete), "{s:?}");
+    assert!(
+        matches!(s, VmSuspend::Wait { counter: None, time_ms: None }),
+        "{s:?}"
+    );  // 成果 132:基帧 RETURN = 重排队让出(Wait)
     assert_eq!(
         vm.store().get(&var(9010)).unwrap(),
         &Value::Int(0),
@@ -150,7 +156,10 @@ fn cginfo_no_file_not_created() {
         ],
     );
     let s = vm.run(100).unwrap();
-    assert!(matches!(s, VmSuspend::Complete), "{s:?}");
+    assert!(
+        matches!(s, VmSuspend::Wait { counter: None, time_ms: None }),
+        "{s:?}"
+    );  // 成果 132:基帧 RETURN = 重排队让出(Wait)
     assert_eq!(
         vm.store().get(&var(9011)).unwrap(),
         &Value::Int(0),
@@ -178,7 +187,10 @@ fn cgend_unregisters() {
         ],
     );
     let s = vm.run(100).unwrap();
-    assert!(matches!(s, VmSuspend::Complete), "{s:?}");
+    assert!(
+        matches!(s, VmSuspend::Wait { counter: None, time_ms: None }),
+        "{s:?}"
+    );  // 成果 132:基帧 RETURN = 重排队让出(Wait)
     assert_eq!(
         vm.store().get(&var(9020)).unwrap(),
         &Value::Int(0),
@@ -210,7 +222,10 @@ fn cginfo_x_y_roundtrip() {
         ],
     );
     let s = vm.run(100).unwrap();
-    assert!(matches!(s, VmSuspend::Complete), "{s:?}");
+    assert!(
+        matches!(s, VmSuspend::Wait { counter: None, time_ms: None }),
+        "{s:?}"
+    );  // 成果 132:基帧 RETURN = 重排队让出(Wait)
     assert_eq!(vm.store().get(&var(9030)).unwrap(), &Value::Int(100));
     assert_eq!(vm.store().get(&var(9031)).unwrap(), &Value::Int(90));
 }

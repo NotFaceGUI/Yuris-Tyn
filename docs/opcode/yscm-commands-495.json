@@ -1,0 +1,365 @@
+{
+  "_meta": {
+    "command_count": 119,
+    "engine_version": 495
+  },
+  "commands": [
+    {
+      "name": "CDDA"
+    },
+    {
+      "name": "CG"
+    },
+    {
+      "name": "CGACT"
+    },
+    {
+      "name": "CGEND"
+    },
+    {
+      "name": "CGINFO"
+    },
+    {
+      "name": "CLIPACT"
+    },
+    {
+      "name": "CLIPINFO"
+    },
+    {
+      "name": "CSV"
+    },
+    {
+      "name": "CSVINFO"
+    },
+    {
+      "name": "DEBUGLIST"
+    },
+    {
+      "name": "DIALOG"
+    },
+    {
+      "name": "ELSE"
+    },
+    {
+      "name": "EMOTE"
+    },
+    {
+      "name": "EMOTEINFO"
+    },
+    {
+      "name": "END"
+    },
+    {
+      "name": "ERROR"
+    },
+    {
+      "name": "ERRORINFO"
+    },
+    {
+      "name": "F_FLT"
+    },
+    {
+      "name": "F_INT"
+    },
+    {
+      "name": "F_STR"
+    },
+    {
+      "name": "F_VAR"
+    },
+    {
+      "name": "FILEACT"
+    },
+    {
+      "name": "FILEINFO"
+    },
+    {
+      "name": "FLASH"
+    },
+    {
+      "name": "FLASHEND"
+    },
+    {
+      "name": "FLASHINFO"
+    },
+    {
+      "name": "FLT"
+    },
+    {
+      "name": "FONT"
+    },
+    {
+      "name": "FONTINFO"
+    },
+    {
+      "name": "FPS"
+    },
+    {
+      "name": "G_FLT"
+    },
+    {
+      "name": "G_FLT2"
+    },
+    {
+      "name": "G_FLT3"
+    },
+    {
+      "name": "G_FLT4"
+    },
+    {
+      "name": "G_INT"
+    },
+    {
+      "name": "G_INT2"
+    },
+    {
+      "name": "G_INT3"
+    },
+    {
+      "name": "G_INT4"
+    },
+    {
+      "name": "G_STR"
+    },
+    {
+      "name": "G_STR2"
+    },
+    {
+      "name": "G_STR3"
+    },
+    {
+      "name": "G_STR4"
+    },
+    {
+      "name": "G_VAR"
+    },
+    {
+      "name": "GO"
+    },
+    {
+      "name": "GOSUB"
+    },
+    {
+      "name": "IF"
+    },
+    {
+      "name": "IFBLEND"
+    },
+    {
+      "name": "IFBREAK"
+    },
+    {
+      "name": "IFCONTINUE"
+    },
+    {
+      "name": "IFEND"
+    },
+    {
+      "name": "INPUT"
+    },
+    {
+      "name": "INT"
+    },
+    {
+      "name": "LABEL"
+    },
+    {
+      "name": "LABELINFO"
+    },
+    {
+      "name": "LET"
+    },
+    {
+      "name": "LOAD"
+    },
+    {
+      "name": "LOOP"
+    },
+    {
+      "name": "LOOPBREAK"
+    },
+    {
+      "name": "LOOPCONTINUE"
+    },
+    {
+      "name": "LOOPEND"
+    },
+    {
+      "name": "MACRO"
+    },
+    {
+      "name": "MATH"
+    },
+    {
+      "name": "MATH3D"
+    },
+    {
+      "name": "MENU"
+    },
+    {
+      "name": "MENUACT"
+    },
+    {
+      "name": "MENUEND"
+    },
+    {
+      "name": "MENUINFO"
+    },
+    {
+      "name": "MIDI"
+    },
+    {
+      "name": "MIDIEND"
+    },
+    {
+      "name": "MIDIINFO"
+    },
+    {
+      "name": "MOUSE"
+    },
+    {
+      "name": "MOVIE"
+    },
+    {
+      "name": "MOVIEEND"
+    },
+    {
+      "name": "MOVIEINFO"
+    },
+    {
+      "name": "PLUG"
+    },
+    {
+      "name": "PREP"
+    },
+    {
+      "name": "REGINFO"
+    },
+    {
+      "name": "RETURN"
+    },
+    {
+      "name": "RETURNBREAK"
+    },
+    {
+      "name": "RETURNCODE"
+    },
+    {
+      "name": "S_FLT"
+    },
+    {
+      "name": "S_INT"
+    },
+    {
+      "name": "S_STR"
+    },
+    {
+      "name": "S_VAR"
+    },
+    {
+      "name": "SAVE"
+    },
+    {
+      "name": "SAVEEND"
+    },
+    {
+      "name": "SAVEINFO"
+    },
+    {
+      "name": "SOUND"
+    },
+    {
+      "name": "SOUNDEND"
+    },
+    {
+      "name": "SOUNDINFO"
+    },
+    {
+      "name": "STR"
+    },
+    {
+      "name": "SYSTEM"
+    },
+    {
+      "name": "SYSTEMINFO"
+    },
+    {
+      "name": "TASK"
+    },
+    {
+      "name": "TASKEND"
+    },
+    {
+      "name": "TASKINFO"
+    },
+    {
+      "name": "TEXT"
+    },
+    {
+      "name": "TEXTINFO"
+    },
+    {
+      "name": "TRAY"
+    },
+    {
+      "name": "VAR"
+    },
+    {
+      "name": "VARACT"
+    },
+    {
+      "name": "VARINFO"
+    },
+    {
+      "name": "WAIT"
+    },
+    {
+      "name": "WINDOW"
+    },
+    {
+      "name": "WINDOWEND"
+    },
+    {
+      "name": "WINDOWINFO"
+    },
+    {
+      "name": "WORD"
+    },
+    {
+      "name": "YMV"
+    },
+    {
+      "name": "YMVEND"
+    },
+    {
+      "name": "YMVINFO"
+    },
+    {
+      "name": "_"
+    },
+    {
+      "name": "_IFDEF"
+    },
+    {
+      "name": "_IFNDEF"
+    },
+    {
+      "name": "_IFEND"
+    },
+    {
+      "name": ");"
+    },
+    {
+      "name": "SYSTEMMODE"
+    },
+    {
+      "name": "COMPILEMODE"
+    },
+    {
+      "name": "RELEASEMODE"
+    },
+    {
+      "name": "PROJECTFOLDER"
+    }
+  ]
+}

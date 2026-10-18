@@ -26,20 +26,52 @@
 
 use std::collections::HashMap;
 
+pub mod audio_probe;
 pub mod boot;
 pub mod bridge;
+pub mod commands;
+pub mod event;
+pub mod exec;
 pub mod host;
+pub mod input;
+pub mod math;
+/// 官方任务调度器重建(**未接线**,差异审阅:`docs/engine/task-scheduler-rebuild.md`;
+/// 现行调度 = `pump_frame`/`step_tasks_at`,保持原样)。
+pub mod task;
+mod driver;
+pub mod scenario;
+pub mod util;
+pub mod vfs;
 
+use host::{ScriptCtx, ScriptHost};
 use yuris_core::{Error, Result};
 use yuris_format::ystb::YstbFile;
-use host::{ScriptCtx, ScriptHost};
 use yuris_script::Evaluator;
 use yuris_value::{Value, VariableStore};
+
+pub use commands::{CmdKind, CommandDispatch, DeclElem};
+pub use input::{EngineInputSettings, InputSnapshot};
+pub(crate) use event::GoOutcome;
+pub use event::{event_json, EffectValue, JumpKind, ResumeResponse, VmEvent, VmState, VmSuspend};
+pub(crate) use exec::Action;
+pub use util::consume_declarations_into;
+pub(crate) use util::mstring;
+pub(crate) use util::VarTarget;
+#[allow(unused_imports)]
+pub(crate) use util::{
+    extract_var_target, sjis_char_len, value_summary, value_truthy, varact_ascii_case,
+    varact_byte_to_char, varact_char_to_byte,
+};
 
 /// crate 版本(与 workspace 同步)
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 命令下标(YSCM 顺序,样本 v555;详见 `docs/engine/command-layer.md` §7)。
+/// **默认 profile 的序号常量**（引擎 555）。
+///
+/// ⚠️ 本模块**不参与分派**：运行期分派一律走 [`CommandDispatch`]，序号来自
+/// 游戏自身的 YSCM（见 [`crate::commands`] 与 `docs/cross-version-commands.md`）。
+/// 这里保留常量只为：(a) 构造[`yuris_core::CommandProfile::v555`]兜底 profile；
+/// (b) 既有测试/工具按名取号。**新代码不得用它做 `match`**。
 pub mod cmd {
     /// GO。
     pub const GO: u8 = 0x2a;
@@ -96,428 +128,6 @@ pub mod cmd {
     /// TASKINFO(任务状态查询;引擎 00451838,EXIST → LET=0/1)。
     pub const TASKINFO: u8 = 0x61;
 }
-
-/// VM 状态机。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VmState {
-    /// 尚未启动。
-    Idle,
-    /// 可继续执行(配额内)。
-    Running,
-    /// 脚本执行完毕。
-    Finished,
-    /// 遇到未证实/未实现语义,已挂起。
-    Error,
-}
-
-/// 一次 `run` 返回的挂起信息。**绝不阻塞**。
-#[derive(Debug, Clone, PartialEq)]
-pub enum VmSuspend {
-    /// 配额耗尽或本批执行完毕,可继续。
-    None,
-    /// 脚本执行完毕。
-    Complete,
-    /// 遇到未实现语义/错误。携带描述。
-    Error(String),
-    /// WAIT:引擎参数 FRAME(帧计数,obj+0x18)/TIME(ms,obj+0x1c=timeGetTime()+ms)。
-    /// 调用方完成等待后 `resume` 继续。
-    Wait {
-        /// FRAME 参数(帧数);None = 未指定。
-        counter: Option<u64>,
-        /// TIME 参数(毫秒);None = 未指定。
-        time_ms: Option<u64>,
-    },
-}
-
-/// 恢复执行的外部应答。
-#[derive(Debug, Clone, PartialEq)]
-pub enum ResumeResponse {
-    /// 无条件继续。
-    Continue,
-}
-
-/// 跳转类别(事件流/Golden Test 用)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JumpKind {
-    /// GO。
-    Go,
-    /// IF 条件为假。
-    IfFalse,
-    /// ELSE(跳过 else 块)。
-    Else,
-    /// RETURN 弹帧。
-    Return,
-    /// LOOPBREAK(跳出循环)。
-    LoopBreak,
-    /// LOOPEND/LOOPCONTINUE(回到循环体顶部)。
-    LoopContinue,
-}
-
-/// GO 的执行结局。
-enum GoOutcome {
-    /// 跳到目标组(当前脚本内)。
-    Jump(usize),
-    /// 跨脚本跳转(切换上下文后跳到目标脚本的组号)。
-    CrossScript {
-        /// 目标脚本号。
-        script_id: u16,
-        /// 目标组号。
-        target: usize,
-    },
-    /// 不跳(非 strict 下未命中等),顺序继续。
-    NoJump,
-    /// strict 挂起,携带原因。
-    Halted(String),
-}
-
-/// VM 事件流(Trace / Golden Test 的数据源)。
-#[derive(Debug, Clone, PartialEq)]
-pub enum VmEvent {
-    /// 一个组执行完毕。
-    GroupExecuted {
-        /// 组下标。
-        pc: usize,
-        /// YSCM 命令下标。
-        command: u8,
-        /// 求值结果(仅 IF 的条件等单值场景;多数命令无单一结果)。
-        condition: Option<Value>,
-    },
-    /// 发生跳转。
-    Jump {
-        /// 起始组。
-        from: usize,
-        /// 目标组。
-        to: usize,
-        /// 类别。
-        kind: JumpKind,
-    },
-    /// GOSUB 压帧。
-    Call {
-        /// GOSUB 组下标。
-        from: usize,
-        /// 目标组。
-        to: usize,
-    },
-    /// TEXT:显示文本(FILE 参数为 SJIS 字节;LET/CLEAR 布尔位)。
-    Text {
-        /// 参数槽下标。
-        pc: usize,
-        /// FILE 参数(SJIS 原文)。
-        file: Option<Vec<u8>>,
-        /// LET 参数(=1 允许按 [r]/[c] 划段)。
-        let_flag: bool,
-        /// CLEAR 参数(=1 先清空)。
-        clear_flag: bool,
-    },
-    /// CG:立绘/背景操作(ID,+ X/Y/Z 位置等关键参数)。
-    Cg {
-        /// 组下标。
-        pc: usize,
-        /// 发出命令的脚本号(yst%05d;素材请求源定位用,成果 75)。
-        script_id: u16,
-        /// ID(名称,若为字符串)。
-        id: Option<String>,
-        /// X/Y/Z 位置(若提供)。
-        position: Option<(i64, i64, i64)>,
-        /// 其他已提供参数计数(按 B0 下标)。
-        param_count: usize,
-        /// FILE 槽(46;带图像装载的 CG 命令非空;渲染驱动按此加载资源;
-        /// 无 FILE = 位置/状态更新,沿用手头资源)。
-        file: Option<Vec<u8>>,
-    },
-    /// SOUND:音频操作(ID/FILE/PLAY/LOOP/VOLUME 等)。
-    Sound {
-        /// 组下标。
-        pc: usize,
-        /// ID(名称,若给定)。
-        id: Option<String>,
-        /// FILE(路径,若为字符串)。
-        file: Option<String>,
-        /// PLAY(是否播放;引擎非零=播放)。
-        play: Option<i64>,
-        /// 其他参数计数。
-        param_count: usize,
-    },
-    /// VARACT/VARINFO 只读查询结果(字符串长度/维度/类型查询等)。
-    /// 只读槽求值记录;**写回类槽(赋值/裁剪/大小写/PUSH/POP)走 Unsupported**——
-    /// 未逆向写回目标前不猜(铁律)。
-    VarQuery {
-        /// 组下标。
-        pc: usize,
-        /// 命令(0x66 VARACT / 0x67 VARINFO)。
-        command: u8,
-        /// 已求值槽: (参数下标B0, 值摘要)。
-        evaluated: Vec<(u8, String)>,
-    },
-    /// 声明类命令(INT/FLT/STR/G_*/S_*/F_* 等):加载期数据,引擎运行器
-    /// 用默认 stub,不执行。记录后(trace)继续,stict 下按未实现挂起。
-    Declaration {
-        /// 组下标。
-        pc: usize,
-        /// 命令类型(YSCM 下标)。
-        command: u8,
-        /// 参数窗口数。
-        windows: u8,
-    },
-    /// CGACT:CGM 图层操作(合成/变换等;71 参,运行期图形管线,只记录已求值参数摘要)。
-    CgAct {
-        /// 组下标。
-        pc: usize,
-        /// ID(B0=0,字符串,若给定)。
-        id: Option<String>,
-        /// 已求值参数摘要:(B0 槽, 值摘要)。
-        evaluated: Vec<(u8, String)>,
-    },
-    /// CGINFO:CG 图层属性查询(引擎 CMDH_0043b084)。
-    /// 无图形后端 ⇒ CG 必然不存在 ⇒ 引擎「不存在」路径(结果缓冲清零,LET=0)。
-    CgInfo {
-        /// 组下标。
-        pc: usize,
-        /// ID(槽 0,CG 名)。
-        id: Option<String>,
-        /// 已求值参数摘要((槽, 值摘要);255 = 写回目标记录)。
-        evaluated: Vec<(u8, String)>,
-    },
-    /// LOAD:YSSD 系统数据装载(FILE + DNO + 写回目标;引擎 CMDH_00444648)。
-    /// 装载路径 = 松散文件 + SNP 解压 + `FUN_0044564d` 写回(见 `load_yssd`);
-    /// 事件保留参数摘要供 trace 对拍。
-    Load {
-        /// 组下标。
-        pc: usize,
-        /// FILE 路径(SJIS 原文)。
-        file: Option<Vec<u8>>,
-        /// 已求值参数摘要。
-        evaluated: Vec<(u8, String)>,
-    },
-    /// SAVE:存档数据位图标记(DNO=存档号,SET=目标引用;引擎 CMDH_00451838)。
-    /// 语料 298 组形态 = [DNO, SET 引用](位图置位/清零)+ [FILE](仅记录);
-    /// 引擎按描述符类型把 INT 置 1/0、FLT 置 1.0/0.0。本实现按目标类型写值,
-    /// 不落盘(存档文件格式 Unknown)。
-    Save {
-        /// 组下标。
-        pc: usize,
-        /// FILE 参数(若有;只记录)。
-        file: Option<Vec<u8>>,
-        /// DNO 存档号(若给定)。
-        dno: Option<i64>,
-        /// SET 目标摘要(写位图的变量)。
-        set_target: Option<String>,
-        /// 已求值参数摘要。
-        evaluated: Vec<(u8, String)>,
-    },
-    /// CGEND:CG 显示结束通知(ID 字符串;引擎 LAB_0043ad14)。
-    /// 无图形后端 → 事件化记录,不触碰图形状态。
-    CgEnd {
-        /// 组下标。
-        pc: usize,
-        /// ID(字符串)。
-        id: Option<String>,
-        /// 已求值参数摘要。
-        evaluated: Vec<(u8, String)>,
-    },
-    /// 跨脚本上下文切换。
-    ScriptSwitch {
-        /// 源脚本号(0 表示未知/未初始化 —— 仅诊断)。
-        from_script: u16,
-        /// 目标脚本号。
-        to_script: u16,
-    },
-    /// 未实现/不支持的命令(语义未逆向或跨脚本等)。
-    /// 事件保留现场;strict 模式随后挂起。
-    Unsupported {
-        /// 组下标。
-        pc: usize,
-        /// YSCM 命令下标。
-        command: u8,
-        /// 原因描述。
-        reason: String,
-    },
-    /// 后端子系统配置/查询族(P2):FONTINFO/MATH/FILEINFO/FILEACT/WINDOWINFO/
-    /// MOUSE/FONT/SYSTEM/ERROR/FPS/INPUT。引擎处理器做子系统状态操作
-    /// (字体层/文件/输入模式/数学函数),无后端 → 事件化记录已求值参数。
-    Subsystem {
-        /// 组下标。
-        pc: usize,
-        /// YSCM 命令下标。
-        command: u8,
-        /// 已求值参数摘要 (B0 槽, 值)。
-        evaluated: Vec<(u8, String)>,
-    },
-}
-
-/// 事件 → JSON 行(P1 引擎真值对拍的统一 schema)。
-///
-/// 手工序列化(非 serde):`Value::Str` 为 SJIS 原始字节 → 十六进制避免编码歧义;
-/// `Value::Float` 用 f64 位模式保证 NaN/精度稳定;`Unsupported` 的 reason 做
-/// 非 ASCII 图形字符转义保证字节稳定。golden 快照与 `vm_trace` 导出共用本函数。
-pub fn event_json(e: &VmEvent) -> String {
-    /// JSON 字符串转义(引擎侧 CG 名等含字面 `"`,如 `"CGS"100`;
-    /// 不转义会产出非法 JSON 行 —— P2 对拍实测发现)。
-    fn json_escape(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() + 2);
-        for c in s.chars() {
-            match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-                c => out.push(c),
-            }
-        }
-        out
-    }
-    /// (槽, 值摘要) 对 → JSON 数组(显式构造;Debug 格式化对非 ASCII 产出
-    /// `\u{...}` 非 JSON 转义,不可用)。
-    fn ev_arr(evaluated: &[(u8, String)]) -> String {
-        let items: Vec<String> = evaluated
-            .iter()
-            .map(|(b, v)| format!("\"{}:{}\"", b, json_escape(v)))
-            .collect();
-        format!("[{}]", items.join(","))
-    }
-    fn val_json(v: &yuris_value::Value) -> String {
-        match v {
-            yuris_value::Value::Int(i) => format!(r#"{{"int":{i}}}"#),
-            yuris_value::Value::Float(f) => {
-                // 用位模式保证 NaN/精度稳定
-                format!(r#"{{"f64bits":{}}}"#, f.to_bits())
-            }
-            yuris_value::Value::Str(b) => {
-                let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
-                format!(r#"{{"str_hex":"{hex}"}}"#)
-            }
-        }
-    }
-    match e {
-        VmEvent::GroupExecuted { pc, command, condition } => {
-            let cond = condition
-                .as_ref()
-                .map(val_json)
-                .unwrap_or_else(|| "null".to_string());
-            format!(
-                r#"{{"ev":"group","pc":{pc},"cmd":{command},"cond":{cond}}}"#
-            )
-        }
-        VmEvent::Jump { from, to, kind } => {
-            let k = match kind {
-                JumpKind::Go => "go",
-                JumpKind::IfFalse => "if_false",
-                JumpKind::Else => "else",
-                JumpKind::Return => "return",
-                JumpKind::LoopBreak => "loop_break",
-                JumpKind::LoopContinue => "loop_continue",
-            };
-            format!(r#"{{"ev":"jump","from":{from},"to":{to},"kind":"{k}"}}"#)
-        }
-        VmEvent::Call { from, to } => {
-            format!(r#"{{"ev":"call","from":{from},"to":{to}}}"#)
-        }
-        VmEvent::Text { pc, file, let_flag, clear_flag } => {
-            let f = file.as_ref().map(|b| {
-                let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
-                format!(r#"{{"hex":"{hex}"}}"#)
-            }).unwrap_or_else(|| "null".to_string());
-            format!(
-                r#"{{"ev":"text","pc":{pc},"file":{f},"let":{let_flag},"clear":{clear_flag}}}"#
-            )
-        }
-        VmEvent::Cg { pc, script_id, id, position, param_count, file } => {
-            let idj = id.clone()
-                .map(|i| "{\"s\":\"".to_string() + &json_escape(&i) + "\"}")
-                .unwrap_or_else(|| "null".to_string());
-            let posj = position.map(|(x, y, z)| format!(r#"{{"x":{x},"y":{y},"z":{z}}}"#)).unwrap_or_else(|| "null".to_string());
-            let fj = file.clone().map(|f| {
-                let hex: Vec<String> = f.iter().map(|b| format!("{b:02x}")).collect();
-                format!(r#"{{"hex":"{}"}}"#, hex.join(""))
-            }).unwrap_or_else(|| "null".to_string());
-            format!(r#"{{"ev":"cg","sid":{script_id},"pc":{pc},"id":{idj},"pos":{posj},"n":{param_count},"file":{fj}}}"#)
-        }
-        VmEvent::Sound { pc, id, file, play, param_count } => {
-            let idj = id.clone()
-                .map(|i| "{\"s\":\"".to_string() + &json_escape(&i) + "\"}")
-                .unwrap_or_else(|| "null".to_string());
-            let fj = file.clone()
-                .map(|i| "{\"s\":\"".to_string() + &json_escape(&i) + "\"}")
-                .unwrap_or_else(|| "null".to_string());
-            let pj = play.map(|p| p.to_string()).unwrap_or_else(|| "null".to_string());
-            format!(r#"{{"ev":"sound","pc":{pc},"id":{idj},"file":{fj},"play":{pj},"n":{param_count}}}"#)
-        }
-        VmEvent::ScriptSwitch { from_script, to_script } => {
-            format!(r#"{{"ev":"switch","from":{from_script},"to":{to_script}}}"#)
-        }
-        VmEvent::Declaration { pc, command, windows } => {
-            format!(r#"{{"ev":"decl","pc":{pc},"cmd":{command},"w":{windows}}}"#)
-        }
-        VmEvent::CgAct { pc, id, evaluated } => {
-            let idj = id.clone().map(|s| json_escape(&s)).unwrap_or_else(|| "null".to_string());
-            let ev: Vec<String> = evaluated.iter().map(|(b, v)| format!("{b}:{}", json_escape(v))).collect();
-            let ev = ev_arr(&evaluated);
-            format!(r#"{{"ev":"cgact","pc":{pc},"id":"{idj}","ev_":{ev}}}"#)
-        }
-        VmEvent::CgInfo { pc, id, evaluated } => {
-            let idj = id.clone().map(|s| json_escape(&s)).unwrap_or_else(|| "null".to_string());
-            let ev: Vec<String> = evaluated.iter().map(|(b, v)| format!("{b}:{}", json_escape(v))).collect();
-            let ev = ev_arr(&evaluated);
-            format!(r#"{{"ev":"cginfo","pc":{pc},"id":"{idj}","ev_":{ev}}}"#)
-        }
-        VmEvent::Load { pc, file, evaluated } => {
-            let fj = file.as_ref().map(|b| {
-                let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
-                hex
-            }).unwrap_or_else(|| "null".to_string());
-            let ev = ev_arr(&evaluated);
-            format!(r#"{{"ev":"load","pc":{pc},"file_hex":"{fj}","ev_":{ev}}}"#)
-        }
-        VmEvent::VarQuery { pc, command, evaluated } => {
-            let ev: Vec<String> = evaluated.iter().map(|(b,v)| format!("{b}:{v}")).collect();
-            let ev = ev_arr(&evaluated);
-            format!(r#"{{"ev":"varquery","pc":{pc},"cmd":{command},"ev_":{ev}}}"#)
-        }
-        VmEvent::Save { pc, file, dno, set_target, evaluated } => {
-            let fj = file.as_ref().map(|b| {
-                let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
-                format!(r#"{{"hex":"{hex}"}}"#)
-            }).unwrap_or_else(|| "null".to_string());
-            let dj = dno.map(|d| d.to_string()).unwrap_or_else(|| "null".to_string());
-            let sj = set_target.clone()
-                .map(|s| format!(r#""{}""#, json_escape(&s)))
-                .unwrap_or_else(|| "null".to_string());
-            let ev = ev_arr(&evaluated);
-            format!(
-                r#"{{"ev":"save","pc":{pc},"file":{fj},"dno":{dj},"set":{sj},"ev_":{ev}}}"#
-            )
-        }
-        VmEvent::CgEnd { pc, id, evaluated } => {
-            let idj = id.clone().map(|s| json_escape(&s)).unwrap_or_else(|| "null".to_string());
-            let ev = ev_arr(&evaluated);
-            format!(r#"{{"ev":"cgend","pc":{pc},"id":"{idj}","ev_":{ev}}}"#)
-        }
-        VmEvent::Subsystem { pc, command, evaluated } => {
-            let ev = ev_arr(&evaluated);
-            format!(r#"{{"ev":"sub","pc":{pc},"cmd":{command},"ev_":{ev}}}"#)
-        }
-        VmEvent::Unsupported { pc, command, reason } => {
-            // reason 含动态文本 → 截断转义,保持快照稳定
-            let r: String = reason
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_graphic() || c == ' ' {
-                        c.to_string()
-                    } else {
-                        format!("\\u{:04x}", c as u32)
-                    }
-                })
-                .collect();
-            format!(
-                r#"{{"ev":"unsupported","pc":{pc},"cmd":{command},"reason":"{}"}}"#,
-                json_escape(&r)
-            )
-        }
-    }
-}
-
 /// GOSUB 调用帧(引擎帧的子集)。
 ///
 /// 帧局部变量(引擎 frame 0x328B:INT 局部 +8 每槽 8B、FLT +0x90、STR +0x120,
@@ -552,6 +162,19 @@ pub struct LoopFrame {
     pub limit: Option<u64>,
     /// 已完成次数(引擎 +0x10/+0x14;LOOP 置 1 → LOOPEND 检查后 +1)。
     pub counter: u64,
+    /// **进入本循环时的 `if_nest` 深度**(成果 133)。
+    ///
+    /// **为什么必须有**:`LOOPBREAK`/`LOOPCONTINUE` 会**跳过循环体内剩余的
+    /// `IFEND`**(实测 `es.SP.FINISH.SET`:`g4765 IF / g4766 LOOPBREAK /
+    /// g4767 IFEND` —— LOOPBREAK 直接跳到循环外的 LOOPEND,`g4767 IFEND`
+    /// 永不执行)⇒ 体内 IF 帧全部残留 ⇒ 之后的 `IFBLEND`/`ELSE` 读到**错误的
+    /// 嵌套栈顶**(实测跳到 4767 而不是 4822,绕回循环尾 → `LOOPEND 无配对
+    /// LOOP`)。
+    ///
+    /// 引擎同一族语义已逆向:**块记录随执行位恢复**(`RETURN` 处理器
+    /// `0x44b418` 用帧里记录的深度 truncate `if_nest`/`loops`,成果 51.5);
+    /// 循环退出同理 —— 丢弃循环体内的嵌套块记录。
+    pub if_nest_depth: usize,
 }
 
 /// IF 嵌套帧(引擎 obj[0x40+level*4] 块的子集)。
@@ -561,6 +184,131 @@ pub struct IfFrame {
     pub if_pc: usize,
     /// 块结束目标(IF 的 w2.len)。
     pub end_target: u32,
+}
+
+/// **一个可切换的执行位**(脚本 + 组下标 + 三层栈)。
+///
+/// `TASK` 建立的任务体是**独立的执行位**(引擎侧任务对象带
+/// `SCRIPTPOS`/`TEXTPOS`/`GOSUBLABEL`/`GOSUBNEST` —— 见 YSCM 的
+/// `TASK`/`TASKINFO` 参数表),与主线**并行**推进。本内核用"整体取出 /
+/// 装回"实现上下文切换:`store`(全局变量)留在 [`GroupVm`] 里共用,
+/// 只有这五项属于执行位。
+///
+/// 证据等级:**Confirmed(T4/T6 取证,2026-10-16,成果 148)** —— 引擎命令
+/// 处理器表(`0x7aae40`,119 项,初始化器 `FUN_0045cd30`)与执行链
+/// (帧驱动 → `FUN_00464fa4` 每任务一步 → `FUN_0045177d` 分派)均已 dump;
+/// v555 侧「任务对象 + 入口标签取自 `#` 槽」(`0x4506f4`)与之互印。
+/// 表见 `docs/engine/v494-handler-table.md`。
+#[derive(Debug, Clone)]
+pub struct SavedExec {
+    /// 当前脚本上下文。
+    pub ctx: crate::host::ScriptCtx,
+    /// 当前组下标。
+    pub pc: usize,
+    /// GOSUB 帧栈(末位 = 当前)。
+    pub frames: Vec<GosubFrame>,
+    /// IF 嵌套栈。
+    pub if_nest: Vec<IfFrame>,
+    /// 循环栈。
+    pub loops: Vec<LoopFrame>,
+}
+
+/// WAIT 挂起流水(`YURIS_TRACE_WAIT=1` 门控;高等级诊断,缺省静默)。
+/// 每次让出(主线/任务)打一行:s/pc/计数/时刻 —— boot 相位差(#1/#2,成果 159)
+/// 的节拍对拍仪器。主线行在 [`GroupVm::run`],任务行在 `step_tasks` 的 Wait 分支。
+fn wait_trace_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("YURIS_TRACE_WAIT").is_ok())
+}
+
+/// 单次 `TASK` 调度里给一个任务体的**组配额**。
+///
+/// **勘误(2026-10-13,成果 120)**:旧值 256 **太小**,实测后果 ——
+/// 场景任务 `es.ScenarioScript` 的 `es.SCENARIO.FLOW` 体在 3000 拍里都没能
+/// 走出开头的 `\BTDEF.LOAD`(按钮定义批量装载):每拍只有 256 组额度,
+/// 而该函数内部大量 `WAIT`/子调用把它切碎 ⇒ **有效推进 ≈ 0.5 组/拍**,
+/// 标题永不可达。
+///
+/// 引擎语义是「**跑到让出为止**」(任务体自己用 `WAIT` 让出),量子只是
+/// 失控保护。现取 65536:实测 `es.SCENARIO.FLOW` 在 300 拍内走完
+/// g0..g8(含 `GO[#=$es.STARTLABEL]`),标题脚本(s142 `SCENARIO_START`)开始执行。
+/// **等级:Confirmed(T6 取证,2026-10-16,成果 148)** —— 引擎步进器
+/// `FUN_00464fa4`(每任务一步)每次**只调分派一次**(取任务 → 写 `task+0x3c` →
+/// 执行一条命令 → 回写记录),**全程无指令/命令计数器** ⇒ 引擎确实没有
+/// 「N 条后抢占」的量子,让出只由命令语义决定。本常量因此确认是**工程
+/// 失控保护值**(非引擎常量);运行期可用 `YURIS_TASK_QUANTUM` 覆盖做对拍。
+pub const TASK_QUANTUM: usize = 65536;
+
+/// 运行期可调的量子(环境变量 `YURIS_TASK_QUANTUM`,诊断/对拍用)。
+/// 引擎语义「跑到让出为止」的工程近似值 —— 默认取 [`TASK_QUANTUM`]。
+pub fn task_quantum_from_env() -> usize {
+    std::env::var("YURIS_TASK_QUANTUM")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(TASK_QUANTUM)
+}
+
+/// `YURIS_DEBUG_FRAME` 门控快照(每组/每读一次 `env::var_os` 的替代)。
+fn debug_frame_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var_os("YURIS_DEBUG_FRAME").is_some())
+}
+
+/// 任务表**规模上限**(防爆:每个 [`VmTask`] 持一份执行位,含整份已解析
+/// 脚本 —— 脚本失控反复建名会线性吃内存)。超出即拒建并留事件。
+pub const MAX_TASKS: usize = 128;
+
+/// 渲染侧在「脚本从未设置过 `FONT SX/SY`」时使用的缺省字号(像素,游戏画布)。
+///
+/// 与 `yuris_player_core::text_px_or_default` 的缺省常量必须一致:
+/// `FONTINFO SX/SY` 查询要回读**当前生效值**,脚本的「暂存→改→还原」
+/// 惯用法(`s70 g290-299`)才构成恒等还原。
+pub const DEFAULT_FONT_PX: i64 = 40;
+
+/// 一帧域泵的报告(P10 域调度,成果 161;诊断与测试断言用)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PumpReport {
+    /// 主线域本帧是否推进(预算耗尽的中途暂停也算)。
+    pub main_ran: bool,
+    /// 主线域本帧的真实让出(预算耗尽为 `None`)。
+    pub main_suspend: Option<VmSuspend>,
+    /// 本帧推进过的任务域个数。
+    pub tasks_ran: usize,
+    /// 本帧结束时仍在休息(未到期/未结束)的任务域个数。
+    ///
+    /// 手册真值:「**所有任务都休息时引擎才绘制一帧**」—— 呈现侧的
+    /// 采样不必等它为 0(引擎绘制也是按帧率采样),但它是帧内作业
+    /// 管线是否清空的诊断信号(boot 相位对拍,成果 160)。
+    pub tasks_resting: usize,
+    /// 主线域本帧实际执行组数(S 用:时间片→组数标定)。
+    pub groups_ran: usize,
+}
+
+/// 一个 `TASK` 执行体(引擎"任务对象"的最小语义模型)。
+#[derive(Debug, Clone)]
+pub struct VmTask {
+    /// `ID` 槽(任务名,SJIS 字节;`TASKINFO EXIST` 按此匹配)。
+    /// 引擎:名字是**普通字符串**、非"脚本自备槽"族(实测 494 的
+    /// 12 个自备槽不含此名,与 `SAVE`/`LOAD` 的引用族不同)。
+    pub id: Vec<u8>,
+    /// 执行位(`None` = 正在被步进,取出中)。
+    pub state: Option<SavedExec>,
+    /// 让出剩余帧数(任务体内 `WAIT` 的计数)。
+    pub wait_frames: u32,
+    /// 让出到期时刻(`WAIT TIME` 的毫秒期限;P10 域调度,成果 161)。
+    ///
+    /// 引擎真值(`VmSuspend::Wait` 注释):TIME 参数存 `obj+0x1c =
+    /// timeGetTime()+ms`,**未到期不醒**。旧实现任务侧丢弃 time_ms、把
+    /// TIME 型让出也压成 1 帧(`unwrap_or(1)`,D2)—— 本字段即修正位:
+    /// `step_tasks`/`pump_frame` 判「`wait_frames` 用尽 **且** `resume_at`
+    /// 已到」才可步进(与主线 tick 的双条件同构)。
+    pub resume_at: Option<std::time::Instant>,
+    /// 已结束(任务体 `RETURN` 落到基帧 / `END`)。
+    pub finished: bool,
+    /// `E` 槽:0 = 不参与调度(任务保留但暂停)。
+    pub enabled: bool,
+    /// 已执行的调度次数(`TASKINFO`/诊断用)。
+    pub steps: u64,
 }
 
 /// CG 状态注册表条目(P7.1,成果 62;P1 收尾定稿)。
@@ -605,6 +353,67 @@ pub struct CgState {
     pub file: Option<Vec<u8>>,
     /// 色(COLOR;CGINFO 槽 24 查询,CG 命令无对应槽)。
     pub color: i64,
+    /// **E = 显隐**(本作 CG 槽 2;官方手册语义:该 CG 是否显示)。
+    ///
+    /// **勘误(2026-10-13,成果 121)**:旧实现没有该字段 —— 游戏用 `E=0`
+    /// 关掉的层在播放器侧仍可见,实测三套按钮状态图(`*NAES`/`*OFFES`/`*ONES`)
+    /// 同时上屏。默认 1(新建即显示):`CG[ID=x FILE=y]` 不带 E 时引擎会显示它。
+    pub e: i64,
+    /// **T = 过渡进行度 0〜256**(手册;本作槽 37)。
+    pub t: Option<i64>,
+    /// **TID = 过渡图案图层 ID**(手册;本作槽 38)。
+    pub tid: Option<Vec<u8>>,
+    /// **TA = 过渡精度 0〜256**(手册;本作槽 40)。
+    pub ta: Option<i64>,
+    /// **MID = 外部遮罩图层 ID**(手册;本作槽 35)。
+    pub mid: Option<Vec<u8>>,
+    /// **MODE = 描画模式 0〜18**(手册;本作槽 41)。
+    pub mode: Option<i64>,
+    /// `SX`/`SY` 是否由脚本**显式给出**（手册：レイヤセットの幅/高さ）。
+    ///
+    /// `CGINFO ONMOUSE*` 的命中矩形需要区分「显式尺寸」与「图像原始尺寸」：
+    /// `CgState` 的 `sx/sy` 缺省 1 表示未设置，若直接当尺寸用，按钮命中区
+    /// 会退化成 1×1。
+    pub size_explicit: bool,
+    /// **`Z` 是否由脚本显式给出**(2026-10-17 勘误)。
+    ///
+    /// `z` 缺省 0 是「未设置」的占位,不是引擎语义上的 z=0。旧实现让
+    /// [`GroupVm::cg_z`] 无条件返回 `Some(st.z)` ⇒ 任何**从未给过 Z** 的层
+    /// 都以 `Some(0)` 覆盖播放器的档位兜底(`vm_ui_z_for_path`:按钮 2010 /
+    /// 其它 1000)⇒ 标题六钮/系统栏全部沉到 z=0 被背景盖住。
+    ///
+    /// 实测(`YURIS_TRACE_Z=1`):`BT.OFFES.TITLE.BTN.START=1=1` 建层事件
+    /// `evt=None`,注册表却回 `Some(0)` ⇒ `→ Some(0) fallback=2010`。
+    ///
+    /// 引擎语义(成果 161 同一依据):`z=None` 只表示「本命令不改 z」;
+    /// 新建对象的 z 由子系统档位决定,不是 0。故只有脚本给过 Z 才可作为
+    /// 继承值下发。
+    pub z_explicit: bool,
+}
+
+/// 一次求值前从 VM 侧取出的上下文快照(见 [`GroupVm::eval_ctx`])。
+///
+/// 存在的理由:`Evaluator::with_locals` 可变借走 `store`,构造后无法再读
+/// VM 的其它字段 —— 求值相关的注入值必须先快照、再一次性 `apply`。
+struct EvalCtx {
+    loop_counter: i64,
+    timer_ms: i64,
+    cursor: (i64, i64),
+    screen: (i64, i64),
+    input: Option<std::sync::Arc<yuris_script::eval::InputVars>>,
+}
+
+impl EvalCtx {
+    /// 注入到求值器(四处求值点统一;T20)。
+    fn apply(&self, ev: &mut yuris_script::Evaluator<'_>) {
+        ev.set_cursor(self.cursor.0, self.cursor.1);
+        ev.set_loop_counter(self.loop_counter);
+        ev.set_timer_ms(self.timer_ms);
+        ev.set_screen_size(self.screen.0, self.screen.1);
+        if let Some(input) = &self.input {
+            ev.set_input(std::sync::Arc::clone(input));
+        }
+    }
 }
 
 impl Default for CgState {
@@ -619,8 +428,30 @@ impl Default for CgState {
             img_h: 0,
             file: None,
             color: 0x80_80_80,
+            e: 1,
+            // 过渡/遮罩/描画模式(成果 125):未指定 = None(引擎「未给槽保持原值」)。
+            t: None,
+            tid: None,
+            ta: None,
+            mid: None,
+            mode: None,
+            size_explicit: false,
+            z_explicit: false,
         }
     }
+}
+
+/// 一条被跳过的 Unsupported 命令的聚合记录(见 `GroupVm::unsup_summary`)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedHit {
+    /// 命中次数。
+    pub count: u64,
+    /// 首次命中的脚本号。
+    pub script_id: u16,
+    /// 首次命中的组号。
+    pub pc: usize,
+    /// 首次命中的原因。
+    pub reason: String,
 }
 
 /// YU-RIS 组级 VM(单脚本)。
@@ -633,6 +464,23 @@ pub struct GroupVm {
     pc: usize,
     state: VmState,
     events: Vec<VmEvent>,
+    /// 与 [`GroupVm::events`] **平行**的域标记(0 = 主线,1..= 任务创建序;
+    /// P10 域调度,成果 161)。引擎真值(成果 159):主线与任务在 worker 线程
+    /// 上**并发**泵进,同帧事件序 = 域泵序(主线先、任务按创建序)——消费侧
+    /// 按域合成呈现时靠它区分来源。不进 golden JSONL(golden 序列化只吃
+    /// `VmEvent`,本 vec 不可见)。
+    event_domains: Vec<u8>,
+    /// 当前事件发射域(步进任务期间在 `step_tasks`/`pump_frame` 里切换)。
+    cur_domain: u8,
+    /// **脚本设定的帧率**(`FPS[SET=n]`;`None` = 未设定)。
+    ///
+    /// 手册 `fps/fps.html`:游戏的帧推进基准,影响 `WAIT` 的 FRAME 计数与
+    /// 动画速率。引擎在 `FUN_0041c2f0` 族按此限帧(实测本作 `FPS[SET=60]`,
+    /// s0 g318 / s142 等)。旧实现把 `FPS` 归 Subsystem 只记录不消费 ⇒
+    /// 内核恒以 60fps 之外的节奏跑,且脚本无从查询。
+    ///
+    /// 消费侧:`Player::tick` 的帧间隔按它定(缺省 60)。
+    pub fps: Option<u32>,
     /// 标签表(name → (目标组号, 脚本号));由外部注入(来自 YSLB)。
     labels: HashMap<Vec<u8>, (u32, u16)>,
     /// strict = 遇 Unsupported 命令挂起(默认);false = 记录后继续。
@@ -643,26 +491,279 @@ pub struct GroupVm {
     loops: Vec<LoopFrame>,
     executed_groups: usize,
     executed_windows: usize,
+    /// `RETURNCODE` 执行次数（调用点返回标记；语义取证中，计数供对拍）。
+    returncode_hits: u64,
     /// 已消费声明组的脚本号(每脚本只全扫一次;见 `switch_script`)。
     declared_scripts: std::collections::HashSet<u16>,
     /// 播放器注入的光标逻辑坐标(@133/@138;P9.2)。
     input_cursor: (i64, i64),
     /// YSVR kind2(按脚本初值)条目暂存,首载时应用(成果 59h)。
     ysvr_kind2: Vec<yuris_format::ysvr::YsvrEntry>,
+    /// YSVR kind1(全局初值)条目**快照**(boot 应用完留档)。
+    ///
+    /// 运行期 `VARACT[INIT/G_*]` 恢复组的镜像(旁线仓库 Round20 Confirmed:
+    /// 引擎 `0x454e00 → 0x455b60`,恢复 = 按 `(ty, category)` 12 位掩码重放
+    /// kind1 记录; 没 G_* 槽 = 全 0 掩码 = 什么都不恢复 —— 见
+    /// [`GroupVm::varact_restore_globals`])。
+    ysvr_globals: Vec<yuris_format::ysvr::YsvrEntry>,
     /// 已应用 kind2 的脚本号。
     ysvr_kind2_applied: std::collections::HashSet<u16>,
+    /// **引擎毫秒计时的起点**(`@1[1]` 系统变量)。
+    ///
+    /// 引擎侧:`00447ebc`/`00447d4c` 的 id<1000 二次派发,case 0x01 = timeGetTime
+    /// 派生计时(`docs/engine/command-layer.md` §9c)。脚本侧恒按**时间差**用
+    /// (`@1[1] - 起始` 再除时长 = 进度),全语料 1504 处。VM 用单调时钟取
+    /// 「自 VM 建立以来的毫秒数」—— 与 timeGetTime 同为单调毫秒,差值与绝对值
+    /// 在脚本可观测面上等价。
+    epoch: std::time::Instant,
     /// 游戏虚拟 FS 存在性索引(FILEINFO EXIST;见 `host::PacFileIndex`)。
     file_probe: Option<std::sync::Arc<crate::host::PacFileIndex>>,
-    /// 命名任务注册表(TASK 创建 → TASKINFO EXIST 查询;引擎 FUN_0040ca7d
-    /// 按名查找的等价面。任务的实际执行经 GOSUB 标签链顺序进入 —— 引擎
-    /// trace 实证:es.IDSubTask 的入口脚本由主线 GOSUB 串行调起,boot 段
-    /// 无并行交错;调度器模型归 P7.1 scenario 合流点定性)。
-    tasks: std::collections::HashSet<Vec<u8>>,
+    /// **音频状态查询通道**（`SOUNDINFO`；由宿主注入，VM 不依赖音频层）。
+    audio_probe: Option<std::sync::Arc<dyn crate::audio_probe::SoundStateProbe>>,
+    /// **官方任务调度器**(单一扁平链;主线也是链中一员)。
+    scheduler: Option<crate::task::TaskScheduler>,
+    /// 任务执行位(按任务名;主线直接跑在 `self` 上)。
+    task_slots: HashMap<Vec<u8>, SavedExec>,
+    /// 任务名表(TASK 注册序;TASKINFO/重配置/诊断用)。**原始字节**。
+    task_names: Vec<Vec<u8>>,
+    /// 调度副作用队列(TASK/TASKEND 写入;调度器每条命令后取走)。
+    pending_effects: Vec<crate::task::Effect>,
+    /// 窗口切片复用缓冲(稳态零分配)。
+    windows_buf: Vec<yuris_format::ystb::CommandSlot>,
+    /// 指令解码复用缓冲。
+    insn_buf: Vec<yuris_script::insn::Instruction>,
+    /// 窗口字节复用缓冲。
+    bytes_buf: Vec<u8>,
+    /// **求值槽位缓冲**（跨调用存活 ⇒ 稳态零分配）。
+    ///
+    /// `Evaluator` 是每次求值临时构造的，它的内部 `slot_buf` 活不过一次
+    /// 调用；条件窗口求值每帧约 70 万次，把缓冲提到 VM 上才是真复用。
+    slot_scratch: Vec<yuris_script::eval::Slot>,
+    /// **指令解码缓存**:`(offset,len)` → 已解码指令(脚本装载后窗口不变)。
+    /// 窗口解码缓存。**FxHashMap**：键是整数元组，每帧约 70 万次查表，
+    /// SipHash 的抗 DoS 特性在这里没有安全收益（键不来自外部输入）。
+    insn_cache: rustc_hash::FxHashMap<(u16, u32, u32), std::sync::Arc<[yuris_script::insn::Instruction]>>,
+    /// 当前 vsync 链的起点时钟(u32 绝对毫秒;WAIT TIME 换算用)。
+    chain_now_ms: u32,
+    /// **统一文本通道**(v49x 内联 WORD/TEXT + v555 明文剧本共用)。
+    text_channel: crate::scenario::TextChannel,
+    /// **字体子系统状态**(`FONT` 命令;SX/SY = 字号)。
+    font_px: Option<(i64, i64)>,
+    font_color: Option<(i64, i64)>,
+    font_bold: Option<i64>,
+    font_drawmode: Option<i64>,
+    font_sel: Option<(i64, i64)>,
+    /// `FONT` 的 `ANTIALIASING` 槽(供 `FONTINFO` 查询回读)。
+    font_aa: Option<i64>,
+    /// `FONT` 的 `GRADATION` 槽(`FONTINFO` 查询回读)。
+    font_gradation: Option<i64>,
+    /// `FONT` 的 `ROTATION` 槽(`FONTINFO` 查询回读)。
+    font_rotation: Option<i64>,
+    /// **错误输出级别配置**(`ERROR` 命令;按**命令参数名** `COM_<CMD>` 索引)。
+    ///
+    /// 取证:YSCM 的 `ERROR` 参数表是 `NO / SET / COM_CG / COM_CGACT / …`
+    /// —— 每个 `COM_*` 对应一条命令;SDK 自带 `es_ERIS.yst` 第 33 行
+    /// `ERROR[COM_CG=0]` 是**启动配置**,不是错误触发。
+    /// 引擎处理体(0x4411f8)只把值写进引擎侧错误号/节流位,**不动脚本 pc、
+    /// 变量与场景** ⇒ 本内核按「记录配置 + 推进 pc」实现,不走挂起路径。
+    error_levels: HashMap<String, i64>,
+    /// `ERROR[NO=…]` 的错误号(引擎侧写进进程级错误码字节)。
+    error_code: Option<i64>,
+    /// `SYSTEM[SCREENSAVER=1]` 的屏保抑制标志（引擎 `0x5b4748`）。
+    ///
+    /// 引擎消费者 `0x45ad22`：非 0 时直接返回，跳过屏保/挂起判定。
+    screensaver_suppressed: bool,
+    /// `SYSTEM[BACKGROUNDEXEC=1]` 的后台执行标志（引擎 `0x5b4700`）。
+    ///
+    /// 引擎只在非前台任务（任务对象 `+0x2a8 == 1`）时应用。
+    background_exec: bool,
+    /// **`yst_list.ybn` 脚本名表**（YSTL）—— `SYSTEMINFO` 的真值来源。
+    ///
+    /// `None` = 该包没有该文件（此时 `SCRIPTNUM`/`TEXTNUM` 答 0、
+    /// `SCRIPTFILE` 答空串，与引擎「表未建立」的行为一致）。
+    ystl: Option<yuris_format::ystl::YstlTable>,
+    /// **E-mote 运行时可用性**（引擎 `0x802a28`：「`YSEmote.dll` 装载成功」）。
+    ///
+    /// 缺省 `false`：本内核不装载 `YSEmote.dll`，也不实现 E-mote 渲染面 ⇒
+    /// 与「无 DLL 的引擎」行为一致（`EMOTE` 为空操作）。
+    /// 取证与实现见 `exec::emote` 模块文档。
+    emote_runtime: bool,
+    /// `SYSTEM[TIMECOUNT*]` 的四个累计毫秒计数（引擎 `0x802934/38/3c/40`）。
+    timecount_total: [i64; 4],
+    /// 同上的「置 1 时刻」起点（引擎 `0x802508/10/18/20`；`None` = 未在计时）。
+    timecount_start: [Option<u32>; 4],
+    /// **逻辑时钟**:`now_ms = 上屏帧数 × 1000/fps`(确定性)。
+    logical_clock: bool,
+    /// 逻辑帧计数。
+    logical_frames: u64,
+    /// **Unsupported 命令汇总**(命令名 → 次数/首现场/原因)。
+    pub unsup_summary: std::collections::BTreeMap<String, UnsupportedHit>,
+    /// 是否发射逐组执行事件(诊断面;播放器关闭)。
+    emit_group_events: bool,
+    /// **热点组直方图**(`YURIS_TRACE_HOT=1`):(脚本,pc) → 执行次数。
+    /// 定位「哪几组吃掉每帧时间」的唯一直接手段。
+    hot_hist: HashMap<(u16, usize), u64>,
+    /// **命令类型直方图**(同为 `YURIS_TRACE_HOT`):command_type → 次数。
+    /// 与 `hot_hist` 分开累加,避免「只看收尾时所在脚本」的漏计
+    /// (成果 184:链内跨脚本泵时,按 ctx.script_id 反查会全落空)。
+    hot_cmd: HashMap<u8, u64>,
+    /// **按脚本的组数直方图**(同门控):script_id → 组数。
+    hot_script: HashMap<u16, u64>,
+    /// **当前分辨率**(引擎 `@_SCREEN_SIZE_X/Y` 与 `WINDOWINFO NO=0 SX/SY` 的真值)。
+    ///
+    /// **勘误(2026-10-13,成果 123)**:旧实现把 `WINDOWINFO SX/SY` 与
+    /// `@115/@116` **写死 1920×1080**(最初样本 v555 的值)。而游戏
+    /// `es_First` 读 `WINDOWINFO NO=0 SX/SY` → `@es.WSX/WSY` → **整套布局**
+    /// (`@es.GSX/GSY`,立绘/UI 坐标)都按它算 ⇒ 本作 1100×825 时**画面整体错位**。
+    /// 真值来自游戏自身 `ysbin\yscfg.ybn`(启动链注入)。
+    screen_w: i64,
+    screen_h: i64,
     /// CG 状态注册表(CG 名(SJIS 字节)→ 状态;P7.1,成果 62)。
     cg_registry: HashMap<Vec<u8>, CgState>,
+    /// **运行期命令分派**:**当前脚本**头版本对应的序号 → [`CmdKind`]。
+    ///
+    /// **引擎只有一张表**（`0x7aae40`，119 项，由 `FUN_0045cd30` 按游戏自己的
+    /// `ysc.ybn` 填充）。脚本头版本**不参与**选表 —— 实测该作 160 个脚本里
+    /// 5 个是 v479 头，但它们在 YSLB 里零标签引用（引擎从不加载），
+    /// 因此「按头版本切表」既无必要也无依据。
+    /// 取值顺序见 [`Self::dispatch_for_version`]。
+    dispatch: std::sync::Arc<CommandDispatch>,
+    /// 游戏自身 `ysc.ybn` 建的 profile（**唯一权威表**）。
+    ///
+    /// `None` = 尚未装载 YSCM（工具/合成脚本场景）：`load()` 已按脚本头版本
+    /// 建立了内置表，此后的切脚本**不会**把它覆盖掉。
+    game_profile: Option<yuris_core::CommandProfile>,
+    /// 已解析的分派表缓存（有游戏表 / 无表 各一格）。
+    ///
+    /// **共享而不是克隆（2026-10-18 性能修复）**：`CommandDispatch` 内含
+    /// 121 条命令名 + 每命令的参数名表（约 1100 个 `String`）。旧实现每次
+    /// `dispatch_for_version` 都 `clone()` 整张表 —— 切脚本（`GO`/`GOSUB`
+    /// 跨脚本、任务调度）时每帧数次，实测是「窗口无响应」级的热点。
+    /// 现在缓存与生效字段都指向同一个 `Arc`，切换只剩引用计数 + 一次哈希查找。
+    dispatch_cache: HashMap<u32, std::sync::Arc<CommandDispatch>>,
+    /// **正在执行的命令下标**(`run_main` 在每次 `dispatch` 前写入)。
+    ///
+    /// **为什么要这一项(2026-10-15,勘误)**:各处理器调 `halted`/`halt_err` 时
+    /// 传的是 `cmd::*` 常量 —— 那批常量是**最初样本 v555 的序号留存**
+    /// (见 `cmd` 模块文档),在别的版本上指向完全不同的命令。诊断文本若按它
+    /// 反查名字,就会打出**错误的命令名**:实测 v494 语料 s142 的真实命令是
+    /// `GO`,而 `cmd::GO = 0x2a` 在 v494 的 YSCM 里是 `G_VAR`,于是日志写成
+    /// `未实现/未命中 G_VAR(0x2a idx42) … :: GO 标签未命中` —— 名字与原因
+    /// 互相矛盾,排障时会去查一条根本没执行的命令。
+    ///
+    /// 统一诊断改读本字段(`Some` = 分派期,`None` = 分派外),并把调用方传的
+    /// 常量仅在**与真实值不一致**时作为附加信息附上。
+    cur_command: Option<u8>,
+    /// 「无参数表 → v555 槽号回落」的累计次数(T3;`Cell` 便于 `&self` 的
+    /// `slot_is` 族登记)。生产 profile(四张内置表 + 游戏 YSCM)恒为 0;
+    /// 非 0 = 分派表按名解析不可用、参数槽读到的是 v555 号(UNVERIFIED)。
+    slot_fallback_uses: std::cell::Cell<u64>,
+    /// 已打过的回落告警 `(命令下标, 参数名)` 去重集(首次才打 stderr)。
+    slot_fallback_warned: std::cell::RefCell<std::collections::HashSet<(u8, String)>>,
+    /// Error 态**第一次进入**时的根因快照(`run_main` 的「VM 处于 Error
+    /// 态」挡回消息带它;2026-10-17 之前该消息不带任何原因 —— 实机排查
+    /// 时用户只能看到无穷尽的同名刷屏,根因一行都翻不到)。
+    ///
+    /// 填充点:有明确原因的处理器(`halt_or_record`/`halted` 族)**先写**,
+    /// [`Self::set_error_state`] 只在缺失时按现场兜底。**只记第一次**:
+    /// 之后同一 Error 态里的再入都已不是根因。
+    err_cause: Option<String>,
+    /// run_main 错误日志的**同因去重**缓存+计数(分派与履约见
+    /// [`Self::log_run_error`];60fps 刷屏时同一文本打满一屏无信息量)。
+    err_log_last: Option<String>,
+    err_log_repeat: u64,
+    /// [`Self::set_error_state`] 现场告警的去重集:每个 `(脚本, pc)` 只打一次
+    /// (实测同一 spot 每帧重入,不去了重同样会刷满一屏)。
+    err_site_warned: std::cell::RefCell<std::collections::HashSet<(u16, usize)>>,
+    /// [`Self::note_swallowed`](吞错继续告警)的去重集(同样每 `(脚本, pc)` 一次)。
+    swallow_warned: std::cell::RefCell<std::collections::HashSet<(u16, usize)>>,
+    /// **Unsupported 大告警去重集**:每 `(脚本, pc, 命令下标)` 只打一次横幅。
+    ///
+    /// 与 `unsup_summary`(计数)互补:前者控制实机输出量,后者供收尾汇总。
+    unsup_alerted: std::cell::RefCell<std::collections::HashSet<(u16, usize, u8)>>,
+    /// **标签未命中去重**（同一 `(脚本, pc, 标签)` 只打一次横幅）。
+    ///
+    /// 必须按实例去重：`GO` 未命中会**每帧重入**（脚本停在原 pc 上继续跑），
+    /// 旧实现每次 `alert!` 都同步写 stderr —— 一次 3.3MB 包的启动链里
+    /// 实测把帧率压到个位数（每帧几十条横幅 × 终端写锁）。
+    label_miss_alerted: std::cell::RefCell<std::collections::HashSet<(u16, usize)>>,
+    /// **未建模参数槽告警去重集**:每 `(命令下标, 槽号)` 只打一次。
+    unknown_slot_warned: std::cell::RefCell<std::collections::HashSet<(u8, u8)>>,
+    /// **strict 模式下把未实现升级为致命错误窗**(默认 `false` = 只挂起;
+    /// 播放器/CLI 启动时置 `true`)。
+    ///
+    /// 库/测试默认关:避免全局致命状态污染同进程的其它用例;真正的运行时
+    /// (有画布、有错误窗)必须在启动链显式打开 —— 这正是用户要求的
+    /// 「未知命令 → 中断 → 崩溃界面盖住」。
+    fatal_reporting: bool,
+    /// **缺失子系统/命令**的告警去重集(按命令名)。
+    missing_feature_warned: std::cell::RefCell<std::collections::HashSet<String>>,
+    /// `MATH RND` 的随机源(MT19937;T22)。
+    ///
+    /// 种子来源**未取证**(引擎 `0x4211c2` 初始化路径未读完)→ 缺省用时间派生
+    /// 种子,`UNVERIFIED`;确定性对拍用 [`GroupVm::set_math_seed`] 注入。
+    /// 取值范围语义与引擎一致(`lo + draw % span`),逐位序列待种子取证后对齐。
+    math_rng: crate::math::Mt19937,
+    /// 本帧输入快照(播放器每帧推进;`None` = 无输入面,见
+    /// [`GroupVm::set_input_snapshot`])。
+    input: Option<crate::input::InputSnapshot>,
+    /// 求值器看到的输入快照(与 [`Self::input`] 同步;写入时经
+    /// `Arc::make_mut` 更新,避免每次求值重建)。
+    input_vars: Option<std::sync::Arc<yuris_script::eval::InputVars>>,
+    /// 本帧脚本对输入系统变量的写入 overlay
+    /// (`(id, 首下标)` → 值);同帧后续读取看到新值。
+    input_overlay: HashMap<(u16, i64), Value>,
+    /// 本帧脚本写入 outbox(帧末由播放器回灌输入状态机)。
+    input_writes: Vec<(u16, Option<i64>, Value)>,
+    /// `INPUT` / `MOUSE` 命令累计设置。
+    input_settings: crate::input::EngineInputSettings,
 }
 
 impl GroupVm {
+    /// 设定**当前分辨率**(应来自游戏自身 `yscfg.ybn` 的 `screen_width/height`)。
+    ///
+    /// 影响:`WINDOWINFO NO=0 SX/SY` 应答、`@_SCREEN_SIZE_X/Y`(`@115/@116`)。
+    /// 引擎真值来自显示初始化;本内核无显示栈,故由启动链显式注入(成果 123)。
+    pub fn set_screen_size(&mut self, w: i64, h: i64) {
+        if w > 0 && h > 0 {
+            self.screen_w = w;
+            self.screen_h = h;
+        }
+    }
+
+    /// 当前分辨率(诊断用)。
+    pub fn screen_size(&self) -> (i64, i64) {
+        (self.screen_w, self.screen_h)
+    }
+
+    /// 注入 `yst_list.ybn` 脚本名表（`SYSTEMINFO` 的 `SCRIPTFILE` /
+    /// `SCRIPTNUM` / `TEXTNUM` 真值来源）。
+    pub fn set_ystl_table(&mut self, table: Option<yuris_format::ystl::YstlTable>) {
+        self.ystl = table;
+    }
+
+    /// 当前脚本名表（诊断/查询）。
+    pub fn ystl_table(&self) -> Option<&yuris_format::ystl::YstlTable> {
+        self.ystl.as_ref()
+    }
+
+    /// 「无参数表 → v555 槽号回落」累计次数(T3 可观测面)。
+    ///
+    /// 生产路径(四张内置表 / 游戏 YSCM 注入)**恒为 0**;非 0 表示该脚本
+    /// 的参数是按 v555 槽号读的(UNVERIFIED)—— 对拍/探针据此判定结果可信度。
+    pub fn slot_fallback_uses(&self) -> u64 {
+        self.slot_fallback_uses.get()
+    }
+
+    /// 注入 `MATH RND` 的随机种子(确定性对拍用;T22)。
+    ///
+    /// 引擎的种子来源未取证 —— 本内核缺省时间派生(UNVERIFIED)。
+    /// 对拍「取值分布」而非逐位序列时不需要本方法;对拍逐位序列必须在
+    /// 种子取证后另行对齐。
+    pub fn set_math_seed(&mut self, seed: u32) {
+        self.math_rng = crate::math::Mt19937::new(seed);
+    }
+
     /// CG 注册表快照(P8.2b 重放:名称 SJIS 字节 + 注册 x/y + 最近 FILE)。
     /// 播放器进游戏时按此重建 VM UI 层(纹理已在播放器侧按 fnv(名) 预载)。
     pub fn cg_registry_snapshot(&self) -> Vec<(Vec<u8>, i64, i64, Option<Vec<u8>>)> {
@@ -672,12 +773,57 @@ impl GroupVm {
             .collect()
     }
 
+    /// 注册表快照(**含 E 显隐与 Z**)——重放必须保真层状态。
+    ///
+    /// **为什么不能只用旧快照(勘误 2026-10-17)**:旧快照只带 `x/y/file`,
+    /// 重放侧只好把每个注册件都当成"要点亮"(`e: Some(1)`)。而引擎的
+    /// 注册表是**对象属性表**:`CG[E=0]` 的对象照样在表里,只是不显示。
+    /// 结果 config 页(注册时 `E=0`)在重放时被强制点亮 ⇒ **开屏就是
+    /// 配置页**。本函数把真实 `e`/`z` 一并带出,重放按原值恢复。
+    ///
+    /// `z` 返回 `Option`:只有脚本显式给过 Z 的对象才带值,否则 `None`
+    /// (重放侧落到档位兜底,见 [`Self::cg_z`] 的勘误说明)。
+    #[allow(clippy::type_complexity)]
+    pub fn cg_registry_snapshot_full(
+        &self,
+    ) -> Vec<(Vec<u8>, i64, i64, Option<i64>, i64, Option<Vec<u8>>)> {
+        self.cg_registry
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.x,
+                    v.y,
+                    if v.z_explicit { Some(v.z) } else { None },
+                    v.e,
+                    v.file.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// 按名称查注册表当前 x/y(es.BT.XY.SET 经 CGACT 落库后的权威位置;
     /// ASCII 名精确匹配,SJIS 名经 lossy 往返可能失配 → None)。
     pub fn cg_position(&self, name: &str) -> Option<(i64, i64)> {
+        self.cg_registry.get(name.as_bytes()).map(|st| (st.x, st.y))
+    }
+
+    /// 按名称查注册表**当前 z**(成果 161 修正:CGEND 后同名重建事件不带
+    /// Z 槽时,属性应沿用 CG 注册表里该对象的 z —— 引擎的 CG 对象按名持
+    /// 有属性,重建命令的 `z=None` 只表示「本命令不改 z」,不表示 z=0)。
+    ///
+    /// 取证:`<game-b>_win_trace.log` 的 `BT.OFFES.CONFIG.TIP.BG=1=1` 首次建层
+    /// `z=Some(998)`,其后所有 E 翻转/CGEND 后重建行均 `z=None`;引擎画面
+    /// 该层始终处于 998 档(配置页在其按钮带之下),⇒ 属性保留。
+    /// 引擎语义(成果 161 同一依据):`z=None` 只表示「本命令不改 z」;
+    /// 新建对象的 z 取**子系统缺省档位**,不是 0。故只有脚本给过 Z 才可
+    /// 作为继承值下发 —— 从未给过 Z 的对象返回 `None`,让播放器落到自己的
+    /// 档位兜底(`vm_ui_z_for_path`)。
+    pub fn cg_z(&self, name: &str) -> Option<i64> {
         self.cg_registry
             .get(name.as_bytes())
-            .map(|st| (st.x, st.y))
+            .filter(|st| st.z_explicit)
+            .map(|st| st.z)
     }
 
     /// 注册表条数(诊断日志用)。
@@ -691,6 +837,12 @@ impl GroupVm {
     /// 定性:任务创建即有 depth=0 的当前帧记录,顶层脚本的帧局部/返回值
     /// 区都落在它上面;RETURN 于基帧 = depth 0 → 脚本结束路径)。
     pub fn load(script: YstbFile) -> Result<Self> {
+        // 运行期命令分派按**脚本自己声明的引擎版本**选内置表；版本未知则置为
+        // 「未解析」（任何命令都走未实现路径），由启动链用游戏自身的 YSCM 覆盖。
+        // 绝不按一个无关版本的内置表静默执行错误语义。
+        let engine_version = script.header().version;
+        let dispatch = CommandDispatch::for_engine_version(engine_version)
+            .unwrap_or_else(CommandDispatch::unresolved);
         let ctx = ScriptCtx::parse(0, script)?;
         Ok(Self {
             ctx,
@@ -698,6 +850,9 @@ impl GroupVm {
             pc: 0,
             state: VmState::Idle,
             events: Vec::new(),
+            event_domains: Vec::new(),
+            cur_domain: 0,
+            fps: None,
             labels: HashMap::new(),
             strict: true,
             store: VariableStore::new(),
@@ -712,14 +867,395 @@ impl GroupVm {
             loops: Vec::new(),
             executed_groups: 0,
             executed_windows: 0,
+            returncode_hits: 0,
             declared_scripts: std::collections::HashSet::new(),
             input_cursor: (0, 0),
             ysvr_kind2: Vec::new(),
+            ysvr_globals: Vec::new(),
             ysvr_kind2_applied: std::collections::HashSet::new(),
+            epoch: std::time::Instant::now(),
             file_probe: None,
-            tasks: std::collections::HashSet::new(),
+            audio_probe: None,
+            scheduler: Some({
+                let mut sch = crate::task::TaskScheduler::from_env();
+                sch.spawn(crate::task::TaskSeed {
+                    id: crate::task::MAIN_TASK_ID.to_vec(),
+                    script_id: 0,
+                    pc: 0,
+                    enabled: true,
+                    is_main: true,
+                });
+                sch
+            }),
+            task_slots: HashMap::new(),
+            task_names: Vec::new(),
+            pending_effects: Vec::new(),
+            windows_buf: Vec::new(),
+            insn_buf: Vec::new(),
+            bytes_buf: Vec::new(),
+            slot_scratch: Vec::new(),
+            insn_cache: rustc_hash::FxHashMap::default(),
+            chain_now_ms: 0,
+            text_channel: crate::scenario::TextChannel::new(),
+            font_px: None,
+            font_color: None,
+            font_bold: None,
+            font_drawmode: None,
+            font_sel: None,
+            font_aa: None,
+            font_gradation: None,
+            font_rotation: None,
+            error_levels: HashMap::new(),
+            error_code: None,
+            ystl: None,
+            emote_runtime: false,
+            screensaver_suppressed: false,
+            background_exec: false,
+            timecount_total: [0; 4],
+            timecount_start: [None; 4],
+            logical_clock: false,
+            logical_frames: 0,
+            unsup_summary: std::collections::BTreeMap::new(),
+            emit_group_events: true,
+            hot_hist: HashMap::new(),
+            hot_cmd: HashMap::new(),
+            hot_script: HashMap::new(),
+            screen_w: 1920,
+            screen_h: 1080,
             cg_registry: HashMap::new(),
+            dispatch: std::sync::Arc::new(dispatch),
+            game_profile: None,
+            dispatch_cache: HashMap::new(),
+            cur_command: None,
+            err_cause: None,
+            err_log_last: None,
+            err_log_repeat: 0,
+            err_site_warned: std::cell::RefCell::new(std::collections::HashSet::new()),
+            swallow_warned: std::cell::RefCell::new(std::collections::HashSet::new()),
+            unsup_alerted: std::cell::RefCell::new(std::collections::HashSet::new()),
+            label_miss_alerted: std::cell::RefCell::new(std::collections::HashSet::new()),
+            unknown_slot_warned: std::cell::RefCell::new(std::collections::HashSet::new()),
+            fatal_reporting: false,
+            missing_feature_warned: std::cell::RefCell::new(std::collections::HashSet::new()),
+            slot_fallback_uses: std::cell::Cell::new(0),
+            slot_fallback_warned: std::cell::RefCell::new(std::collections::HashSet::new()),
+            // 种子 = 时间派生(引擎种子未取证;见字段文档,UNVERIFIED)
+            math_rng: crate::math::Mt19937::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+                    .unwrap_or(0),
+            ),
+            input: None,
+            input_vars: None,
+            input_overlay: HashMap::new(),
+            input_writes: Vec::new(),
+            input_settings: crate::input::EngineInputSettings::default(),
         })
+    }
+
+    /// 设置游戏自身 YSCM 建的命令 profile（**权威表**）。
+    ///
+    /// 启动链在装载 `ysc.ybn` 后调用。此后每个脚本按**自己头版本**取表：
+    /// - 头版本 == 本 profile 版本 → 用本表（游戏自己的 YSCM，权威）；
+    /// - 头版本不同 → 用该版本的内置表（官方 SDK 表），并落一条去重告警
+    ///   （混版本封包是事实，不是猜测：脚本头自己声明了版本）。
+    ///
+    /// 传 `None` = 无 YSCM：所有脚本按头版本取内置表，未知版本走「未解析」。
+    pub fn set_command_profile(&mut self, profile: Option<yuris_core::CommandProfile>) {
+        if let Some(p) = &profile {
+            self.dispatch_cache.insert(
+                p.engine_version(),
+                std::sync::Arc::new(CommandDispatch::new(p.clone())),
+            );
+        }
+        self.game_profile = profile;
+        self.refresh_dispatch();
+    }
+
+    /// 直接注入已建好的分派表（测试/工具用；不登记为游戏 profile）。
+    pub fn set_command_dispatch(&mut self, dispatch: CommandDispatch) {
+        self.dispatch = std::sync::Arc::new(dispatch);
+    }
+
+    /// **取生效分派表**（分派语义的唯一定义点）。
+    ///
+    /// ## 引擎真值（勘误 2026-10-18）
+    ///
+    /// 引擎只装载**一张**命令表：启动链读游戏自己的 `ysc.ybn`，填进
+    /// `0x7aae40` 的 119 项分派表（初始化器 `FUN_0045cd30`），分派是
+    /// `CALL [handler[cmd_index]]`。**没有第二张表，也没有按脚本头版本
+    /// 切换表的逻辑。**
+    ///
+    /// 因此本函数：
+    /// 1. **有游戏 YSCM → 一律用它**（与当前脚本的头版本无关）；
+    /// 2. 没有游戏 YSCM → **未解析空表**（任何命令显式报未实现）。
+    ///
+    /// ## 为什么不能拿内置 SDK 表兜底
+    ///
+    /// `SDK_479/495/V555` 那几张表是**给人查命令清单的参考资料**
+    /// （`docs/opcode/yscm-commands-*.json` 的镜像），不是运行期语义。
+    /// 拿它兜底有两个硬伤：
+    /// - 同一封包里不同头版本的脚本会被两套序号解释，语义不一致；
+    /// - 内置表覆盖不到商业游戏私有的命令增删 ⇒ **静默错解**。
+    ///
+    /// 实测该作 160 个脚本里 5 个是 v479 头，但它们在 YSLB 里
+    /// **一条标签都没有**（139/160 个脚本被引用，这 5 个全不在其中）
+    /// ⇒ 引擎从不加载它们（见 boot 侧的「声明按需消费」）。
+    pub fn dispatch_for_version(&mut self, _version: u32) -> std::sync::Arc<CommandDispatch> {
+        // 缓存槽：有游戏表 / 无表 各一格（与任何真实版本号区分）。
+        const GAME_SLOT: u32 = u32::MAX;
+        const NONE_SLOT: u32 = u32::MAX - 1;
+        let slot = if self.game_profile.is_some() {
+            GAME_SLOT
+        } else {
+            NONE_SLOT
+        };
+        if let Some(d) = self.dispatch_cache.get(&slot) {
+            return std::sync::Arc::clone(d);
+        }
+        let d = std::sync::Arc::new(match &self.game_profile {
+            Some(p) => CommandDispatch::new(p.clone()),
+            None => CommandDispatch::unresolved(),
+        });
+        self.dispatch_cache.insert(slot, std::sync::Arc::clone(&d));
+        d
+    }
+
+    /// 刷新生效分派表（当前脚本切换时调用）。
+    ///
+    /// - **有游戏 YSCM** → 一律换成游戏表（与脚本头版本无关，引擎语义）；
+    /// - **无游戏 YSCM**（工具/测试/内存宿主）→ **保持 `load()` 已建立的表**
+    ///   不动。否则切脚本会把该表覆盖成「未解析空表」，把本来能跑的分派
+    ///   清空 —— 实测导致跨脚本 GOSUB 在目标脚本首条命令就报未实现。
+    fn refresh_dispatch(&mut self) {
+        if self.game_profile.is_some() {
+            let version = self.ctx.script.header().version;
+            self.dispatch = self.dispatch_for_version(version);
+        }
+    }
+
+    /// 当前分派表（= 当前脚本头版本对应的表）。
+    pub fn command_dispatch(&self) -> &CommandDispatch {
+        self.dispatch.as_ref()
+    }
+
+    /// **游戏引擎版本号**（YSCM 版本；无 YSCM 时回落当前脚本头版本）。
+    ///
+    /// 与 [`Self::command_dispatch`] 的 `engine_version()` 不同：后者是
+    /// **当前脚本**的编译器版本，混版本封包里会随脚本切换。需要"引擎本身"
+    /// 版本的调用方（输入子系统映射、诊断）必须用本方法。
+    pub fn engine_version(&self) -> u32 {
+        self.game_profile
+            .as_ref()
+            .map(|p| p.engine_version())
+            .unwrap_or_else(|| self.ctx.script.header().version)
+    }
+
+    /// 分派表是否已解析（版本未知且未注入 YSCM 时为 `false`）。
+    pub fn is_dispatch_resolved(&self) -> bool {
+        self.dispatch.is_resolved()
+    }
+
+    /// 当前分派的来源描述（诊断/日志用）。
+    pub fn dispatch_source(&self) -> &str {
+        self.dispatch.profile().source()
+    }
+
+    /// 序号是否为声明族（含局部 `FLT`/`INT`/`STR` 与 `F_*`/`G_*`/`S_*`/`VAR`）。
+    ///
+    /// 取代旧的 `is_declaration(cmd: u8)` 自由函数 —— 旧实现内嵌某一版的
+    /// 序号区间，跨版本会误判。
+    pub fn is_declaration(&self, index: u8) -> bool {
+        self.kind_of(index).is_declaration()
+    }
+
+    /// 序号 → 命令种类（运行期分派入口）。
+    pub fn kind_of(&self, index: u8) -> CmdKind {
+        self.dispatch.kind(index as u16)
+    }
+
+    /// 置错误态(**唯一入口**)。
+    ///
+    /// 存在的理由:有若干处理器设了错误态却不把信息冒泡出去(事件流里看不
+    /// 出是哪一组),排查时只能靠"状态突然变 Error"猜。集中到这里后……
+    ///
+    /// **可观测性(2026-10-17,strict 挂起「根因哪儿都翻不到」的修复)**:
+    /// 每个首次到达的 `(脚本, pc)` 现场**无条件**落一条 warn(旧的
+    /// `YURIS_LOG_ERR` 门控默认开 — 该环境变量仍可强制全量重打)。实测
+    /// 某款游戏在同一个现场**每帧重入**(60fps ⇒ 每帧一条),不去重就会
+    /// 刷满一屏;同时把现场快照进 `err_cause`,供 `run_main` 的挡回消息
+    /// 携带根因 —— 旧版这条消息不带任何原因,用户只能看到同名刷屏。
+    fn set_error_state(&mut self) {
+        if self.state != VmState::Error {
+            let site = (self.ctx.script_id, self.pc);
+            let is_first_here = self.err_site_warned.borrow_mut().insert(site);
+            if is_first_here {
+                self.log_error_site();
+                if self.err_cause.is_none() {
+                    self.err_cause = Some(self.error_site_cause(
+                        "现场未被处理器注明原因(见同刻的 [vm-err];run_main 挡回根因唯一入口)".into(),
+                    ));
+                }
+            } else if std::env::var("YURIS_LOG_ERR").is_ok() {
+                self.log_error_site();
+            }
+        }
+        self.state = VmState::Error;
+    }
+
+    /// `set_error_state` 的现场告警一行(`warn` 级)。
+    fn log_error_site(&self) {
+        let kind = self.kind_of(
+            self.ctx
+                .groups
+                .get(self.pc)
+                .map(|g| g.command_type)
+                .unwrap_or(0),
+        );
+        yuris_log::warn!(
+            "[vm-err] s{} pc={} cmd={:?} 帧深={} if栈={} 循环栈={}",
+            self.ctx.script_id,
+            self.pc,
+            kind,
+            self.frames.len(),
+            self.if_nest.len(),
+            self.loops.len(),
+        );
+    }
+
+    /// Error 现场快照文本(`run_main` 挡回消息与 [`Self::log_error_site`]
+    /// 共用;`detail` 由调用方在**已知道原因**时给)。
+    fn error_site_cause(&self, detail: String) -> String {
+        format!(
+            "s{} pc={} {}",
+            self.ctx.script_id, self.pc, detail
+        )
+    }
+
+    /// **吞错继续**场景的统一告警(每 `(脚本, pc)` 只一次)。
+    ///
+    /// 引擎若干处理器(子系统参数/TASK 参数/声明初值非严格路径等)对参数
+    /// 求值失败**不传播**:按未知值继续(实测引擎行为)。旧实现下这些
+    /// 调用方把 `eval_window_condition` 的 Err 吞进事件流文本(`err:…`),
+    /// strict 挂起时根因一行都不见(2026-10-17 s66 pc5355 实测)。现统一
+    /// 落 warn(一次性)+ 根因快照。
+    fn note_swallowed(&mut self, pc: usize, command: u8, what: &str, e: &Error) {
+        if self
+            .swallow_warned
+            .borrow_mut()
+            .insert((self.ctx.script_id, pc))
+        {
+            let cname = self
+                .dispatch
+                .name_of(command as u16)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("<未命名 cmd{command}>"));
+            yuris_log::alert!(
+                "参数求值失败但被吞掉(引擎容忍路径)\n\
+                 命令: {cname} (idx {command})\n\
+                 上下文: {what}\n\
+                 现场: script {} pc {pc}\n\
+                 错误: {e}\n\
+                 处置: {}",
+                self.ctx.script_id,
+                if self.strict {
+                    "strict —— 根因已记录,命令继续按引擎容忍语义执行(不是静默:本条即证据)"
+                } else {
+                    "lenient —— 记录后继续"
+                }
+            );
+        }
+        if self.err_cause.is_none() {
+            self.err_cause = Some(format!(
+                "{what} 参数求值失败(吞错继续) s{} pc={pc}: {e}",
+                self.ctx.script_id
+            ));
+        }
+    }
+
+    /// run 错误的**同因限频**落日志(主线/任务域统一入口)。
+    ///
+    /// 实测 strict 挂起后每帧 60fps 生成一条同名 ERROR(「VM 处于 Error
+    /// 态」),数分钟即数千行,把真根因淹在刷屏里(2026-10-17 用户实机报告)。
+    /// 规则:**首次** error 级直落;同文本重复只计数;每满 120 次(60fps ≈ 2s)
+    /// 用 warn 提醒一次累计量。不同因 → 重新计。
+    pub fn log_run_error(&mut self, reason: &str) {
+        if self.err_log_last.as_deref() == Some(reason) {
+            self.err_log_repeat += 1;
+            if self
+                .err_log_repeat
+                .checked_sub(1)
+                .filter(|c| *c % 120 == 0)
+                .is_some()
+            {
+                let n = self.err_log_repeat - 1;
+                yuris_log::warn!("[vm] 同因错误已连续 {} 次(限频中): {reason}", n + 1);
+            }
+            return;
+        }
+        self.err_log_last = Some(reason.to_string());
+        self.err_log_repeat = 0;
+        yuris_log::error!("[vm] 错误: {reason}");
+    }
+
+    /// **参数名 → 槽位**（当前命令分派表；`None` = 无参数表或无此参数名）。
+    ///
+    /// YSTB 参数窗口的 `tag & 0xff` 即此槽位，而槽位号**逐版本漂移**（实测
+    /// `CG.FILE`：v555 槽 46 / v494 槽 33 / v479 槽 29）。处理器一律经此取槽：
+    /// 写死数字会让该参数在别的版本上**永远读不到**（实测后果 = CG 的 `FILE`
+    /// 为空 → 纹理不装载 → 全黑）。
+    fn slot_of_param(&self, command_index: u8, param: &str) -> Option<u8> {
+        self.dispatch.slot(command_index, param)
+    }
+
+    /// 槽位是否命中参数 `param`。
+    ///
+    /// 无参数表（旧式 profile / 合成脚本）→ 回落 `fallback`（该参数在
+    /// **内置 v555 表**中的槽号），保持既有行为；有参数表则**严格按名匹配**，
+    /// 不再回落 —— 否则跨版本会读到相邻参数而静默出错。
+    ///
+    /// **回落不静默（T3）**：每次回落计入 [`Self::slot_fallback_uses`] 并对
+    /// 每个 `(命令, 参数)` 首次打一条 stderr 告警（`YURIS_QUIET_SLOT_FALLBACK=1`
+    /// 可关）—— 新的无参表版本进来时**必须可观测**，不能再无声读错槽。
+    fn slot_is(&self, command_index: u8, slot: u8, param: &str, fallback: u8) -> bool {
+        self.param_slot(command_index, param, fallback) == Some(slot)
+    }
+
+    /// 解析参数槽位：有参数表 → 按**参数名**；否则 → 回落 `fallback`（可观测）。
+    ///
+    /// 返回 `None` = 有参数表但该版本没有这个参数名（该参数在此版本不存在，
+    /// 处理器须跳过，不得用别的槽位顶替）。
+    fn param_slot(&self, command_index: u8, param: &str, fallback: u8) -> Option<u8> {
+        if self.dispatch.profile().has_params() {
+            self.dispatch.slot(command_index, param)
+        } else {
+            self.note_slot_fallback(command_index, param, fallback);
+            Some(fallback)
+        }
+    }
+
+    /// 记录一次「无参数表 → v555 槽号回落」(T3)。
+    fn note_slot_fallback(&self, command_index: u8, param: &str, fallback: u8) {
+        self.slot_fallback_uses.set(self.slot_fallback_uses.get() + 1);
+        if std::env::var_os("YURIS_QUIET_SLOT_FALLBACK").is_some() {
+            return;
+        }
+        let first = self
+            .slot_fallback_warned
+            .borrow_mut()
+            .insert((command_index, param.to_string()));
+        if first {
+            let cname = self
+                .dispatch
+                .name_of(command_index as u16)
+                .unwrap_or("<未命名>");
+            yuris_log::warn!(
+                "[vm] 槽位回落(v555 UNVERIFIED):{cname}.{param} → 槽 {fallback};                    分派 profile「{}」无参数表(v{}),按名解析不可用 —— 若这是新版本                     游戏,此处读到的参数可能是别的槽",
+                self.dispatch.profile().source(),
+                self.dispatch.profile().engine_version(),
+            );
+        }
     }
 
     /// 绑定跨脚本宿主(启用跨脚本 GO/GOSUB)。
@@ -735,6 +1271,24 @@ impl GroupVm {
 
     pub fn set_file_probe(&mut self, probe: std::sync::Arc<crate::host::PacFileIndex>) {
         self.file_probe = Some(probe);
+    }
+
+    /// 注入音频状态查询通道（`SOUNDINFO` 用；宿主实现
+    /// [`crate::audio_probe::SoundStateProbe`]）。
+    pub fn set_audio_probe(
+        &mut self,
+        probe: std::sync::Arc<dyn crate::audio_probe::SoundStateProbe>,
+    ) {
+        self.audio_probe = Some(probe);
+    }
+
+    /// 音频状态查询（`None` = 未注入通道或该字段无真值）。
+    pub(crate) fn audio_query(
+        &self,
+        layer_id: &str,
+        field: crate::audio_probe::SoundField,
+    ) -> Option<crate::audio_probe::SoundInfoValue> {
+        self.audio_probe.as_ref()?.query(layer_id, field)
     }
 
     /// 标记脚本的声明组已消费(boot 全量消费后调用;防止 switch_script
@@ -775,6 +1329,139 @@ impl GroupVm {
         &self.events
     }
 
+    /// 与 [`Self::events`] 平行的**域标记**(0 = 主线,1..= 任务创建序;
+    /// P10 域调度,成果 161)。长度恒等于 `events().len()`;消费侧按域合成
+    /// 呈现/做诊断时用。**刻意不进 golden JSONL** —— golden 快照序列化的
+    /// 只有 `VmEvent` 本身,本 vec 对其不可见(零回归)。
+    pub fn event_domains(&self) -> &[u8] {
+        &self.event_domains
+    }
+
+    /// 主线域是否在休息(FRAME 计数未尽或 TIME 期限未到;诊断/测试用,
+    /// D1 回归哨兵:裸让出后必须为 true = 恰休一帧)。
+    pub fn main_wait_pending(&self) -> bool {
+        self.scheduler
+            .as_ref()
+            .and_then(|s| s.main_node())
+            .map(|n| n.wait_frames > 0 || n.deadline_ms.is_some())
+            .unwrap_or(false)
+    }
+
+    /// 事件入流的**唯一包装点**(P10):所有处理器经此推送,自动携带当前
+    /// 域标记。域 = 发射时的 [`Self::cur_domain`](主线域步进期间恒 0;
+    /// 任务域由 `step_tasks`/`pump_frame` 在切换执行位时同步切换)。
+    fn push_event(&mut self, ev: VmEvent) {
+        // 逐组执行事件是诊断面(引擎不产生):播放器关闭,避免 85 万组/帧
+        // 时产生同等数量的事件对象。
+        if !self.emit_group_events && matches!(ev, VmEvent::GroupExecuted { .. }) {
+            return;
+        }
+        // Unsupported 汇总(不受 `emit_group_events` 影响 —— 排查主线)。
+        if let VmEvent::Unsupported { pc, command, reason } = &ev {
+            let name = self
+                .dispatch
+                .name_of(*command as u16)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("idx{command}"));
+            self.unsup_summary
+                .entry(name)
+                .and_modify(|h| h.count += 1)
+                .or_insert_with(|| UnsupportedHit {
+                    count: 1,
+                    script_id: self.ctx.script_id,
+                    pc: *pc,
+                    reason: reason.clone(),
+                });
+        }
+        self.event_domains.push(self.cur_domain);
+        self.events.push(ev);
+    }
+
+    /// 统一文本通道(只读)。
+    pub fn text_channel(&self) -> &crate::scenario::TextChannel {
+        &self.text_channel
+    }
+
+    /// 取走本帧待呈现的全部文本(内联 + 明文剧本;按入队序)。
+    pub fn drain_text_lines(&mut self) -> Vec<crate::scenario::TextLine> {
+        self.text_channel.take()
+    }
+
+    /// **取走**全部待消费事件(连同平行域标),缓冲就地清空(零克隆)。
+    pub fn take_events(&mut self) -> (Vec<VmEvent>, Vec<u8>) {
+        let evs = std::mem::take(&mut self.events);
+        let doms = std::mem::take(&mut self.event_domains);
+        (evs, doms)
+    }
+
+    /// 开关逐组执行事件(缺省 true = golden/单测语义不变)。
+    pub fn set_group_events(&mut self, on: bool) {
+        self.emit_group_events = on;
+    }
+
+    /// 当前字号(`FONT` 的 SX/SY;`None` = 脚本尚未设置)。
+    pub fn font_size(&self) -> Option<(i64, i64)> {
+        self.font_px
+    }
+
+    /// 当前字体颜色(`COLOR`,`COLOR2`;0xRRGGBB)。
+    pub fn font_colors(&self) -> Option<(i64, i64)> {
+        self.font_color
+    }
+
+    /// 当前字体加粗位(`BOLD`)。
+    pub fn font_bold(&self) -> Option<i64> {
+        self.font_bold
+    }
+
+    /// 当前字体描画模式(`DRAWMODE`)。
+    pub fn font_drawmode(&self) -> Option<i64> {
+        self.font_drawmode
+    }
+
+    /// 启用/关闭逻辑时钟(播放器启用;单测保持墙钟)。
+    pub fn set_logical_clock(&mut self, on: bool) {
+        self.logical_clock = on;
+        self.logical_frames = 0;
+    }
+
+    /// 逻辑时钟是否启用。
+    pub fn logical_clock(&self) -> bool {
+        self.logical_clock
+    }
+
+    /// 写入标题选择槽(`@1035`;UI 点击 → 脚本状态机入口)。
+    pub fn set_title_choice(&mut self, slot: i64) {
+        let r = yuris_value::VarRef {
+            space: yuris_value::VarSpace::At,
+            id: 1035,
+        };
+        self.store.set(&r, yuris_value::Value::Int(slot));
+        yuris_log::info!("[vm] @1035(标题选择)← {slot}");
+    }
+
+    /// **打印 Unsupported 汇总**(不支持的命令被跳过后必须可查)。
+    pub fn log_unsupported_summary(&self, tag: &str) {
+        if self.unsup_summary.is_empty() {
+            yuris_log::info!("[vm-unsup] {tag}: 无被跳过的命令");
+            return;
+        }
+        let total: u64 = self.unsup_summary.values().map(|h| h.count).sum();
+        yuris_log::warn!(
+            "[vm-unsup] {tag}: {} 种命令被跳过,共 {total} 次",
+            self.unsup_summary.len()
+        );
+        for (name, h) in &self.unsup_summary {
+            yuris_log::warn!(
+                "[vm-unsup]   {name} ×{}  首次 s{} pc{}  {}",
+                h.count,
+                h.script_id,
+                h.pc,
+                h.reason
+            );
+        }
+    }
+
     /// 变量存储(只读)。
     pub fn store(&self) -> &VariableStore {
         &self.store
@@ -798,7 +1485,10 @@ impl GroupVm {
 
     /// 调用帧栈快照(诊断/测试用;返回各帧 return_pc 与脚本号)。
     pub fn frames_snapshot(&self) -> Vec<(usize, u16)> {
-        self.frames.iter().map(|f| (f.return_pc, f.script_id)).collect()
+        self.frames
+            .iter()
+            .map(|f| (f.return_pc, f.script_id))
+            .collect()
     }
 
     /// 当前帧局部可读变量数(诊断/测试用)。
@@ -830,10 +1520,73 @@ impl GroupVm {
                 self.ysvr_kind2.push(e.clone());
                 continue;
             }
+            if e.kind == 1 {
+                // 全局初值快照(运行期 VARACT INIT 恢复组的镜像)
+                self.ysvr_globals.push(e.clone());
+            }
             self.apply_ysvr_entry(e)?;
             applied += 1;
         }
         Ok(applied)
+    }
+
+    /// 运行期 `VARACT[INIT/G_*]` 全局恢复(引擎 0x454e00→0x455b60;旁线仓库
+    /// Round20 Confirmed,v494/v555 同族)。
+    ///
+    /// 语义 = 重放 YSVR `kind==1` 记录:mask 按 `(记录 ty, 记录 category)`
+    /// 12 位命中才整槽重建;`G_INT/G_INT2/G_INT3/G_INT4`(组 1..4)、
+    /// `G_FLT*`、`G_STR*` 槽在场**且求值非 0** → 对应位允许;没有 G_* 槽 →
+    /// 全 0 掩码 → 什么都不恢复(引擎\"只给 INIT\"实测行为)。
+    ///
+    /// 输入 = `(槽名 → 槽号)` 解析器与 `(槽号 → 求值)` 取值器(命令序号逐
+    /// 版本漂移,槽位必须按**游戏自身 YSCM 参数名**解析,不得写死序号)。
+    fn varact_restore_globals(
+        &mut self,
+        value_of_slot: &dyn Fn(u8) -> Option<yuris_value::Value>,
+        g_slots: &[(&'static str, u8, Option<u8>)],
+    ) -> Result<usize> {
+        let mut allow = [false; 12]; // (ty-1)*4 + (组-1);ty: 1=INT 2=FLT 3=STR
+        for (name, ty, slot) in g_slots {
+            let Some(slot) = slot else { continue };
+            let Some(v) = value_of_slot(*slot) else {
+                continue;
+            };
+            if v.as_int_opt().map(|n| n != 0).unwrap_or(true) {
+                let ty = *ty;
+                let group: u8 = name
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .fold(0u8, |a, c| {
+                        a.saturating_mul(10)
+                            .saturating_add(c.to_digit(10).unwrap() as u8)
+                    });
+                let group = group.clamp(1, 4);
+                let bit = (ty as usize - 1) * 4 + (group as usize - 1);
+                allow[bit] = true;
+            }
+        }
+        let hit = self
+            .ysvr_globals
+            .iter()
+            .filter(|e| {
+                e.kind == 1
+                    && e.ty >= 1
+                    && e.ty <= 3
+                    && e.category >= 1
+                    && e.category <= 4
+                    && allow[(e.ty as usize - 1) * 4 + (e.category as usize - 1)]
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut n = 0usize;
+        for e in &hit {
+            self.apply_ysvr_entry(e)?; // 重放初值(引擎 = 镜像整槽重建)
+            n += 1;
+        }
+        if debug_frame_enabled() {
+            yuris_log::trace_forced!("[varact] INIT 恢复掩码={allow:?} 重放 {n} 条");
+        }
+        Ok(n)
     }
 
     /// 应用某脚本名下的 kind2 条目(脚本首次加载时;幂等)。
@@ -859,13 +1612,21 @@ impl GroupVm {
     /// 应用单条 YSVR 条目(边界覆盖 + 初值)。
     fn apply_ysvr_entry(&mut self, e: &yuris_format::ysvr::YsvrEntry) -> Result<()> {
         use yuris_value::{ElemType, Value};
+        if std::env::var("YURIS_WATCH_VAR")
+            .ok()
+            .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            == Some(e.var_id)
+        {
+            yuris_log::trace_forced!(
+                "[watch] **YSVR** 应用 id={:#06x} kind={} ty={} bounds={:?} init={:?}",
+                e.var_id, e.kind, e.ty, e.bounds, e.init
+            );
+        }
         let prefix: u8 = match e.ty {
-            1 | 2 => 0x40,  // INT/FLT -> @
-            3 | 0 => 0x24,  // STR -> $
+            1 | 2 => 0x40, // INT/FLT -> @
+            3 | 0 => 0x24, // STR -> $
             other => {
-                return Err(Error::Unimplemented(
-                    "YSVR 条目类型 Unknown(不猜)",
-                ));
+                return Err(Error::Unimplemented("YSVR 条目类型 Unknown(不猜)"));
             }
         };
         let r = yuris_value::VarRef {
@@ -875,10 +1636,29 @@ impl GroupVm {
         let v = match &e.init {
             yuris_format::ysvr::YsvrInit::Int(i) => Value::Int(*i),
             yuris_format::ysvr::YsvrInit::Float(f) => Value::Float(*f),
-            yuris_format::ysvr::YsvrInit::Str(b) => Value::Str(b.clone()),
+            // **勘误(2026-10-13,成果 119)**:旧实现 `Value::Str(b.clone())`
+            // 把该字段当裸字符串 —— 错。它是**表达式指令流**(见
+            // [`GroupVm::decode_ysvr_str_init`])。必改。
+            yuris_format::ysvr::YsvrInit::Str(b) => {
+                match Self::decode_ysvr_str_init(&mut self.store, b) {
+                    Some(s) => Value::Str(s),
+                    None => {
+                        // 畸形初值:保留原字节(旧行为)但**留痕** ——
+                        // 不静默把窗口字节当成"裸字符串"传下去。
+                        yuris_log::warn!(
+                            "[ysvr] 字符串初值无法按表达式解码 id={:#06x} {}B,按原字节保留",
+                            e.var_id,
+                            b.len()
+                        );
+                        Value::Str(b.clone())
+                    }
+                }
+            }
             yuris_format::ysvr::YsvrInit::None => {
                 // 仅声明无初值:数组按边界清零,标量按 type 默认
                 if e.bounds.is_empty() {
+                    // 形态互斥(引擎一份描述符):YSVR 后于声明应用 → 它的形态为准
+                    self.store.clear_arrays_for_id(e.var_id);
                     if e.ty == 1 {
                         Value::Int(0)
                     } else if e.ty == 2 {
@@ -902,17 +1682,66 @@ impl GroupVm {
                 }
             }
         };
+        // 形态互斥:YSVR 说标量就清掉同名数组,说数组就清掉同名标量。
+        // (引擎一份描述符 —— 见 `VariableStore::clear_arrays_for_id` 的实测触发点)
         if e.bounds.is_empty() {
+            self.store.clear_arrays_for_id(e.var_id);
             self.store.set(&r, v);
         } else {
-            let elem = if e.ty == 1 { ElemType::Int }
-                else if e.ty == 2 { ElemType::Float }
-                else { ElemType::Str };
+            self.store.clear_scalars_for_id(e.var_id);
+            let elem = if e.ty == 1 {
+                ElemType::Int
+            } else if e.ty == 2 {
+                ElemType::Float
+            } else {
+                ElemType::Str
+            };
             self.store.declare_array(&r, elem, &e.bounds);
-            let zeros = vec![0i64; e.bounds.len()];
-            self.store.set_elem(&r, &zeros, v)?;
+            // **填满整个数组**(勘误 2026-10-17,成果 178):引擎 `ysv.ybn`
+            // 的数组条目只记**一个**初值(`bounds=[20] init=-1`),脚本按任意
+            // 下标读取时都期望拿到它。旧实现 `set_elem([0…0])` 只写元素 0,
+            // 下标 ≥1 读到 0 ⇒ 脚本把「未指定」当显式 0 传给 SOUND,
+            // `LOOP=0`(无限循环)导致语音/SE 永不停。
+            self.store.fill_array(&r, v)?;
         }
         Ok(())
+    }
+
+    /// YSVR 字符串初值(`ty=3`)的**表达式解码**。
+    ///
+    /// **勘误(2026-10-13,成果 119)**:旧实现把该字段当裸字符串
+    /// (`Value::Str(b.clone())`)。实机取证(本作 v494 `ysbin\ysv.ybn`)证伪:
+    /// 该字段是**表达式指令流**(与 `.ybn` 窗口同一套编码:`4d`=PushStr +
+    /// u16 长度 + 带定界符的字面量),引擎**求值**后才得到串。
+    ///
+    /// 证据链(全部可复现):
+    /// - 全表形状(`cargo run -p yuris-tools --example ysvr_strinit -- <游戏>`):
+    ///   `ty=3` 306 条 → 278 条无初值 / 28 条有初值;**28/28 首字节 = 0x4d**、
+    ///   28/28 解码为**单条 PushStr**、0 条其他形态。
+    /// - 字节对照:`id 0x040c` 初值 = `4d 10 00 22 "SCENARIO_START" 22`,
+    ///   与脚本窗口(s20 g269 pstr 窗)里同一字面量的编码**逐字节一致**。
+    /// - 语义对照(官方 SDK 0.495 示例 `ERIS/global.yst:63`):
+    ///   `G_STR[$es.STARTLABEL="SCENARIO_START"]` ⇒ 期望值 `SCENARIO_START`。
+    ///
+    /// 旧行为的后果(实机实测):`$es.STARTLABEL` 变成 19 字节窗口字节 →
+    /// `es.SCENARIO.FLOW`(s21 g8)的 `GO[#=$es.STARTLABEL]` 查不到标签 →
+    /// 场景任务空转、一张图都不画 → **画面恒黑**;`id 0x040d`
+    /// (`es.ScenarioScript`)同类污染 → 任务名显示为 `M "es.ScenarioScript"`。
+    ///
+    /// 返回 `None` = 无法按表达式解码(畸形),由调用方决定口径(现为保留原字节 + 留痕)。
+    fn decode_ysvr_str_init(store: &mut VariableStore, b: &[u8]) -> Option<Vec<u8>> {
+        if b.is_empty() {
+            return Some(Vec::new());
+        }
+        let instrs = yuris_script::decode_window(b).ok()?;
+        let mut ev = yuris_script::Evaluator::with_locals(store, None);
+        let stack = ev.eval_instructions(&instrs).ok()?;
+        match stack.into_iter().next_back() {
+            // 字符串字面量经求值器剥定界符(eval.rs 0x4d 路径),
+            // 故这里拿到的就是引擎语义的串(`"ABC"` → `ABC`)。
+            Some(Value::Str(s)) => Some(s),
+            _ => None,
+        }
     }
 
     /// 已执行组数(配额审计)。
@@ -925,6 +1754,11 @@ impl GroupVm {
         self.executed_windows
     }
 
+    /// `RETURNCODE`(调用点返回标记)执行次数；语义取证中,计数供对拍。
+    pub fn returncode_hits(&self) -> u64 {
+        self.returncode_hits
+    }
+
     /// 组数。
     pub fn group_count(&self) -> usize {
         self.ctx.groups.len()
@@ -935,2229 +1769,60 @@ impl GroupVm {
         self.ctx.script_id
     }
 
-    /// 执行至多 `budget` 个组,返回挂起信息。
+    /// 已注册任务名(`TASKINFO EXIST` 的查询面)。
+    pub fn task_exists(&self, id: &[u8]) -> bool {
+        self.task_names.iter().any(|t| t == id)
+    }
+
+    /// **丢弃已消费的事件并返回消费方的新游标(恒 0)。**
     ///
-    /// - 配额耗尽 → [`VmSuspend::None`](VmSuspend::None)(状态 `Running`)
-    /// - pc 走完所有组 → [`VmSuspend::Complete`](VmSuspend::Complete)(`Finished`)
-    /// - Unsupported(strict)/求值错误 → [`VmSuspend::Error`](VmSuspend::Error)
-    pub fn run(&mut self, budget: usize) -> Result<VmSuspend> {
-        match self.state {
-            VmState::Finished => return Ok(VmSuspend::Complete),
-            VmState::Error => {
-                return Err(Error::format(
-                    "VM 处于 Error 态;需先检查事件,骨架版不支持自动恢复",
-                ))
-            }
-            VmState::Idle | VmState::Running => {}
+    /// 事件缓冲 [`Self::events`] 是**只增不减**的 `Vec`,消费方通常持有
+    /// 「已消费到 `events()[cursor]`」的游标。长跑时该缓冲会无限增长
+    /// (实测:数十帧即 1.16e6 条 ≈ 数十 MB;开启任务调度后事件量再涨
+    /// ~15 倍)—— 消费方每轮调用一次本方法即可封顶。
+    ///
+    /// 用法:
+    /// ```ignore
+    /// let start = self.cursor;
+    /// for ev in &self.vm.events()[start..] { /* 处理 */ }
+    /// self.cursor = self.vm.trim_consumed_events(self.vm.events().len());
+    /// ```
+    pub fn trim_consumed_events(&mut self, consumed: usize) -> usize {
+        let n = consumed.min(self.events.len());
+        if n > 0 {
+            self.events.drain(..n);
+            self.event_domains.drain(..n);
         }
-        self.state = VmState::Running;
+        0
+    }
 
-        let mut used = 0usize;
-        while self.pc < self.ctx.groups.len() {
-            if used >= budget {
-                return Ok(VmSuspend::None);
-            }
-            used += 1;
-            self.executed_groups += 1;
+    /// 任务数(诊断/测试;**不含主线节点**)。
+    pub fn task_count(&self) -> usize {
+        self.task_names.len()
+    }
 
-            let g = self.ctx.groups[self.pc];
-            let first = self.ctx.first_slots[self.pc];
-            // 克隆窗口切片(12B 结构),避免 script 借用与 &mut self 冲突
-            let windows: Vec<yuris_format::ystb::CommandSlot> = self.ctx.script.slots()
-                [first..first + g.window_count as usize]
-                .to_vec();
-            self.executed_windows += g.window_count as usize;
+    /// 已结束任务数(诊断)。
+    pub fn task_finished_count(&self) -> usize {
+        let Some(s) = self.scheduler.as_ref() else { return 0 };
+        self.task_names
+            .iter()
+            .filter(|id| s.find_by_id(id).map(|n| n.finished).unwrap_or(false))
+            .count()
+    }
 
-            match g.command_type {
-                cmd::GO => match self.exec_go(&windows)? {
-                    GoOutcome::Jump(target) => {
-                        let from = self.pc;
-                        self.events.push(VmEvent::Jump {
-                            from,
-                            to: target,
-                            kind: JumpKind::Go,
-                        });
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: from,
-                            command: g.command_type,
-                            condition: None,
-                        });
-                        self.pc = target;
-                        continue;
-                    }
-                    GoOutcome::CrossScript { script_id, target } => {
-                        // 跨脚本 GO:事件归属 = 派发点(引擎真值:P1 对拍
-                        // 实锤,引擎在旧脚本 pc 记本组后才切上下文)。
-                        // switch_script 会改写 self.pc/self.ctx.script_id,
-                        // 故 from/from_script 必须在切换前捕获。
-                        let from = self.pc;
-                        let from_script = self.ctx.script_id;
-                        match self.switch_script(script_id, target) {
-                            Ok(()) => {
-                                self.events.push(VmEvent::GroupExecuted {
-                                    pc: from,
-                                    command: g.command_type,
-                                    condition: None,
-                                });
-                                self.events.push(VmEvent::ScriptSwitch {
-                                    from_script,
-                                    to_script: script_id,
-                                });
-                                self.events.push(VmEvent::Jump {
-                                    from,
-                                    to: target,
-                                    kind: JumpKind::Go,
-                                });
-                                continue;
-                            }
-                            Err(e) => {
-                                self.state = VmState::Error;
-                                return Ok(VmSuspend::Error(e.to_string()));
-                            }
-                        }
-                    }
-                    GoOutcome::NoJump => {
-                        // 非 strict:未命中事件已记,顺序继续
-                        self.pc += 1;
-                        continue;
-                    }
-                    GoOutcome::Halted(reason) => {
-                        self.state = VmState::Error;
-                        return Ok(VmSuspend::Error(reason));
-                    }
-                },
-                cmd::GOSUB => {
-                    // w0 = 条件窗口(引擎 FUN_00442d01);求值失败 → 诚实挂起
-                    let cond = self.eval_window_condition(windows.first())?;
-                    let Some(cond) = cond else {
-                        if let Some(reason) =
-                            self.halt_or_record(self.pc, g.command_type, "GOSUB 无条件窗口")
-                        {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    };
-                    let truthy = value_truthy(&cond)?;
-                    if !truthy {
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc,
-                            command: g.command_type,
-                            condition: Some(cond),
-                        });
-                        self.pc += 1;
-                        continue;
-                    }
-                    // 标签解析:找 M-串窗口(引擎查 hash 表);未命中 → 引擎静默不跳
-                    let resolved = self.resolve_label_in(&windows)?;
-                    let Some((target, target_script)) = resolved else {
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc,
-                            command: g.command_type,
-                            condition: Some(cond),
-                        });
-                        self.pc += 1;
-                        continue;
-                    };
-                    let from = self.pc;
-                    let from_script = self.ctx.script_id;
-                    let mut locals = VariableStore::new();
-                    self.seed_frame_locals(&mut locals, &windows, g.param);
-                    self.frames.push(GosubFrame {
-                        return_pc: from + 1,
-                        script_id: from_script,
-                        locals,
-                        // 引擎:帧 +1 存 IF 栈深;循环记录栈增长亦随 RETURN 丢弃
-                        // (成果 51.5)。
-                        if_nest_depth: self.if_nest.len(),
-                        loop_depth: self.loops.len(),
-                    });
-                    self.events.push(VmEvent::Call { from, to: target });
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from,
-                        command: g.command_type,
-                        condition: Some(cond),
-                    });
-                    // 跨脚本 GOSUB:压帧后切换上下文到目标脚本,并记 ScriptSwitch。
-                    if target_script != from_script {
-                        self.events.push(VmEvent::ScriptSwitch {
-                            from_script: from_script,
-                            to_script: target_script,
-                        });
-                        self.switch_script(target_script, target)?;
-                    } else {
-                        self.pc = target;
-                    }
-                    continue;
-                }
-                cmd::RETURN => {
-                    // 返回值虚拟族(P5 定性,成果 50):实参按 B0 槽号求值
-                    // (callee 上下文),写入调用者帧返回值区:
-                    //   B0 0x00/0x01-0x0f → INT  ret[@60][max(1,B0)]
-                    //   B0 0x10-0x1f      → FLT  ret[@61][max(1,B0-0x10)]
-                    //   B0 0x20-0x2f      → STR  ret[$62][max(1,B0-0x20)]
-                    // 槽从 1 起(引擎 0044b418 实锤,成果 54:写循环
-                    // `iVar9=1..=count`,0x160+8*i;B0=0 = 条件窗形态
-                    // 「无显式槽号」→ 默认槽 1)。语料:RETURN B0=0 共 215 窗
-                    // (189 单窗);@60/$62 读者下标全 ≥1(0 次出现,探针
-                    // probe_ret_readers.py)。实证:es._strlen RETURN B0=1 →
-                    // 调用者 @60[1];es._label.info.exist RETURN B0=0 → @60[1]
-                    // (s13 g476 → g2 读者)。
-                    //
-                    // depth 语义(0044b418 + 004428c0 交叉,成果 56):RETURN
-                    // 写 `obj+0x140+depth*4` = 读侧基 0x144 的 record[depth-1]
-                    // = **调用者记录**(+0x160/+0x1e8/+0x278 值区,+0x2ef/0x300/
-                    // 0x311 计数),弹帧后按同一记录 +4/+8 恢复;`if (0 < iVar8)`
-                    // 不成立 = depth 0(基帧 record[0] 上 RETURN)→ 脚本结束
-                    // (FUN_00451724)。VM frames.len() ↔ 引擎 depth:
-                    // len≤1 = 基帧上 RETURN → 结束;len>1 → 弹帧写调用者帧。
-                    if self.frames.len() <= 1 {
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc,
-                            command: g.command_type,
-                            condition: None,
-                        });
-                        self.state = VmState::Finished;
-                        return Ok(VmSuspend::Complete);
-                    }
-                    let mut ret_vals: Vec<(u32, Value)> = Vec::new();
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let b0 = (w.tag & 0xff) as u32;
-                        if b0 >= 0x30 {
-                            continue; // 区段外
-                        }
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            ret_vals.push((b0, v));
-                        }
-                    }
-                    let Some(frame) = self.frames.pop() else {
-                        unreachable!("frames.len()>1 已保证可弹");
-                    };
-                    // 引擎 RETURN 语义(成果 51.5):IF 嵌套栈深恢复为帧记录值,
-                    // 子程序内遗留的未弹 IF 项 / 循环记录整体丢弃。
-                    self.if_nest.truncate(frame.if_nest_depth);
-                    self.loops.truncate(frame.loop_depth);
-                    {
-                        let from = self.pc;
-                        let cur_script = self.ctx.script_id;
-                        // 返回帧所在脚本号;切帧(跨脚本返回)。
-                        let cross = frame.script_id != cur_script;
-                        self.events.push(VmEvent::Jump {
-                            from,
-                            to: frame.return_pc,
-                            kind: JumpKind::Return,
-                        });
-                        // 本组事件归属 = 派发点脚本(P1 引擎对拍);跨脚本时
-                        // 须在切换前发 ScriptSwitch,否则事件流重建脚本号错位。
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: from,
-                            command: g.command_type,
-                            condition: None,
-                        });
-                        if cross {
-                            self.events.push(VmEvent::ScriptSwitch {
-                                from_script: cur_script,
-                                to_script: frame.script_id,
-                            });
-                            self.switch_script(frame.script_id, frame.return_pc)?;
-                        }
-                        // 返回值写入调用者帧(弹出后 frames.last() = 调用者)
-                        for (b0, v) in ret_vals {
-                            let (r, idx, et): (
-                                yuris_value::VarRef,
-                                u32,
-                                yuris_value::ElemType,
-                            ) = match b0 {
-                                // 槽号从 1 起(成果 54);B0=0 = 默认槽 1
-                                0x00..=0x0f => (
-                                    yuris_value::VarRef {
-                                        space: yuris_value::VarSpace::At,
-                                        id: 60,
-                                    },
-                                    b0.max(1),
-                                    yuris_value::ElemType::Int,
-                                ),
-                                0x10..=0x1f => (
-                                    yuris_value::VarRef {
-                                        space: yuris_value::VarSpace::At,
-                                        id: 61,
-                                    },
-                                    (b0 - 0x10).max(1),
-                                    yuris_value::ElemType::Float,
-                                ),
-                                0x20..=0x2f => (
-                                    yuris_value::VarRef {
-                                        space: yuris_value::VarSpace::Dollar,
-                                        id: 62,
-                                    },
-                                    (b0 - 0x20).max(1),
-                                    yuris_value::ElemType::Str,
-                                ),
-                                _ => continue,
-                            };
-                            if let Some(caller) = self.frames.last_mut() {
-                                if !caller.locals.has_array(&r) {
-                                    caller.locals.declare_array(&r, et, &[16]);
-                                }
-                                let cv: Value = match (et, v) {
-                                    (yuris_value::ElemType::Int, Value::Int(i)) => {
-                                        Value::Int(i)
-                                    }
-                                    (yuris_value::ElemType::Int, Value::Float(f)) => {
-                                        Value::Int(f.round() as i64)
-                                    }
-                                    (yuris_value::ElemType::Float, Value::Int(i)) => {
-                                        Value::Float(i as f64)
-                                    }
-                                    (yuris_value::ElemType::Float, Value::Float(f)) => {
-                                        Value::Float(f)
-                                    }
-                                    (yuris_value::ElemType::Str, Value::Str(mut s)) => {
-                                        if s.len() >= 2
-                                            && s.first() == Some(&b'"')
-                                            && s.last() == Some(&b'"')
-                                        {
-                                            s = s[1..s.len() - 1].to_vec();
-                                        }
-                                        Value::Str(s)
-                                    }
-                                    (_, other) => other,
-                                };
-                                let _ = caller.locals.set_elem(&r, &[idx as i64], cv);
-                            }
-                        }
-                        self.pc = frame.return_pc;
-                        continue;
-                    }
-                }
-                cmd::IF => {
-                    if g.window_count != 3 {
-                        if let Some(reason) = self.halt_or_record(
-                            self.pc,
-                            g.command_type,
-                            format!("IF 窗口数 {} != 3(语料恒 3)", g.window_count),
-                        ) {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    }
-                    let cond = self.eval_window_condition(windows.first())?;
-                    let Some(cond) = cond else {
-                        if let Some(reason) =
-                            self.halt_or_record(self.pc, g.command_type, "IF 无条件窗口")
-                        {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    };
-                    let truthy = value_truthy(&cond)?;
-                    // 嵌套栈:end 目标 = w2.len(编译期组号)
-                    self.if_nest.push(IfFrame {
-                        if_pc: self.pc,
-                        end_target: windows[2].len,
-                    });
-                    if !truthy {
-                        // 假 → 跳 w1.len ?: w2.len
-                        let to = if windows[1].len != 0 {
-                            windows[1].len
-                        } else {
-                            windows[2].len
-                        };
-                        let from = self.pc;
-                        self.events.push(VmEvent::Jump {
-                            from,
-                            to: to as usize,
-                            kind: JumpKind::IfFalse,
-                        });
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: from,
-                            command: g.command_type,
-                            condition: Some(cond),
-                        });
-                        self.pc = to as usize;
-                        continue;
-                    }
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc,
-                        command: g.command_type,
-                        condition: Some(cond),
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::IFBLEND => {
-                    let Some(top) = self.if_nest.last().copied() else {
-                        if let Some(reason) =
-                            self.halt_or_record(self.pc, g.command_type, "IFBLEND 无配对 IF")
-                        {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    };
-                    let from = self.pc;
-                    self.events.push(VmEvent::Jump {
-                        from,
-                        to: top.end_target as usize,
-                        kind: JumpKind::Else,
-                    });
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from,
-                        command: g.command_type,
-                        condition: None,
-                    });
-                    self.pc = top.end_target as usize;
-                    continue;
-                }
-                cmd::LET => {
-                    if g.window_count != 2 {
-                        if let Some(reason) = self.halt_or_record(
-                            self.pc,
-                            g.command_type,
-                            format!("LET 窗口数 {} != 2(语料恒 2)", g.window_count),
-                        ) {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    }
-                    // 引擎 FUN_00443808:w0 = 左值,w1 = 右值表达式;
-                    // 复合赋值码 = w0.tag 的 B3 字节(0=赋值 1=+= … 8=^=)
-                    let code = ((windows[0].tag >> 24) & 0xFF) as u8;
-                    let lhs_bytes = match self.ctx.script.window_bytes_pooled_copy(&windows[0]) {
-                        Some(b) => b,
-                        None => {
-                            if let Some(reason) = self.halt_or_record(
-                                self.pc,
-                                g.command_type,
-                                "LET 左值窗口越过池尾",
-                            ) {
-                                return Ok(VmSuspend::Error(reason));
-                            }
-                            self.pc += 1;
-                            continue;
-                        }
-                    };
-                    let lval = match self.eval_window_lvalue(&lhs_bytes) {
-                        Ok(l) => l,
-                        Err(e) => {
-                            self.state = VmState::Error;
-                            return Ok(VmSuspend::Error(e.to_string()));
-                        }
-                    };
-                    // 帧局部变量(id = 声明命令 0x32/0x33/0x34/0x35/0x46)写入当前帧
-                    // locals;其余走全局(下方按 lval.var.id 分流)。
-                    // 基帧恒在(成果 56):帧局部 LET 恒有落点(引擎 depth 0 时
-                    // 写 record[0]),无「无帧」错误路径。
-                    let rhs = match self.eval_window_condition(Some(&windows[1]))? {
-                        Some(v) => v,
-                        None => {
-                            if let Some(reason) = self.halt_or_record(
-                                self.pc,
-                                g.command_type,
-                                "LET 右值窗口为空",
-                            ) {
-                                return Ok(VmSuspend::Error(reason));
-                            }
-                            self.pc += 1;
-                            continue;
-                        }
-                    };
-                    // 复合赋值需要当前值:左值窗内含 aload(引擎左值窗为
-                    // 引用+下标+aload 形态)→ 求值得到当前值;
-                    // 无 aload(纯标量)→ 标量路径直取。eval_window_condition
-                    // 的结尾 LValue 会被丢弃,这里允许其失败。
-                    let cur = self.store_current(&lval);
-                    let newv = match cur {
-                        Some(c) => match yuris_value::compound_assign(code, &c, &rhs) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                self.state = VmState::Error;
-                                return Ok(VmSuspend::Error(e.to_string()));
-                            }
-                        },
-                        None => {
-                            // code==0(纯赋值)允许向未初始化目标写入;复合码缺左值 → 挂起
-                            if code == 0 {
-                                rhs.clone()
-                            } else if let Some(reason) = self.halt_or_record(
-                                self.pc,
-                                g.command_type,
-                                "复合赋值目标无当前值(未声明?)",
-                            ) {
-                                return Ok(VmSuspend::Error(reason));
-                            } else {
-                                self.pc += 1;
-                                continue;
-                            }
-                        }
-                    };
-                    // 目标:帧局部(id 0x32-0x46 族)→ 当前 GOSUB 帧 locals;否则全局
-                    let is_frame_local = matches!(lval.var.id, 0x32 | 0x33 | 0x34 | 0x35 | 0x46);
-                    let store_res = if is_frame_local {
-                        match self.frames.last_mut() {
-                            Some(fr) if lval.indices.is_empty() => {
-                                fr.locals.set(&lval.var, newv.clone());
-                                Ok(())
-                            }
-                            Some(fr) => fr.locals.set_elem(&lval.var, &lval.indices, newv.clone()),
-                            None => Err(Error::format(
-                                "LET 帧局部但无帧(基帧恒在,不应发生;成果 56)",
-                            )),
-                        }
-                    } else if lval.indices.is_empty() {
-                        self.store.set(&lval.var, newv.clone());
-                        Ok(())
-                    } else {
-                        self.store.set_elem(&lval.var, &lval.indices, newv.clone())
-                    };
-                    if let Err(e) = store_res {
-                        self.state = VmState::Error;
-                        return Ok(VmSuspend::Error(e.to_string()));
-                    }
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc,
-                        command: g.command_type,
-                        condition: Some(newv),
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::LOOP => {
-                    // 引擎 CMDH_00445a00:w0 = 计数表达式(INT, B2=1);
-                    // 压循环帧 {body_start=pc+1, limit=w0, counter=1};深度上限 0x40
-                    if self.loops.len() >= 0x40 {
-                        if let Some(reason) = self.halt_or_record(
-                            self.pc,
-                            g.command_type,
-                            "循环嵌套超过 64 层(引擎 0x18ce0 同族)",
-                        ) {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    }
-                    let limit = match self.eval_window_condition(windows.first())? {
-                        Some(Value::Int(n)) if n >= 0 => Some(n as u64),
-                        Some(Value::Int(_)) => None, // 引擎负值 → 0xffffffff/-1 无限标记(Likely)
-                        Some(v) => {
-                            let reason = format!("LOOP 计数非 INT: {v:?}");
-                            self.state = VmState::Error;
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        None => {
-                            if let Some(reason) = self
-                                .halt_or_record(self.pc, g.command_type, "LOOP 无计数窗口")
-                            {
-                                return Ok(VmSuspend::Error(reason));
-                            }
-                            self.pc += 1;
-                            continue;
-                        }
-                    };
-                    // 退出点 = w1.len(编译期组号 = 配对 LOOPEND;引擎 rec+8
-                    // = DAT_00661428,语料实证 s190 g332 w1.len=338→g338、
-                    // s7 g93 w1.len=97→g97,均为 LOOPEND 组)。
-                    let exit_target = if windows.len() > 1 {
-                        windows[1].len as usize
-                    } else {
-                        0
-                    };
-                    self.loops.push(LoopFrame {
-                        body_start: self.pc + 1,
-                        exit_target,
-                        limit,
-                        counter: 1,
-                    });
-                    // 引擎 00445a00 limit==0 路径:counter=0 且 PC = rec+8
-                    // (退出点)—— **不进循环体**,记录留栈由 LOOPEND 弹出
-                    // (对拍 [546] 实证:s7 g93 limit=0 → g97 LOOPEND)。
-                    if limit == Some(0) {
-                        if let Some(f) = self.loops.last_mut() {
-                            f.counter = 0;
-                        }
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc,
-                            command: g.command_type,
-                            condition: None,
-                        });
-                        self.pc = exit_target;
-                        continue;
-                    }
-                    // 注意:limit>0 恒压帧;LOOPEND「counter+1 >= limit → 弹帧」
-                    // 循环体内的 GOSUB 返回后 LOOPEND 有配对(端到端实测踩坑,勿回退)。
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc,
-                        command: g.command_type,
-                        condition: None,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::LOOPBREAK => {
-                    // 引擎 CMDH_00445b9c:LV 参数 = 回退层数(默认 1);
-                    // 保留目标层记录(counter=0/limit=0),丢弃其上 LV-1 层,
-                    // PC = 该层 rec+8 = 退出点(LOOP 组号,配对 LOOPEND);
-                    // 随后 LOOPEND 执行(发事件)并弹栈(成果 55b:rec+8 =
-                    // w1.len 反编译+语料双证,取代旧动态配对)。
-                    let level = self.loop_level_from(windows.first())?;
-                    let Some(level) = level else {
-                        self.pc += 1;
-                        continue;
-                    };
-                    if level < 1 || level > self.loops.len() {
-                        if let Some(reason) = self.halt_or_record(
-                            self.pc,
-                            g.command_type,
-                            format!("LOOPBREAK 层级 {level} 越界(深度 {})", self.loops.len()),
-                        ) {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    }
-                    let keep = self.loops.len() - level; // 保留该层(含)
-                    let exit = self.loops[keep].exit_target;
-                    let from = self.pc;
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from,
-                        command: g.command_type,
-                        condition: None,
-                    });
-                    self.events.push(VmEvent::Jump {
-                        from,
-                        to: exit,
-                        kind: JumpKind::LoopBreak,
-                    });
-                    self.loops.truncate(keep + 1);
-                    if let Some(f) = self.loops.last_mut() {
-                        f.counter = 0;
-                        f.limit = Some(0);
-                    }
-                    self.pc = exit;
-                    continue;
-                }
-                cmd::LOOPCONTINUE => {
-                    // 引擎 CMDH_00445c54:保留目标层记录(counter/limit 不动),
-                    // 丢弃其上 LV-1 层,PC = 该层 rec+8(LOOPEND 组)→
-                    // LOOPEND 递增 counter 并回体顶/退出(成果 55b)。
-                    let level = self.loop_level_from(windows.first())?;
-                    let Some(level) = level else {
-                        self.pc += 1;
-                        continue;
-                    };
-                    if level < 1 || level > self.loops.len() {
-                        if let Some(reason) = self.halt_or_record(
-                            self.pc,
-                            g.command_type,
-                            format!("LOOPCONTINUE 层级 {level} 越界(深度 {})", self.loops.len()),
-                        ) {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    }
-                    let keep = self.loops.len() - level;
-                    let exit = self.loops[keep].exit_target;
-                    let from = self.pc;
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from,
-                        command: g.command_type,
-                        condition: None,
-                    });
-                    self.events.push(VmEvent::Jump {
-                        from,
-                        to: exit,
-                        kind: JumpKind::LoopContinue,
-                    });
-                    self.loops.truncate(keep + 1);
-                    self.pc = exit;
-                    continue;
-                }
-                cmd::LOOPEND => {
-                    // 引擎 CMDH_00445ce8:counter+1;counter >= limit → 弹帧顺序继续;
-                    // 否则 PC = body_start(64 位计数,0xffffffff/-1 = 无限标记)
-                    let Some(top) = self.loops.last().copied() else {
-                        if let Some(reason) = self
-                            .halt_or_record(self.pc, g.command_type, "LOOPEND 无配对 LOOP")
-                        {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    };
-                    let counter = top.counter + 1;
-                    if let Some(limit) = top.limit {
-                        if counter > limit {
-                            self.loops.pop();
-                            self.events.push(VmEvent::GroupExecuted {
-                                pc: self.pc,
-                                command: g.command_type,
-                                condition: None,
-                            });
-                            self.pc += 1;
-                            continue;
-                        }
-                    }
-                    if let Some(f) = self.loops.last_mut() {
-                        f.counter = counter;
-                    }
-                    let from = self.pc;
-                    // 循环回跳路径同样记本组事件(引擎每派发必有一事件;
-                    // P1 对拍实锤:engine 39 pc118 LOOPEND 每次迭代都有事件)
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from,
-                        command: g.command_type,
-                        condition: None,
-                    });
-                    self.events.push(VmEvent::Jump {
-                        from,
-                        to: top.body_start,
-                        kind: JumpKind::LoopContinue,
-                    });
-                    self.pc = top.body_start;
-                    continue;
-                }
-                cmd::WAIT => {
-                    // 引擎 CMDH_00455d58:求值参数;FRAME 参数(槽 0)→ obj+0x18
-                    // 帧计数,让出;TIME 参数(槽 1)→ obj+0x1c = timeGetTime()+ms,让出;
-                    // 两者都无 → 不等待。
-                    let mut counter = None;
-                    let mut time_ms = None;
-                    for (i, w) in windows.iter().enumerate() {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let Some(v) = self.eval_window_condition(Some(w))? else {
-                            continue;
-                        };
-                        // YSCM WAIT 参数序:FRAME(槽0) TIME(槽1);按窗口出现的槽序归类
-                        let slot = (w.tag & 0xff) as u8;
-                        match slot {
-                            0 => counter = v.as_int_opt().map(|n| n as u64),
-                            1 => time_ms = v.as_int_opt().map(|n| n as u64),
-                            _ => {}
-                        }
-                        let _ = i;
-                    }
-                    if counter.is_none() && time_ms.is_none() {
-                        // 无参数 → 引擎直接返回 0(不等待)
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc,
-                            command: g.command_type,
-                            condition: None,
-                        });
-                        self.pc += 1;
-                        continue;
-                    }
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc,
-                        command: g.command_type,
-                        condition: None,
-                    });
-                    self.pc += 1; // 先推进:等完后继续执行
-                    return Ok(VmSuspend::Wait { counter, time_ms });
-                }
-                cmd::TEXT => {
-                    // 引擎 CMDH_00452888:FILE 参数为字符串(UTF-8/SJIS)→ 显示层;
-                    // LET/CLEAR 为布尔。事件化;不阻塞(点击等待在文本层,非本 VM)。
-                    let mut file = None;
-                    let mut let_flag = false;
-                    let mut clear_flag = false;
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            match v {
-                                Value::Str(bytes) => file = Some(bytes),
-                                Value::Int(n) => {
-                                    let slot = (w.tag & 0xff) as u8;
-                                    // 参数槽:YSCM TEXT 序 = FILE(0) LET(1) CLEAR(2)
-                                    match slot {
-                                        1 => let_flag = n != 0,
-                                        2 => clear_flag = n != 0,
-                                        _ => {}
-                                    }
-                                }
-                                other => {
-                                    // 非字符串/整数参数:记事件,不猜
-                                    let _ = other;
-                                }
-                            }
-                        }
-                    }
-                    self.events.push(VmEvent::Text {
-                        pc: self.pc,
-                        file,
-                        let_flag,
-                        clear_flag,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::CG => {
-                    // 引擎处理器 = 0x423864(表初始化 DAT_0078b024 实锤;
-                    // 勘误:0x43c984 是 cmd 0x0a DIALOG,此前误标为 CG)。
-                    // 求值全部参数,按 B0 槽填入;
-                    // 事件化记录 ID(槽 0)/X,Y,Z(槽 4/5/6),其余计数。
-                    // 槽位映射草案见 bridge 模块文档(成果 48)。
-                    // P7.1(成果 62):按名 upsert CG 状态注册表(引擎仅写
-                    // 已指定槽,未指定字段保持原值/新建默认 —— 反编译
-                    // 0x423864 逐槽 if(DAT_006624xx) 写,实证)。
-                    let mut id = None;
-                    let mut id_bytes: Option<Vec<u8>> = None;
-                    let (mut cx, mut cy, mut cz) = (None, None, None);
-                    let (mut csx, mut csy) = (None, None);
-                    let mut file: Option<Vec<u8>> = None;
-                    let mut count = 0usize;
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            count += 1;
-                            match (slot, &v) {
-                                (0, Value::Str(bytes)) => {
-                                    id = Some(v.str_as_string());
-                                    id_bytes = Some(bytes.clone());
-                                }
-                                (4, Value::Int(n)) => cx = Some(*n),
-                                (5, Value::Int(n)) => cy = Some(*n),
-                                (6, Value::Int(n)) => cz = Some(*n),
-                                (9, Value::Int(n)) => csx = Some(*n),
-                                (10, Value::Int(n)) => csy = Some(*n),
-                                (46, Value::Str(bytes)) => file = Some(bytes.clone()),
-                                _ => {}
-                            }
-                        }
-                    }
-                    let position = match (cx, cy) {
-                        (Some(x), Some(y)) => Some((x, y, cz.unwrap_or(0))),
-                        _ => None,
-                    };
-                    // 注册表维护(成果 62,引擎 0x423864 + watch oracle 实证):
-                    // FILE 槽(46)非空 → 创建(注册;已存在则按已指定槽 patch);
-                    // 无 FILE / FILE="" → 静默不创建(处理器 return 0 路径),
-                    // 已注册者仅 patch —— 后续 CGINFO 查未注册名走「不存在」
-                    // 路径写 0(BT.OVER/ON/ONOV/MASK vs BT.OFF/NA 对拍实证)。
-                    // P1 收尾:FILE 非空时经 VFS 探针解析图像头,填
-                    // img_w/img_h(CGINFO 槽13/14 真值应答源)。
-                    let image_dims = match (&file, &self.file_probe) {
-                        (Some(f), Some(probe)) => {
-                            probe.image_dims(&String::from_utf8_lossy(f))
-                        }
-                        _ => None,
-                    };
-                    if let Some(bytes) = &id_bytes {
-                        let create = matches!(&file, Some(f) if !f.is_empty());
-                        let exists = self.cg_registry.contains_key(bytes);
-                        if create || exists {
-                            let st = self.cg_registry.entry(bytes.clone()).or_default();
-                            if let Some(x) = cx {
-                                st.x = x;
-                            }
-                            if let Some(y) = cy {
-                                st.y = y;
-                            }
-                            if let Some(z) = cz {
-                                st.z = z;
-                            }
-                            if let Some(sx) = csx {
-                                st.sx = sx;
-                            }
-                            if let Some(sy) = csy {
-                                st.sy = sy;
-                            }
-                            if let Some((w, h)) = image_dims {
-                                st.img_w = w;
-                                st.img_h = h;
-                            }
-                            if let Some(f) = &file {
-                                if !f.is_empty() {
-                                    st.file = Some(f.clone());
-                                }
-                            }
-                        }
-                    }
-                    self.events.push(VmEvent::Cg {
-                        pc: self.pc,
-                        script_id: self.ctx.script_id,
-                        id,
-                        position,
-                        param_count: count,
-                        file: file.clone(),
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::SOUND => {
-                    let mut id = None;
-                    let mut file = None;
-                    let mut play = None;
-                    let mut count = 0usize;
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            count += 1;
-                            match (slot, &v) {
-                                (0, Value::Str(_)) => id = Some(v.str_as_string()),
-                                (2, Value::Str(_)) => file = Some(v.str_as_string()),
-                                (3, Value::Int(n)) => play = Some(*n),
-                                _ => {}
-                            }
-                        }
-                    }
-                    self.events.push(VmEvent::Sound {
-                        pc: self.pc,
-                        id,
-                        file,
-                        play,
-                        param_count: count,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::ELSE => {
-                    // 引擎 CMDH_0043d34c(反编译,成果 55):
-                    //   w0 无条件(B2=0)→ 顺序(进 else 块);
-                    //   w0 求值真 → 顺序;假 → PC = w1.len != 0 ? w1.len
-                    //   : 嵌套栈顶 end 目标。w1.len 存编译期组号 = ELSE 链中
-                    //   **下一个 ELSE**(语料实证:s126 g66 w1.len=70 → g70;
-                    //   g70 w1.len=0 → 落 IFEND g72);旧实现直接跳 end 目标,
-                    //   跳过链中后续 ELSE 块(对拍 [518] 分歧根因)。
-                    //   嵌套栈不弹(IFEND 负责弹,引擎同)。
-                    let cond = if windows.len() > 0 && windows[0].len > 0 {
-                        self.eval_window_condition(Some(&windows[0]))?
-                    } else {
-                        None
-                    };
-                    let truthy = if let Some(v) = cond {
-                        value_truthy(&v)?
-                    } else {
-                        true // 无条件 ELSE → 进块
-                    };
-                    let Some(top) = self.if_nest.last().copied() else {
-                        if let Some(reason) = self.halt_or_record(
-                            self.pc, g.command_type, "ELSE 无配对 IF") {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    };
-                    if truthy {
-                        self.events.push(VmEvent::GroupExecuted {
-                            pc: self.pc, command: g.command_type, condition: None });
-                        self.pc += 1;
-                        continue;
-                    }
-                    // 假 → 下一 ELSE(w1.len);无 → 嵌套栈顶 end 目标
-                    let to = if windows.len() > 1 && windows[1].len != 0 {
-                        windows[1].len as usize
-                    } else {
-                        top.end_target as usize
-                    };
-                    let from = self.pc;
-                    self.events.push(VmEvent::Jump {
-                        from, to, kind: JumpKind::Else });
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: from, command: g.command_type, condition: None });
-                    self.pc = to;
-                    continue;
-                }
-                cmd::END => {
-                    // 引擎 FUN_0043da44:设标志 DAT_008725dc=1(脚本结束),可选返回码→
-                    // DAT_00872228。本 VM 以 Complete 结束。
-                    let ret = if let Some(w) = windows.first() {
-                        self.eval_window_condition(Some(w)).ok().flatten()
-                    } else { None };
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc, command: g.command_type, condition: ret });
-                    self.state = VmState::Finished;
-                    return Ok(VmSuspend::Complete);
-                }
-                cmd::VARINFO => {
-                    // 引擎 CMDH_004550a0(**Confirmed**,2026-09-03 勘误):
-                    // SET(槽0)/LET(槽1) = 变量引用槽(kind 2 延迟求值),非操作!
-                    //   旧实现把 SET 误判为写回操作挂起 → 端到端卡死,已修正。
-                    // 操作槽(引擎 if-else 链按槽号升序,第一个非零者生效):
-                    //   TYPE(2)/STRTYPE(3)/DIMNUM(4)/DIMSIZE(5..12 = 第 1..8 维)/
-                    //   LENGTH(13)/SEARCH(14)/STRFIRST(15)/SJISCODE(16)
-                    // 结果 → 接收器 = **写入 LET 引用目标**(STRTYPE 分支直接证据:
-                    //   判定 1/2 写入 LET 引用的下标元素;无 LET 槽 → 仅事件记录)。
-                    // 全部操作槽为 0 → 引擎 fallback = LENGTH(SET 串字节长)。
-                    let mut set_target: Option<VarTarget> = None;
-                    let mut let_target: Option<VarTarget> = None;
-                    let mut op_slot: Option<(u8, Value)> = None;
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    let mut pending: Vec<(u8, yuris_format::ystb::CommandSlot)> = Vec::new();
-                    // 操作槽求值全量保留(SEARCH 需要 key/起始下标等参数值)
-                    let mut slot_vals: Vec<(u8, Value)> = Vec::new();
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        match slot {
-                            0 | 1 => pending.push((slot, w.clone())),
-                            _ => {
-                                let Some(v) = self.eval_window_condition(Some(w))? else {
-                                    continue;
-                                };
-                                let enabled = matches!(&v, Value::Int(n) if *n != 0);
-                                if enabled && op_slot.is_none() {
-                                    op_slot = Some((slot, v.clone()));
-                                }
-                                evaluated.push((slot, value_summary(&v)));
-                                slot_vals.push((slot, v));
-                            }
-                        }
-                    }
-                    // 引用槽窗口解码失败 = 结构异常,诚实挂起
-                    for (slot, w) in pending {
-                        let bytes = self
-                            .ctx
-                            .script
-                            .window_bytes_pooled_copy(&w)
-                            .ok_or_else(|| Error::format("VARINFO 引用窗越过池尾"))?;
-                        let target = extract_var_target(&bytes)?;
-                        match slot {
-                            0 => set_target = Some(target),
-                            _ => let_target = Some(target),
-                        }
-                    }
-                    // 执行查询(未实现/结构异常 → strict 挂起 / trace 记录后跳过)
-                    let query = op_slot.as_ref().map(|(s, _)| *s);
-                    let result = match self
-                        .exec_varinfo_query(query, set_target.as_ref(), &slot_vals, &mut evaluated)
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            if let Some(reason) =
-                                self.halt_or_record(self.pc, g.command_type, e.to_string())
-                            {
-                                return Ok(VmSuspend::Error(reason));
-                            }
-                            self.pc += 1;
-                            continue;
-                        }
-                    };
-                    // 写 LET 目标
-                    if let (Some(result), Some(target)) = (result, &let_target) {
-                        self.write_var_target(target, result)?;
-                    }
-                    if let Some(t) = &let_target {
-                        evaluated.push((255u8, format!("→ {}", t.summary())));
-                    }
-                    self.events.push(VmEvent::VarQuery {
-                        pc: self.pc,
-                        command: g.command_type,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::VARACT => {
-                    // 引擎 CMDH_00453178(反编译逐分支,2026-09-03 勘误后):
-                    // 处理器头部把槽0(SET)引用记为对象、槽1(LET)引用记为目标。
-                    // 分支结构(全 if 独立判断,非互斥 else):
-                    // - a3(CUT) 分支:POS(4)/LENGTH(5) 联合计算字符区间 [POS,
-                    //   POS+LENGTH) 的字节偏移,拷贝子串 → FUN_0045b9f8(写 LET 目标);
-                    //   对象为空串时步进循环不执行 → 结果 = 空串(不报错)。
-                    // - 顶层 `if (a6==0)` 为真(无 TYPE 槽)才进上述各分支;a6≠0 是
-                    //   INT/FLT/STR 类型转换分支(收尾直接接收器,无 LET 也可)。
-                    // - DIMSIZE(13)/PUSH(14)/POP(15) 分支无接收器写回(直接改数组
-                    //   描述符);全语料直方图:[0,13]=131、[0,15]=113、[0,14]=93
-                    //   (全部无 LET 槽,与「直接改数组」自洽)。
-                    // - 语料 [0,1,3,4,5]=15 组 = CUT+POS+LENGTH 联合(截取子串)。
-                    // 未实现分支:诚实挂起(不猜)。
-                    let mut set_target: Option<VarTarget> = None;
-                    let mut let_target: Option<VarTarget> = None;
-                    // (slot, B3 算符, 槽值);B3 = tag 高字节(0=赋值/1=加/…,
-                    // DIMSIZE 分支经 FUN_00425224 消费;成果 59)
-                    let mut ops: Vec<(u8, u8, Value)> = Vec::new();
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    let mut pending: Vec<(u8, yuris_format::ystb::CommandSlot)> = Vec::new();
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        match slot {
-                            0 | 1 => pending.push((slot, w.clone())),
-                            _ => {
-                                let Some(v) = self.eval_window_condition(Some(w))? else {
-                                    continue;
-                                };
-                                if slot >= 2 {
-                                    let b3 = ((w.tag >> 24) & 0xff) as u8;
-                                    ops.push((slot, b3, v.clone()));
-                                }
-                                evaluated.push((slot, value_summary(&v)));
-                            }
-                        }
-                    }
-                    for (slot, w) in pending {
-                        let bytes = self
-                            .ctx
-                            .script
-                            .window_bytes_pooled_copy(&w)
-                            .ok_or_else(|| Error::format("VARACT 引用窗越过池尾"))?;
-                        let t = extract_var_target(&bytes)?;
-                        if slot == 0 {
-                            set_target = Some(t);
-                        } else {
-                            let_target = Some(t);
-                        }
-                    }
-                    let target = set_target.ok_or_else(|| {
-                        Error::format("VARACT 无 SET 引用槽(引擎必填)")
-                    })?;
-                    // 对象当前值(STR 操作分支的输入;引擎经 FUN_0044d4e8 读取)
-                    let obj = self.read_var_target(&target)?;
-                    // 引擎 if-else 链按槽号独立 if(可多槽同时启用);逐个处理
-                    let mut result: Option<Value> = None;
-                    let mut unimplemented: Vec<u8> = Vec::new();
-                    let has_range_op = ops.iter().any(|(s, _, _)| matches!(s, 2 | 3));
-                    for (slot, b3, v) in &ops {
-                        match slot {
-                            13 => {
-                                // DIMSIZE:new_len = 算符(B3)以**当前元素个数**
-                                // 为基(引擎 00453178 DIMSIZE 分支,00425224 唯一
-                                // 调用点:op 0=赋值/1=加/2=减/3=乘/4=除,基值 =
-                                // desc+4;负值 → 报错 0x…b60;结果 == cur 不
-                                // resize)。语料惯用法 DIMSIZE(+=1) = 压栈
-                                // (s47 g42 等,成果 59)。
-                                let r = match &target {
-                                    VarTarget::Scalar(r) => r,
-                                    VarTarget::Indexed(r, _) => r,
-                                };
-                                let cur = self
-                                    .store
-                                    .array_dims(r)
-                                    .and_then(|d| d.first().copied())
-                                    .ok_or_else(|| {
-                                        Error::format(format!(
-                                            "VARACT DIMSIZE 目标非数组(引擎 desc+2==1) s{} pc={}",
-                                            self.ctx.script_id, self.pc
-                                        ))
-                                    })?;
-                                let newv = yuris_value::compound_assign(
-                                    *b3,
-                                    &Value::Int(cur as i64),
-                                    v,
-                                )?;
-                                let new_len = match newv {
-                                    Value::Int(n) if n >= 0 => n as usize,
-                                    other => {
-                                        return Err(Error::format(format!(
-                                            "VARACT DIMSIZE 需非负 int,得到 {other:?}"
-                                        )))
-                                    }
-                                };
-                                if new_len != cur as usize {
-                                    self.resize_array_target(&target, new_len)?;
-                                }
-                            }
-                            4 | 5 if has_range_op => {
-                                // POS/LENGTH 是 CUT/COPY 分支的字符区间参数
-                                // (引擎 a2/a3 守卫内消费),不单独产生结果
-                            }
-                            slot @ (7 | 9) => {
-                                // UPPER(7)/LOWER(9):引擎 FUN_004546cc/FUN_00464dac
-                                // (各 57B,Ghidra 2026-09-04):SJIS 感知 ASCII 大小写
-                                // 原地转换 —— 步进表 DAT_0059b0c0==1(双字节首区
-                                // 0x81-0x9F/0xE0-0xEF)连跳 2 字节;单字节 'a'-'z'→
-                                // -0x20(UPPER) / 'A'-'Z'→+0x20(LOWER),其余原样。
-                                // 槽值(push 1)= 使能标志,转换本身不消费(语料
-                                // s190 g267 LOWER=1;Likely)。接收 = LET 目标。
-                                let bytes = match &obj {
-                                    Value::Str(b) => b.clone(),
-                                    other => {
-                                        return Err(Error::format(format!(
-                                            "VARACT 槽 {slot} 对象非 STR: {other:?}"
-                                        )))
-                                    }
-                                };
-                                result = Some(Value::Str(varact_ascii_case(
-                                    &bytes,
-                                    *slot == 7,
-                                )));
-                            }
-                            slot @ (2 | 3) => {
-                                // slot3 COPY:截取字符区间 [POS-1, POS-1+LENGTH)
-                                // slot2 CUT :写出切除该区间后的剩余部分
-                                // (引擎 CMDH_00453178 两分支:按 SJIS 步进表定位
-                                // 字节偏移。守卫语义:POS∈{0,1}→首字符(引擎对值
-                                // 0/1 有专门短路);LENGTH=0→空区间;对象为空串 →
-                                // 步进循环不执行 → 结果=空串,**不报错**。
-                                // 报错(0x1d4ca/0x1d4d4)仅在非空串上步进越过缓冲尾,
-                                // 本实现以「钳制到字符数」近似(引擎此时也报错;
-                                // 真实语料该路径未观测到,等级 Likely)。
-                                let bytes = match &obj {
-                                    Value::Str(b) => b.clone(),
-                                    other => {
-                                        return Err(Error::format(format!(
-                                            "VARACT 槽 {slot} 对象非 STR: {other:?}"
-                                        )))
-                                    }
-                                };
-                                let pos_ch = self.varact_slot_usize(ops.as_slice(), 4)?;
-                                let len_ch = self.varact_slot_usize(ops.as_slice(), 5)?;
-                                if bytes.is_empty() {
-                                    // 空串:两循环都不步进 → COPY=""、CUT=""
-                                    result = Some(Value::Str(Vec::new()));
-                                } else {
-                                    let start_ch = pos_ch.saturating_sub(1);
-                                    let start = varact_char_to_byte(&obj, start_ch)
-                                        .ok_or_else(|| {
-                                            let pc = self.pc;
-                                            let blen = bytes.len();
-                                            let sid = self.ctx.script_id;
-                                            let hex: String = bytes
-                                                .iter()
-                                                .take(48)
-                                                .map(|b| format!("{b:02x}"))
-                                                .collect::<Vec<_>>()
-                                                .join(" ");
-                                            Error::format(format!(
-                                                "VARACT 槽 {slot} POS={pos_ch} 越界(引擎 0x1d4ca 同族; s{sid} pc={pc} 目标={target:?} 串字节={blen} ops={ops:?} hex={hex})"
-                                            ))
-                                        })?;
-                                    let end = varact_char_to_byte(&obj, start_ch + len_ch)
-                                        .ok_or_else(|| {
-                                            let pc = self.pc;
-                                            let blen = bytes.len();
-                                            let sid = self.ctx.script_id;
-                                            Error::format(format!(
-                                                "VARACT 槽 {slot} LENGTH={len_ch} 越界(引擎 0x1d4d4 同族; s{sid} pc={pc} 串字节={blen} POS={pos_ch} ops={ops:?})"
-                                            ))
-                                        })?;
-                                    result = Some(match slot {
-                                        3 => Value::Str(bytes[start..end].to_vec()),
-                                        _ => {
-                                            let mut out = bytes[..start].to_vec();
-                                            out.extend_from_slice(&bytes[end..]);
-                                            Value::Str(out)
-                                        }
-                                    });
-                                }
-                            }
-                            14 | 15 => {
-                                // PUSH(14)/POP(15):数组元素插入/删除(带移位;
-                                // 引擎 00453178 PUSH/POP 分支汇编级 Confirmed):
-                                // - 前提:目标 1 维数组(desc+2==1,否则 0x879b80/
-                                //   0x879be0 报错);槽值 = 操作位置 pos(64 位,
-                                //   钳制:pos >= count-1 时只写末位)。
-                                // - PUSH:`for i in (pos+1..count).rev(): arr[i] =
-                                //   arr[i-1]`(后移),`arr[pos] = 类型默认值`
-                                //   (INT 0 / FLT 0.0[0x579ca8] / STR ""[0x87899c])。
-                                // - POP:`for i in pos..count-1: arr[i] = arr[i+1]`
-                                //   (前移),`arr[count-1] = 默认值`。
-                                // 无 LET 写回、无 resize(desc+4 不变)。
-                                let r = match &target {
-                                    VarTarget::Scalar(r) => r,
-                                    // 带下标 = 非裸数组引用(PUSH/POP 须裸引用)
-                                    VarTarget::Indexed(_, _) => {
-                                        return Err(Error::format(format!(
-                                            "VARACT PUSH/POP 目标须裸数组引用(引擎 desc+2==1)\
-                                             s{} pc={}",
-                                            self.ctx.script_id, self.pc
-                                        )));
-                                    }
-                                };
-                                let Some(bounds) = self.store.array_dims(r) else {
-                                    return Err(Error::format(format!(
-                                        "VARACT PUSH/POP 目标非数组 s{} pc={}",
-                                        self.ctx.script_id, self.pc
-                                    )));
-                                };
-                                if bounds.len() != 1 {
-                                    return Err(Error::format(format!(
-                                        "VARACT PUSH/POP 要求 1 维数组(引擎 desc+2==1),\
-                                         得到 {} 维",
-                                        bounds.len()
-                                    )));
-                                }
-                                let count = bounds[0] as usize;
-                                let pos = match v {
-                                    Value::Int(n) if *n >= 0 => *n as usize,
-                                    other => {
-                                        return Err(Error::format(format!(
-                                            "VARACT PUSH/POP 位置须非负 int,得到 {other:?}"
-                                        )))
-                                    }
-                                };
-                                if count == 0 {
-                                    return Err(Error::format(
-                                        "VARACT PUSH/POP 空数组(引擎 desc+4==0)",
-                                    ));
-                                }
-                                let default = match self.store.array_elem_type(r).unwrap() {
-                                    yuris_value::ElemType::Int => Value::Int(0),
-                                    yuris_value::ElemType::Float => Value::Float(0.0),
-                                    yuris_value::ElemType::Str => Value::Str(Vec::new()),
-                                };
-                                if *slot == 14 {
-                                    // PUSH:pos 钳到 count-1;后移 + 插入默认值
-                                    let pos = pos.min(count - 1);
-                                    for i in ((pos + 1)..count).rev() {
-                                        let v = self.store.get_elem(r, &[(i - 1) as i64])?.clone();
-                                        self.store.set_elem(r, &[i as i64], v)?;
-                                    }
-                                    self.store.set_elem(r, &[pos as i64], default)?;
-                                } else {
-                                    // POP:pos >= count-1 只尾置默认;否则前移 + 尾置默认
-                                    if pos < count.saturating_sub(1) {
-                                        for i in pos..(count - 1) {
-                                            let v = self
-                                                .store
-                                                .get_elem(r, &[(i + 1) as i64])?
-                                                .clone();
-                                            self.store.set_elem(r, &[i as i64], v)?;
-                                        }
-                                    }
-                                    self.store
-                                        .set_elem(r, &[(count - 1) as i64], default)?;
-                                }
-                            }
-                            other_slot => unimplemented.push(*other_slot),
-                        }
-                    }
-                    // 结果接收:引擎 a3 分支收尾写 LET 引用的变量(有 LET 槽才写;
-                    // DIMSIZE/PUSH/POP 无 LET 也不写)
-                    if let Some(v) = result {
-                        let lt = let_target.clone().ok_or_else(|| {
-                            Error::format("VARACT CUT 有结果但无 LET(1) 引用槽(引擎必填)")
-                        })?;
-                        self.write_var_target(&lt, v)?;
-                        evaluated.push((255u8, format!("→ {}", lt.summary())));
-                    }
-                    if !unimplemented.is_empty() {
-                        let slots: Vec<String> =
-                            unimplemented.iter().map(|s| format!("{s}")).collect();
-                        if let Some(reason) = self.halt_or_record(
-                            self.pc,
-                            g.command_type,
-                            format!(
-                                "VARACT 写操作槽 [{slots:?}] 未实现(不猜) s{} pc={}",
-                                self.ctx.script_id, self.pc
-                            ),
-                        ) {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                    }
-                    self.events.push(VmEvent::VarQuery {
-                        pc: self.pc,
-                        command: g.command_type,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::LABELINFO => {
-                    // 引擎 CMDH_00443674(Confirmed,402B 小函数):
-                    // '#'(槽0,k1)=标签名;LET(槽1)=写回目标(可带下标);
-                    // EXIST(槽2)非零 → FUN_0045124c(murmur2 查标签表):
-                    //   命中 → LET 写 1;未命中 → 写 0(INT 写 8B 零/FLT 写 0.0)。
-                    // 未启用 EXIST → 仅拷名(no-op)。
-                    let mut label: Option<String> = None;
-                    let mut let_target: Option<VarTarget> = None;
-                    let mut exist = false;
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    let mut pending_let: Option<yuris_format::ystb::CommandSlot> = None;
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        match slot {
-                            0 => {
-                                if let Some(v) = self.eval_window_condition(Some(w))? {
-                                    if let Value::Str(_) = v {
-                                        label = Some(v.str_as_string());
-                                    }
-                                    evaluated.push((slot, value_summary(&v)));
-                                }
-                            }
-                            1 => pending_let = Some(w.clone()),
-                            _ => {
-                                let v = self.eval_window_condition(Some(w))?;
-                                if slot == 2 {
-                                    exist = matches!(&v, Some(Value::Int(n)) if *n != 0);
-                                }
-                                if let Some(v) = &v {
-                                    evaluated.push((slot, value_summary(v)));
-                                }
-                            }
-                        }
-                    }
-                    if let Some(w) = pending_let {
-                        let bytes = self
-                            .ctx
-                            .script
-                            .window_bytes_pooled_copy(&w)
-                            .ok_or_else(|| Error::format("LABELINFO LET 引用窗越过池尾"))?;
-                        let_target = Some(extract_var_target(&bytes)?);
-                    }
-                    if exist {
-                        let hit = label
-                            .as_deref()
-                            .and_then(|name| self.labels.get(name.as_bytes()))
-                            .is_some();
-                        if let Some(target) = &let_target {
-                            self.write_var_target(target, Value::Int(hit as i64))?;
-                            evaluated.push((255u8, format!("EXIST({label:?})={} → {}", hit as i64, target.summary())));
-                        }
-                    }
-                    self.events.push(VmEvent::VarQuery {
-                        pc: self.pc,
-                        command: g.command_type,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::CGINFO => {
-                    // 引擎 CMDH_0043b084(Confirmed 结构):
-                    // ID(槽0,k1)=CG 名;IDNO(1)=名字后缀拼接;LET(槽33)=结果写回目标;
-                    // 其余槽(EXIST/X/Y/SX/SY/ONMOUSE…)=查询项(非零启用)。
-                    // 全部查询汇入结果缓冲(函数头清零 DAT_005c0840=0)→ 接收器写 LET。
-                    // P7.1(成果 62):按 CG 状态注册表应答已建模查询
-                    //   (EXIST(2)=1 / X(5)/Y(6)/SX(13)/SY(14)/COLOR(24));
-                    // **CG 未注册(名不存在)⇒ 引擎「不存在」路径 ⇒ 恒写 Int(0)**
-                    //   (iVar6==0 → 接收器以清零缓冲写 LET,Confirmed);
-                    // 未建模查询(ONMOUSE/TRIM/LINT 族)在 CG 存在时不写回
-                    //   (语义 Unknown,不猜;boot trace 未执行到)。
-                    let mut id: Option<String> = None;
-                    let mut id_bytes: Option<Vec<u8>> = None;
-                    let mut let_target: Option<VarTarget> = None;
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    let mut pending_let: Option<yuris_format::ystb::CommandSlot> = None;
-                    let mut query: Option<u8> = None;
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        match slot {
-                            0 => {
-                                if let Some(v) = self.eval_window_condition(Some(w))? {
-                                    if let Value::Str(bytes) = &v {
-                                        id = Some(v.str_as_string());
-                                        id_bytes = Some(bytes.clone());
-                                    }
-                                    evaluated.push((slot, value_summary(&v)));
-                                }
-                            }
-                            33 => pending_let = Some(w.clone()),
-                            _ => {
-                                if let Some(v) = self.eval_window_condition(Some(w))? {
-                                    evaluated.push((slot, value_summary(&v)));
-                                    if query.is_none() {
-                                        query = Some(slot);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if let Some(w) = pending_let {
-                        let bytes = self
-                            .ctx
-                            .script
-                            .window_bytes_pooled_copy(&w)
-                            .ok_or_else(|| Error::format("CGINFO LET 引用窗越过池尾"))?;
-                        let_target = Some(extract_var_target(&bytes)?);
-                    }
-                    // 查询应答:注册命中 → 状态字段;未命中 → 0(引擎
-                    // 「不存在」路径);已建模查询之外的槽不写回(Unknown)。
-                    // 槽13/14 = 装载图像真实宽/高(引擎 watch oracle 实证:
-                    // occ1 dummy.png 1×1 → 1.0;occ2 txspace → 1350.0)。
-                    let mut answer: Option<i64> = None;
-                    if let (Some(name), Some(q)) = (&id_bytes, query) {
-                        match self.cg_registry.get(name) {
-                            Some(st) => match q {
-                                2 => answer = Some(1),       // EXIST
-                                5 => answer = Some(st.x),    // X
-                                6 => answer = Some(st.y),     // Y
-                                13 => answer = Some(st.img_w), // 图像宽
-                                14 => answer = Some(st.img_h), // 图像高
-                                24 => answer = Some(st.color), // COLOR
-                                _ => {}                      // 未建模:不写
-                            },
-                            None => answer = Some(0),
-                        }
-                    }
-                    if let (Some(target), Some(v)) = (&let_target, answer) {
-                        self.write_var_target(target, Value::Int(v))?;
-                        let note = match (&id, query) {
-                            (Some(n), Some(q)) => {
-                                format!("→ {} (cg {n:?} q{q} = {v})", target.summary())
-                            }
-                            _ => format!("→ {}", target.summary()),
-                        };
-                        evaluated.push((255u8, note));
-                    } else if let (Some(target), Some(name_bytes)) = (&let_target, &id_bytes) {
-                        // 未建模查询且 CG 存在:不写回(变量保持原值)。
-                        if self.cg_registry.contains_key(name_bytes) {
-                            evaluated.push((
-                                254u8,
-                                format!("→ {} (未建模查询,不写回)", target.summary()),
-                            ));
-                        } else {
-                            self.write_var_target(target, Value::Int(0))?;
-                            let name = id.as_deref().unwrap_or("?");
-                            evaluated.push((
-                                255u8,
-                                format!("→ {} (cg {name:?} 不存在路径=0)", target.summary()),
-                            ));
-                        }
-                    }
-                    self.events.push(VmEvent::CgInfo {
-                        pc: self.pc,
-                        id,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::CGACT => {
-                    // 引擎 CMDH_0042607c(12466B):71 参,运行期图形管线合成。
-                    // ID(B0=0,字符串)记录;B0=0x0c/0x0d = X/Y(成果 82 勘误 4:
-                    // es.BT.XY.SET 宏体实证 —— yst00009 组1083 将 XY.SET(531,10)
-                    // 的实参转发给 CGACT 槽 0x0c=531/0x0d=10)→ 命中已注册
-                    // CG 即 patch 注册表 x/y(后续 CGINFO 查询/重放可见)。
-                    let mut id = None;
-                    let mut id_bytes: Option<Vec<u8>> = None;
-                    let mut act_x = None;
-                    let mut act_y = None;
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            match slot {
-                                0 => {
-                                    if let Value::Str(b) = &v {
-                                        id_bytes = Some(b.clone());
-                                        id = Some(v.str_as_string());
-                                    }
-                                }
-                                0x0c => {
-                                    if let Value::Int(n) = v {
-                                        act_x = Some(n);
-                                    }
-                                }
-                                0x0d => {
-                                    if let Value::Int(n) = v {
-                                        act_y = Some(n);
-                                    }
-                                }
-                                _ => {}
-                            }
-                            evaluated.push((slot, value_summary(&v)));
-                        }
-                    }
-                    if let Some(b) = id_bytes {
-                        if let Some(st) = self.cg_registry.get_mut(&b) {
-                            if let Some(x) = act_x {
-                                st.x = x;
-                            }
-                            if let Some(y) = act_y {
-                                st.y = y;
-                            }
-                        }
-                    }
-                    self.events.push(VmEvent::CgAct {
-                        pc: self.pc,
-                        id,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::LOAD => {
-                    // 引擎 CMDH_00444648(文件分支,反编译 p5_sysvar/):
-                    // 槽 0 = FILE(求值;无扩展名 → 补 ".sd";'/'→'\')、
-                    // 槽 1 = MEM(非零 = 内存源,语料未出现)、
-                    // 槽 2 = DNO(块号,1 基 → YSSD 偏移表[DNO-1])、
-                    // 槽 3 = 写回目标(**延迟引用**;s35 g705 实证,成果 59f)、
-                    // 槽 4 = ID 模式(非零 = 0x690 特殊配置格式,语料未出现)。
-                    // 块类型 0 = 普通载荷;1 = 0x690 配置;2 = 多子块(未出现)。
-                    let mut file = None;
-                    let mut mem: Option<i64> = None;
-                    let mut dno: Option<i64> = None;
-                    let mut id_flag: i64 = 0;
-                    let mut target: Option<yuris_script::LValueRef> = None;
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        if slot == 3 {
-                            // 写回目标 = 左值引用窗(0x76 varidx / 0x48 var 单条,
-                            // s35 g705 与 s120 g17 实证),不求值。
-                            let bytes = self
-                                .ctx
-                                .script
-                                .window_bytes_pooled_copy(w)
-                                .ok_or_else(|| Error::format("LOAD 引用窗越过池尾"))?;
-                            let lval = self.eval_window_lvalue(&bytes)?;
-                            evaluated.push((slot, format!("@{}", lval.var.display())));
-                            target = Some(lval);
-                            continue;
-                        }
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            match slot {
-                                0 => {
-                                    if let Value::Str(bytes) = &v {
-                                        file = Some(bytes.clone());
-                                    }
-                                }
-                                1 => mem = v.as_int_opt(),
-                                2 => dno = v.as_int_opt(),
-                                4 => id_flag = v.as_int_opt().unwrap_or(0),
-                                _ => {}
-                            }
-                            evaluated.push((slot, value_summary(&v)));
-                        }
-                    }
-                    if let (Some(fname), Some(dno_v), Some(lval)) = (file.clone(), dno, &target) {
-                        if let Some(mem_v) = mem {
-                            if mem_v != 0 {
-                                return Err(self.halt_err(
-                                    self.pc,
-                                    cmd::LOAD,
-                                    "LOAD MEM(内存源)路径未实现(语料未出现;不猜)",
-                                ));
-                            }
-                        }
-                        if id_flag != 0 {
-                            return Err(self.halt_err(
-                                self.pc,
-                                cmd::LOAD,
-                                "LOAD ID 模式(0x690 配置块)未实现(语料未出现;不猜)",
-                            ));
-                        }
-                        if !lval.indices.is_empty() {
-                            return Err(self.halt_err(
-                                self.pc,
-                                cmd::LOAD,
-                                "LOAD 写回目标带下标(基点偏移语义未逆向;语料未出现)",
-                            ));
-                        }
-                        self.load_yssd(&fname, dno_v, &lval.var)?;
-                    }
-                    self.events.push(VmEvent::Load {
-                        pc: self.pc,
-                        file,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::SAVE => {
-                    // 引擎 CMDH_00451838(反编译逐分支,2026-09-04):
-                    // 槽 2(DNO)=存档号;槽 3(SET)=位图引用;槽 0(FILE)=文件名
-                    // (只走显示层)。a0 分支:按 SET 引用的描述符类型写位图 —
-                    // INT(desc byte+1==1)→ desc+0x30 区 8B 槽 = SET 值 ?1:0;
-                    // FLT(byte+1==2)→ desc+0x34 区 8B = SET 值 ?1.0:0.0;
-                    // STR(==3)→ FUN_0045b9f8 显示层(无存储写入)。
-                    // a1 分支(INT=1/FLT=1.0 置位)、a2(默认报错)、a3/a4(仅显示)。
-                    // 语料 298 组:[DNO,SET]×284(=a0 分支置位/清零)、[FILE]×10、
-                    // [SET]×2、[DNO,ID]×2。SET 引用是左值目标(提取后写值)。
-                    let mut dno: Option<i64> = None;
-                    let mut file: Option<Vec<u8>> = None;
-                    let mut set_ref: Option<Vec<u8>> = None;
-                    let mut set_flag = false;
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        match slot {
-                            3 => {
-                                // 槽 3 双形态:变量引用窗(首 op 0x48/0x56/0x76,
-                                // 延迟求值 = SET 目标)/ 纯值窗(SET 置位标志)。
-                                // 语料 298 组恒单 SET 窗;双窗形态仅合成测试。
-                                let bytes = self
-                                    .ctx
-                                    .script
-                                    .window_bytes_pooled_copy(w)
-                                    .ok_or_else(|| {
-                                        Error::format("SAVE SET 引用窗越过池尾")
-                                    })?;
-                                let is_ref = yuris_script::decode_window(&bytes)
-                                    .map(|ins| {
-                                        ins.first()
-                                            .map(|i| {
-                                                matches!(i.raw_op, 0x48 | 0x56 | 0x76)
-                                            })
-                                            .unwrap_or(false)
-                                    })
-                                    .unwrap_or(false);
-                                if is_ref {
-                                    set_ref = Some(bytes);
-                                } else if let Some(v) =
-                                    self.eval_window_condition(Some(w))?
-                                {
-                                    if let Value::Int(n) = &v {
-                                        set_flag = *n != 0;
-                                    }
-                                    evaluated.push((slot, value_summary(&v)));
-                                }
-                            }
-                            _ => {
-                                let Some(v) = self.eval_window_condition(Some(w))? else {
-                                    continue;
-                                };
-                                match (slot, &v) {
-                                    (2, Value::Int(n)) => dno = Some(*n),
-                                    (0, Value::Str(b)) => file = Some(b.clone()),
-                                    (3, Value::Int(n)) => set_flag = *n != 0,
-                                    _ => {}
-                                }
-                                evaluated.push((slot, value_summary(&v)));
-                            }
-                        }
-                    }
-                    let mut set_target = None;
-                    if let Some(bytes) = set_ref {
-                        let target = extract_var_target(&bytes)?;
-                        set_target = Some(target.summary());
-                        // 引擎 a0 分支:INT → 1/0;FLT → 1.0/0.0;STR → 无写入
-                        let cur_type = self.var_target_elem(&target);
-                        let v = match cur_type {
-                            Some(yuris_value::ElemType::Float) => {
-                                Value::Float(if set_flag { 1.0 } else { 0.0 })
-                            }
-                            Some(yuris_value::ElemType::Int) => {
-                                Value::Int(set_flag as i64)
-                            }
-                            _ => {
-                                // STR 目标:引擎走显示层,不写存储(不猜)
-                                Value::Int(set_flag as i64)
-                            }
-                        };
-                        self.write_var_target(&target, v)?;
-                    }
-                    self.events.push(VmEvent::Save {
-                        pc: self.pc,
-                        file,
-                        dno,
-                        set_target,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::CGEND => {
-                    // 引擎 LAB_0043ad14(cmd 0x03;命令表 slot 11):ID(槽0,字符串)
-                    // = 结束显示的 CG 名。P7.1(成果 62):同步从 CG 状态
-                    // 注册表移除(显示结束 ⇒ 后续 CGINFO 查询走「不存在」路径)。
-                    let mut id = None;
-                    let mut id_bytes: Option<Vec<u8>> = None;
-                    let mut evaluated: Vec<(u8, String)> = Vec::new();
-                    for w in &windows {
-                        if w.len == 0 {
-                            continue;
-                        }
-                        let slot = (w.tag & 0xff) as u8;
-                        if let Some(v) = self.eval_window_condition(Some(w))? {
-                            if slot == 0 {
-                                if let Value::Str(bytes) = &v {
-                                    id = Some(v.str_as_string());
-                                    id_bytes = Some(bytes.clone());
-                                }
-                            }
-                            evaluated.push((slot, value_summary(&v)));
-                        }
-                    }
-                    if let Some(bytes) = &id_bytes {
-                        self.cg_registry.remove(bytes);
-                    }
-                    self.events.push(VmEvent::CgEnd {
-                        pc: self.pc,
-                        id,
-                        evaluated,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                cmd::IFEND => {
-                    if self.if_nest.pop().is_none() {
-                        if let Some(reason) =
-                            self.halt_or_record(self.pc, g.command_type, "IFEND 无配对 IF")
-                        {
-                            return Ok(VmSuspend::Error(reason));
-                        }
-                        self.pc += 1;
-                        continue;
-                    }
-                    self.events.push(VmEvent::GroupExecuted {
-                        pc: self.pc,
-                        command: g.command_type,
-                        condition: None,
-                    });
-                    self.pc += 1;
-                    continue;
-                }
-                other => {
-                    // 运行期声明族 INT(0x32)/FLT(0x19)/STR(0x5c):引擎有真
-                    // 处理器(P1 对拍实锤 + 反编译 00443538_CMD_INT_runtime.c /
-                    // 004411fc_CMD_FLT_0x19.c —— 两者逐行对称;STR 同形见
-                    // script12 g10「STR $1748 = $55[1]」且引擎 pc 顺序推进):
-                    //   w0 = 变量引用(描述符类型/边界重置),
-                    //   后续窗 = 初值表达式求值后写入标量。
-                    // 实证:script190 g28「INT @6292 = @53[2]」、g30
-                    // 「INT @6293 = 0」、script12 g11「INT @1749 = 0」。
-                    if matches!(other, 0x19 | 0x32 | 0x5C) {
-                        let mut target: Option<yuris_value::VarRef> = None;
-                        let mut array_form = false;
-                        if let Some(w0) = windows.first() {
-                            if w0.tag & 0xFF == 0 {
-                                if let Some(bytes) =
-                                    self.ctx.script.window_bytes_pooled_copy(w0)
-                                {
-                                    if let Ok(instrs) =
-                                        yuris_script::decode_window(&bytes)
-                                    {
-                                        for ins in &instrs {
-                                            match &ins.kind {
-                                                yuris_script::Insn::PushVar(r)
-                                                | yuris_script::Insn::PushVarRef(r) => {
-                                                    if target.is_none() {
-                                                        target = Some(r.clone());
-                                                    }
-                                                }
-                                                yuris_script::Insn::PushVarIndexed(_) => {
-                                                    array_form = true;
-                                                }
-                                                yuris_script::Insn::ArrayLoad { .. } => {
-                                                    array_form = true;
-                                                }
-                                                _ => {}
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let Some(r) = target else {
-                            let reason = format!(
-                                "运行期声明 0x{other:02x}:窗口未含变量引用(不猜); \
-                                 array_form={array_form}"
-                            );
-                            let pc = self.pc;
-                            self.events.push(VmEvent::Unsupported {
-                                pc,
-                                command: other,
-                                reason: reason.clone(),
-                            });
-                            if self.strict {
-                                self.state = VmState::Error;
-                                return Ok(VmSuspend::Error(reason));
-                            }
-                            self.pc += 1;
-                            continue;
-                        };
-                        // 初值 = 第一个非空后续窗的求值结果;无 → 类型默认值
-                        // (引擎 INT→FUN_0046a140(i64) / FLT→FUN_0046a060(f64);
-                        //  STR 同族字符串写入)
-                        let mut init = match other {
-                            0x19 => yuris_value::Value::Float(0.0),
-                            0x5C => yuris_value::Value::Str(Vec::new()),
-                            _ => yuris_value::Value::Int(0),
-                        };
-                        for w in windows.iter().skip(1) {
-                            if w.len == 0 {
-                                continue;
-                            }
-                            if let Some(v) = self.eval_window_condition(Some(w))? {
-                                init = v;
-                            }
-                            break;
-                        }
-                        self.store.set(&r, init);
-                        self.events.push(VmEvent::Declaration {
-                            pc: self.pc,
-                            command: other,
-                            windows: g.window_count,
-                        });
-                        self.pc += 1;
-                        continue;
-                    }
-                    // 其余声明类命令:引擎运行器用默认 stub(G_*/F_* 族)或
-                    // 已确证 no-op(S_* 0x52-0x54 → FUN_00423080),不执行;
-                    // 记录 Declaration 事件后继续(与引擎一致)。
-                    // 注:0x5c STR 处理器 0x451598 的 LAB_ 边界反编译形似
-                    // 「按名切脚本」,不可靠;实测引擎 pc 顺序推进,已按上
-                    // 声明族实现。0x65 VAR(0x453158)语义未定性(Unknown)。
-                    if is_declaration(other) {
-                        self.events.push(VmEvent::Declaration {
-                            pc: self.pc,
-                            command: other,
-                            windows: g.window_count,
-                        });
-                        self.pc += 1;
-                        continue;
-                    }
-                    // FILEINFO(0x15,引擎 0043eb28):FOLDER(0)/FILE(1)/
-                    // CGFILE(2)/SOUNDFILE(3) = 路径源;EXIST(4)/SIZE(5)/
-                    // RELATION(6) = 查询项;LET(7) = 写回目标。
-                    // 本实现:EXIST+FILE+LET → 虚拟 FS 存在性
-                    // (`host::PacFileIndex`;实证 s207 es.R18Check:引擎查
-                    // `cg/thumb_cg/A_HAN_2002_a.png` 得 1)。无 probe → 不写
-                    // 回,事件记 err(诚实缺省)。其余查询项出现时再逆向。
-                    if other == 0x15 {
-                        let mut path: Option<String> = None;
-                        let mut exist = false;
-                        let mut let_ref: Option<yuris_format::ystb::CommandSlot> = None;
-                        let mut evaluated: Vec<(u8, String)> = Vec::new();
-                        for w in &windows {
-                            if w.len == 0 {
-                                continue;
-                            }
-                            let slot = (w.tag & 0xff) as u8;
-                            match slot {
-                                1 => {
-                                    if let Some(v) = self.eval_window_condition(Some(w))? {
-                                        path = Some(v.str_as_string());
-                                        evaluated.push((slot, value_summary(&v)));
-                                    }
-                                }
-                                4 => {
-                                    if let Some(v) = self.eval_window_condition(Some(w))? {
-                                        exist = matches!(&v, Value::Int(n) if *n != 0);
-                                        evaluated.push((slot, value_summary(&v)));
-                                    }
-                                }
-                                7 => let_ref = Some(w.clone()),
-                                _ => {
-                                    if let Some(v) = self.eval_window_condition(Some(w))? {
-                                        evaluated.push((slot, value_summary(&v)));
-                                    }
-                                }
-                            }
-                        }
-                        if exist {
-                            match (&let_ref, (&path, &self.file_probe)) {
-                                (Some(w), (Some(p), Some(probe))) => {
-                                    let bytes = self
-                                        .ctx
-                                        .script
-                                        .window_bytes_pooled_copy(w)
-                                        .ok_or_else(|| {
-                                            Error::format("FILEINFO LET 引用窗越过池尾")
-                                        })?;
-                                    let target = extract_var_target(&bytes)?;
-                                    let hit = probe.exists(p);
-                                    self.write_var_target(&target, Value::Int(hit as i64))?;
-                                    evaluated.push((
-                                        255u8,
-                                        format!("EXIST({p})={} → {}", hit as i64, target.summary()),
-                                    ));
-                                }
-                                (Some(_), (None, _)) => {
-                                    evaluated.push((255u8, "err:EXIST 无 FILE 路径".into()));
-                                }
-                                (Some(_), (_, None)) => {
-                                    evaluated.push((255u8, "err:无 file_probe".into()));
-                                }
-                                _ => {}
-                            }
-                        }
-                        self.events.push(VmEvent::Subsystem {
-                            pc: self.pc,
-                            command: other,
-                            evaluated,
-                        });
-                        self.pc += 1;
-                        continue;
-                    }
-                    // 后端子系统配置/查询族(P2,处理器反编译见
-                    // docs/reverse/decompiled/engine/0044*_CMD_*.c):
-                    // 0x1b FONTINFO/0x15 FILEINFO/0x14 FILEACT/0x6b WINDOWINFO/
-                    // 0x45 MOUSE/0x1a FONT/0x5d SYSTEM/0x0e ERROR/0x1c FPS/
-                    // 0x31 INPUT/0x3c MATH/0x0a DIALOG/0x69 WINDOW。
-                    // 引擎侧为子系统状态操作(字体层表/文件/输入模式/数学函数
-                    // 派发),无后端 → 求值全部参数事件化记录,不建子系统状态。
-                    // DIALOG(0x0a,引擎 0043c984):模态消息框;无 LET/LETSTR
-                    // 槽时对流程零影响 → 记录后继续(= 用户瞬时按默认键;
-                    // 交互阻塞语义归运行时层 P8/P9)。带 LET 的对话框出现时
-                    // 须先逆向返回值编码再实现(铁律:不猜)。
-                    // WINDOW(0x69):引擎处理器 = 共享 no-op stub(0045c4d4,
-                    // engine_trace_config 实测)→ 无求值、无副作用;引擎 trace
-                    // 侧 stub 命中被过滤为伪事件 → VM 同样**完全静默**
-                    // (发事件会破坏对拍域,成果 59d)。
-                    if other == 0x69 {
-                        self.pc += 1;
-                        continue;
-                    }
-                    // TASK(0x5f,引擎 0044fe40 反编译):命名任务创建/重配置。
-                    // 槽 0=ID(名)、槽 1=E/槽 2=A/槽 3=Z(优先级)、槽 4-13=TINT、
-                    // 14-23=TFLT、24-33=TSTR、槽 34='#'(入口标签)、35/36=SCRIPTPOS/
-                    // TEXTPOS、37=RESTART。引擎:查/建任务对象 → 标签查表装载
-                    // 入口脚本 → 参数写入任务对象。VM:**注册名字**(TASKINFO
-                    // EXIST 的查询面)+ 求值记录;不 spawn —— 引擎 trace 实证
-                    // 任务入口经主线 GOSUB 标签链顺序调起(s24 g195 → s2 pc47
-                    // GOSUB → s266 → s9),boot 段无并行交错。
-                    if other == cmd::TASK {
-                        let mut evaluated: Vec<(u8, String)> = Vec::new();
-                        let mut name: Option<Vec<u8>> = None;
-                        for w in &windows {
-                            if w.len == 0 {
-                                continue;
-                            }
-                            let slot = (w.tag & 0xff) as u8;
-                            match self.eval_window_condition(Some(w)) {
-                                Ok(Some(v)) => {
-                                    if slot == 0 {
-                                        if let Value::Str(bytes) = &v {
-                                            name = Some(bytes.clone());
-                                        }
-                                    }
-                                    evaluated.push((slot, value_summary(&v)));
-                                }
-                                Ok(None) => {}
-                                Err(e) => evaluated.push((slot, format!("err:{e}"))),
-                            }
-                        }
-                        if let Some(n) = name {
-                            let existed = self.tasks.contains(&n);
-                            self.tasks.insert(n.clone());
-                            evaluated.push((
-                                255u8,
-                                format!(
-                                    "task {} {}",
-                                    if existed { "已存在(重配置)" } else { "注册" },
-                                    String::from_utf8_lossy(&n)
-                                ),
-                            ));
-                        }
-                        self.events.push(VmEvent::Subsystem {
-                            pc: self.pc,
-                            command: other,
-                            evaluated,
-                        });
-                        self.pc += 1;
-                        continue;
-                    }
-                    // TASKINFO(0x61,引擎 00451838 反编译):任务状态查询。
-                    // 槽 0=ID(任务名;缺省=当前任务)、槽 1=LET(写回目标)、
-                    // 槽 2=EXIST → 注册表命中写 1/未命中写 0(引擎:查不到
-                    // 任务 → LET=0 后返回;查到且 EXIST → 写 1)。其余查询槽
-                    // (E/A/Z/FILE/../NEXTVOICE/GOLABEL/...)走 FUN_0045baf8 ——
-                    // 语料未执行,到访挂起(不猜)。
-                    if other == cmd::TASKINFO {
-                        let mut evaluated: Vec<(u8, String)> = Vec::new();
-                        let mut name: Option<Vec<u8>> = None;
-                        let mut let_target: Option<VarTarget> = None;
-                        let mut exist = false;
-                        let mut other_query = false;
-                        let mut pending_let: Option<yuris_format::ystb::CommandSlot> = None;
-                        for w in &windows {
-                            if w.len == 0 {
-                                continue;
-                            }
-                            let slot = (w.tag & 0xff) as u8;
-                            match slot {
-                                1 => pending_let = Some(w.clone()),
-                                _ => {
-                                    match self.eval_window_condition(Some(w)) {
-                                        Ok(Some(v)) => {
-                                            match slot {
-                                                0 => {
-                                                    if let Value::Str(bytes) = &v {
-                                                        name = Some(bytes.clone());
-                                                    }
-                                                }
-                                                2 => {
-                                                    exist = matches!(&v, Value::Int(n) if *n != 0)
-                                                }
-                                                _ => other_query = true,
-                                            }
-                                            evaluated.push((slot, value_summary(&v)));
-                                        }
-                                        Ok(None) => {}
-                                        Err(e) => evaluated.push((slot, format!("err:{e}"))),
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(w) = pending_let {
-                            let bytes = self
-                                .ctx
-                                .script
-                                .window_bytes_pooled_copy(&w)
-                                .ok_or_else(|| Error::format("TASKINFO LET 引用窗越过池尾"))?;
-                            let_target = Some(extract_var_target(&bytes)?);
-                        }
-                        if other_query {
-                            return Err(self.halt_err(
-                                self.pc,
-                                cmd::TASKINFO,
-                                "TASKINFO 非 EXIST 查询槽未实现(引擎 FUN_0045baf8 族;\
-                                 语料未出现;不猜)",
-                            ));
-                        }
-                        if exist {
-                            let hit = name
-                                .as_deref()
-                                .map(|n| self.tasks.contains(n))
-                                .unwrap_or(false);
-                            if let Some(target) = &let_target {
-                                self.write_var_target(target, Value::Int(hit as i64))?;
-                                evaluated.push((
-                                    255u8,
-                                    format!(
-                                        "EXIST({:?})={} → {}",
-                                        name.map(|n| String::from_utf8_lossy(&n).into_owned()),
-                                        hit as i64,
-                                        target.summary()
-                                    ),
-                                ));
-                            }
-                        }
-                        self.events.push(VmEvent::Subsystem {
-                            pc: self.pc,
-                            command: other,
-                            evaluated,
-                        });
-                        self.pc += 1;
-                        continue;
-                    }
-                    if matches!(
-                        other,
-                        0x0A | 0x0E | 0x14 | 0x15 | 0x1A | 0x1B | 0x1C | 0x31
-                            | 0x3C | 0x45 | 0x5D | 0x6B
-                    ) {
-                        // 子系统查询输出写回(P5.2,引擎 FUN_0045baf8 族
-                        // 查询→LET 写回;反编译 00457d64/00441c08):
-                        // - WINDOWINFO(0x6b):SX(槽10)/SY(槽11)查询 → 窗口宽/高
-                        //   写入 LET(槽1)目标(s24 g133/134 → @1074/@1075);
-                        // - FONTINFO(0x1b):NUM(槽11,值=1)查询 → 注册字体数
-                        //   写入 LET(槽18)目标(s45 g26 → @2684,LOOP 计数)。
-                        // oracle 环境(引擎 trace 采集时刻)常量:全屏 1920×1080
-                        // (s41 g77 范围检查 ±32/±18 反推);713 字体(引擎
-                        // s45 循环圈数实测)。同 @114=32bpp 先例(成果 59c)。
-                        if other == 0x6b || other == 0x1b {
-                            let let_slot = if other == 0x6b { 1u8 } else { 18u8 };
-                            let mut target: Option<VarTarget> = None;
-                            let mut query_a = false;
-                            let mut query_b = false;
-                            for w in &windows {
-                                if w.len == 0 {
-                                    continue;
-                                }
-                                let slot = (w.tag & 0xff) as u8;
-                                if slot == let_slot {
-                                    if let Ok(bytes) = self
-                                        .ctx
-                                        .script
-                                        .window_bytes_pooled_copy(w)
-                                        .ok_or_else(|| {
-                                            Error::format("子系统 LET 引用窗越过池尾")
-                                        })
-                                    {
-                                        target = extract_var_target(&bytes).ok();
-                                    }
-                                } else if other == 0x6b && slot == 10 {
-                                    query_a = true;
-                                } else if other == 0x6b && slot == 11 {
-                                    query_b = true;
-                                } else if other == 0x1b && slot == 11 {
-                                    // NUM 查询须值为 1(引擎 slot11==1 检查)
-                                    query_a = matches!(
-                                        self.eval_window_condition(Some(w)),
-                                        Ok(Some(Value::Int(1)))
-                                    );
-                                } else if other == 0x1b && slot == 13 {
-                                    // LANG 查询(须值 1;s45 g28 FONTINFO(NO,LANG→LET)):
-                                    // 引擎 713 字体全部非零(pc29 IF 真 → LOOPCONT×713
-                                    // 实测)→ oracle 常量 1。
-                                    query_b = matches!(
-                                        self.eval_window_condition(Some(w)),
-                                        Ok(Some(Value::Int(1)))
-                                    );
-                                }
-                            }
-                            if let Some(t) = &target {
-                                if other == 0x6b {
-                                    if query_a {
-                                        self.write_var_target(t, Value::Int(1920))?;
-                                    }
-                                    if query_b {
-                                        self.write_var_target(t, Value::Int(1080))?;
-                                    }
-                                } else if query_a {
-                                    // 注册字体数 = oracle 常量(环境依赖:
-                                    // 2026-09-04 采集 = 713,2026-09-05 采集 = 783
-                                    // —— 字体注册数随运行环境变化,对拍基线
-                                    // 须与引擎 trace 同批采集;当前以 400k trace
-                                    // 为准 = 783)
-                                    self.write_var_target(t, Value::Int(783))?;
-                                } else if query_b {
-                                    self.write_var_target(t, Value::Int(1))?;
-                                }
-                            }
-                        }
-                        let mut evaluated: Vec<(u8, String)> = Vec::new();
-                        for w in &windows {
-                            if w.len == 0 {
-                                continue;
-                            }
-                            let slot = (w.tag & 0xff) as u8;
-                            // 求值失败不传播:引擎对未声明/未初始化变量读取
-                            // 容忍(实测 desc 全零仍继续),事件如实记录
-                            match self.eval_window_condition(Some(w)) {
-                                Ok(Some(v)) => evaluated.push((slot, value_summary(&v))),
-                                Ok(None) => {}
-                                Err(e) => evaluated.push((slot, format!("err:{e}"))),
-                            }
-                        }
-                        self.events.push(VmEvent::Subsystem {
-                            pc: self.pc,
-                            command: other,
-                            evaluated,
-                        });
-                        self.pc += 1;
-                        continue;
-                    }
-                    let reason = format!(
-                        "命令 0x{other:02x} 的运行语义未逆向(处理器未实现;不猜) s{} pc={}",
-                        self.ctx.script_id, self.pc
-                    );
-                    let pc = self.pc;
-                    self.events.push(VmEvent::Unsupported {
-                        pc,
-                        command: other,
-                        reason: reason.clone(),
-                    });
-                    if self.strict {
-                        self.state = VmState::Error;
-                        return Ok(VmSuspend::Error(reason));
-                    }
-                    self.pc += 1;
-                    continue;
-                }
-            }
-        }
-        self.state = VmState::Finished;
-        Ok(VmSuspend::Complete)
+    /// 任务表逐条摘要(诊断:名字 / 脚本+组 / 步进次数 / 待命帧 / 结束位)。
+    pub fn task_summary(&self) -> Vec<String> {
+        let Some(s) = self.scheduler.as_ref() else { return Vec::new() };
+        self.task_names
+            .iter()
+            .filter_map(|id| s.find_by_id(id))
+            .map(|n| crate::driver::task_summary_line(self, n))
+            .collect()
+    }
+
+    /// 任务执行位(诊断/摘要用)。
+    pub(crate) fn task_slots(&self) -> &HashMap<Vec<u8>, SavedExec> {
+        &self.task_slots
     }
 
     /// 切换到目标脚本上下文(取目标脚本 ctx,替换当前 ctx,重设 pc 与 script_id)。
@@ -3172,13 +1837,18 @@ impl GroupVm {
         let new_ctx = host.load(script_id)?;
         self.ctx = new_ctx;
         self.pc = target_pc;
+        // **分派表随脚本切换**(2026-10-18):序号是编译器版本的属性;同一封包里
+        // 可能存在不同版本产出的脚本(实测 5/160 为 v479)。整包共用一张表会
+        // 把 IF/LET 窗口当成 FLT/G_FLT 声明来消费 —— 静默的错误语义。
+        self.refresh_dispatch();
         // 引擎加载脚本时消费其声明组(INT/FLT/STR 建立变量,Confirmed 形态)。
         // 每脚本只全扫一次(已消费集跟踪):GO/GOSUB 高频跨脚本,重复全扫
         // 实测成为端到端主热点(声明幂等,重复消费无语义收益)。
         // 注意:boot 已全量消费并标记,此处只为未标记脚本兜底(不覆盖 YSVR 终态)。
         if self.declared_scripts.insert(script_id) {
             let ctx = &self.ctx;
-            consume_declarations_into(&mut self.store, ctx)?;
+            // 声明族判定也走**本脚本**版本的表(`refresh_dispatch` 已在上面跑过)。
+            consume_declarations_into(&mut self.store, ctx, &self.dispatch)?;
         }
         // YSVR kind2(按脚本初值):脚本**首次加载**时应用(成果 59h;
         // 幂等,已应用脚本直接跳过)。
@@ -3195,16 +1865,17 @@ impl GroupVm {
     ///
     /// 幂等:已定义标量不覆盖(初值应用须发生在本消费之后)。
     pub fn consume_script_declarations(&mut self) -> Result<usize> {
+        // 按**本脚本**头版本选表:混版本封包里用错表会把非声明命令当成声明。
+        let version = self.ctx.script.header().version;
+        let d = self.dispatch_for_version(version);
         let ctx = &self.ctx;
-        consume_declarations_into(&mut self.store, ctx)
+        consume_declarations_into(&mut self.store, ctx, &d)
     }
 
     /// 从挂起点恢复。
     pub fn resume(&mut self, _resp: ResumeResponse) -> Result<()> {
         if self.state == VmState::Error {
-            return Err(Error::format(
-                "Error 态需先处理事件;骨架版不支持自动恢复",
-            ));
+            return Err(Error::format("Error 态需先处理事件;骨架版不支持自动恢复"));
         }
         Ok(())
     }
@@ -3213,7 +1884,11 @@ impl GroupVm {
     /// 跨脚本 → Unsupported(单脚本 VM 不猜多脚本重绑)。
     fn exec_go(&mut self, windows: &[yuris_format::ystb::CommandSlot]) -> Result<GoOutcome> {
         let Some(w) = windows.first() else {
-            return Ok(GoOutcome::Halted(self.halted(self.pc, cmd::GO, "GO 无窗口")));
+            return Ok(GoOutcome::Halted(self.halted(
+                self.pc,
+                cmd::GO,
+                "GO 无窗口",
+            )));
         };
         // 引擎:len 高位非 0 = 载入期已解析的标签表下标(id|0x10000000)。
         // 该标记只存在于引擎内存(载入后回写);文件形态恒为原始 len。
@@ -3225,17 +1900,27 @@ impl GroupVm {
             )));
         }
         let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) else {
-            return Ok(GoOutcome::Halted(self.halted(self.pc, cmd::GO, "GO 窗口越过池尾")));
-        };
-        let Some(name) = mstring(&bytes) else {
             return Ok(GoOutcome::Halted(self.halted(
                 self.pc,
                 cmd::GO,
-                "GO 窗口不是 M-串标签",
+                "GO 窗口越过池尾",
             )));
         };
-        match self.labels.get(name).copied() {
-            Some((target_pc, script_id)) => {
+        // **勘误(2026-10-13,成果 120)**:旧实现用 `mstring(&bytes)` 直接把标签窗
+        // 按「M-串字面量」解析 —— 只认 `GO[#="NAME"]` 形态,变量标签窗一律
+        // 落到「GO 窗口不是 M-串标签」而不跳转。实机取证证伪:
+        //   - 本作 `es.SCENARIO.FLOW`(s21 g8) 的 GO 标签窗是**变量**
+        //     (`PushVar($1036)` = `$es.STARTLABEL`;转储见成果 119 §证据链);
+        //   - 官方 SDK 示例源码 `ERIS/es_ScenarioFlow.yst:42` 即
+        //     `GO[#=$es.STARTLABEL]` —— 变量标签是**规范用法**,不是边角;
+        //   - 后果:GO 不跳转 ⇒ 标题脚本 `SCENARIO_START`(s142) 实测 **0 组**
+        //     执行 ⇒ 冷启动画面出不来。
+        // 现改用与 GOSUB 完全相同的**表达式求值 + 查表**路径
+        // ([`Self::resolve_label_in`],引擎 0045124c murmur2 查表),
+        // 字面量(`4d` M-串)与变量标签同型处理。
+        let literal_name = mstring(&bytes).map(|b| b.to_vec());
+        match self.resolve_label_in(windows)? {
+            Some((target, script_id)) => {
                 if script_id != self.ctx.script_id {
                     // 跨脚本:需要 host;无 host → 挂起(旧行为)。
                     if self.host.is_none() {
@@ -3245,22 +1930,63 @@ impl GroupVm {
                             format!("跨脚本 GO 到 script {script_id} 但未绑定 ScriptHost"),
                         )));
                     }
-                    return Ok(GoOutcome::CrossScript {
-                        script_id,
-                        target: target_pc as usize,
-                    });
+                    return Ok(GoOutcome::CrossScript { script_id, target });
                 }
-                Ok(GoOutcome::Jump(target_pc as usize))
+                Ok(GoOutcome::Jump(target))
             }
-            None => Ok(match self.halt_or_record(
-                self.pc,
-                cmd::GO,
-                format!("GO 标签未命中: {:?}", String::from_utf8_lossy(name)),
-            ) {
-                Some(reason) => GoOutcome::Halted(reason),
-                None => GoOutcome::NoJump,
-            }),
+            None => {
+                // **标签未命中 ≠ 命令未实现**(2026-10-18 政策)。
+                //
+                // 引擎真值(v494 `0x4459ed`):查表函数返负 → `0x445ada` 报错
+                // 并 `return -1`(让出);脚本此后不再推进。实测触发点是
+                // `s142 g29` 的 `GO[$es.SEL.GO]`,而 `$es.SEL.GO` 此刻被
+                // `g24` 赋成 `SCENARIO_LOGO` —— 该标签在本作 YSLB 里
+                // **不存在**(全表 0 命中)。这是 v555 时代脚本的残留。
+                //
+                // 处置:`alert`(绕过等级阈值、可见) + 事件化 + **跳过该 GO**
+                // 继续执行。不升级为致命 —— 根因是游戏数据里不存在的标签,
+                // 不是内核缺功能;一张错误窗会盖住整条启动链。
+                let label = match &literal_name {
+                    Some(n) => String::from_utf8_lossy(n).to_string(),
+                    None => self
+                        .resolve_label_text(windows)
+                        .unwrap_or_else(|| "<求值失败>".to_string()),
+                };
+                yuris_log::alert!(
+                    "标签未命中(已跳过该跳转)\n\
+                     命令: GO\n\
+                     现场: script {} pc {}\n\
+                     标签: {:?}\n\
+                     引擎真值: 查表失败 → 报错并让出(v494 0x4459da)\n\
+                     说明: 该标签不在本作 YSLB 中(s142 g29 的 $es.SEL.GO 被\n\
+                     置为 SCENARIO_LOGO —— v555 时代脚本残留)。\n\
+                     处置: 跳过该 GO 继续执行;YURIS_TRACE_LABELS=1 看查表轨迹",
+                    self.ctx.script_id,
+                    self.pc,
+                    label
+                );
+                self.push_event(VmEvent::LabelMiss {
+                    pc: self.pc,
+                    command: "GO".into(),
+                    label,
+                    skipped: true,
+                });
+                Ok(GoOutcome::NoJump)
+            }
         }
+    }
+
+    /// 求值标签窗得到标签文本（诊断用；不做查表）。
+    fn resolve_label_text(&mut self, windows: &[yuris_format::ystb::CommandSlot]) -> Option<String> {
+        for w in windows {
+            if w.tag & 0xFF != 0 || w.len == 0 {
+                continue;
+            }
+            if let Ok(Some(Value::Str(name))) = self.eval_window_condition(Some(w)) {
+                return Some(String::from_utf8_lossy(&name).to_string());
+            }
+        }
+        None
     }
 
     /// 在组窗口中解析标签并查表(引擎 GOSUB 004428c0)。
@@ -3290,10 +2016,29 @@ impl GroupVm {
             let Value::Str(name) = v else {
                 continue;
             };
+            // 诊断(`YURIS_TRACE_LABELS=1`):跨脚本分派全靠名字查表,静默
+            // miss 时从事件流看不出「谁没查到谁」。默认关闭,零开销。
+            let trace = std::env::var_os("YURIS_TRACE_LABELS").is_some();
             if let Some(&(target_pc, script_id)) = self.labels.get(&name) {
+                if trace {
+                    yuris_log::trace_forced!(
+                        "[label] s{} pc{} hit {:?} → s{script_id} pc{target_pc}",
+                        self.ctx.script_id,
+                        self.pc,
+                        String::from_utf8_lossy(&name)
+                    );
+                }
                 return Ok(Some((target_pc as usize, script_id)));
             }
             // 未命中 → 引擎行为:静默跳过,继续找下一个
+            if trace {
+                yuris_log::trace_forced!(
+                    "[label] s{} pc{} MISS {:?}",
+                    self.ctx.script_id,
+                    self.pc,
+                    String::from_utf8_lossy(&name)
+                );
+            }
         }
         Ok(None)
     }
@@ -3309,33 +2054,54 @@ impl GroupVm {
         if w.len == 0 {
             return Ok(None);
         }
-        let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) else {
-            // 溢出窗(池尾外) → 视为损坏
-            self.state = VmState::Error;
-            return Err(Error::format(format!(
-                "窗口 {}+{} 越过 content+part4 池尾",
-                w.offset, w.len
-            )));
-        };
-        let instrs = match yuris_script::decode_window(&bytes) {
+        // **解码缓存优先(2026-10-18 性能修复)**：
+        //
+        // 旧顺序是「先 `window_bytes_pooled_copy`(分配 Vec) → 再查缓存」，
+        // 而缓存命中率接近 100%（窗口字节在脚本装载后不变）。于是每次求值
+        // 都白分配一次 Vec 再丢弃 —— 稳态每帧约 70 万次求值 ⇒ 70 万次
+        // 无用分配。现在先查缓存，**只有未命中时才取字节**。
+        //
+        // 越界校验仍必须做：缓存键 `(script_id, offset, len)` 不含池长，
+        // 而损坏脚本可能给出池外窗口 —— 那条路径仍要报错（且不能因为
+        // 「缓存里恰好有这个键」就放过）。
+        if !self.ctx.script.window_fits_pool(w) {
+            let msg = format!("窗口 {}+{} 越过 content+part4 池尾", w.offset, w.len);
+            if self.strict {
+                self.set_error_state();
+            }
+            return Err(Error::format(msg));
+        }
+        let instrs = match self.decode_cached_slot(w) {
             Ok(v) => v,
             Err(e) => {
-                self.state = VmState::Error;
-                return Err(Error::format(format!("条件窗口解码失败: {e}")));
+                let msg = format!("条件窗口解码失败: {e}");
+                if self.strict {
+                    self.set_error_state();
+                }
+                return Err(Error::format(msg));
             }
         };
         let locals = self.frames.last().map(|f| &f.locals);
+        let ctx = self.eval_ctx();
         let mut ev = Evaluator::with_locals(&mut self.store, locals);
-        let (cx, cy) = self.input_cursor;
-        ev.set_cursor(cx, cy);
-        // @48 系统变量注入(P5 定性,引擎 sysvar case 0x30):内层 LOOP
-        // 迭代计数 —— 引擎读 obj+0x244 嵌套栈顶记录 +0x10,LOOP 置 1、
-        // LOOPEND +1;无活动循环 = 0(GOSUB 不压该栈,跨帧可见)。
-        ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
-        match ev.eval_instructions(&instrs) {
-            Ok(stack) => Ok(stack.into_iter().next_back()),
+        ctx.apply(&mut ev);
+        // **零分配求值(2026-10-18)**:只取末值,缓冲由 VM 持有并原地复用。
+        let mut scratch = std::mem::take(&mut self.slot_scratch);
+        let eval_out = ev.eval_last_value_in(&instrs, &mut scratch);
+        scratch.clear();
+        self.slot_scratch = scratch;
+        match eval_out {
+            Ok(v) => Ok(v),
             Err(e) => {
-                self.state = VmState::Error;
+                // **勘误(2026-10-17,复现 evidence: <game-b> s66 pc5355)**:
+                // 旧实现在 strict 下毒化共享状态。毒化被「引擎容忍继续」的
+                // 调用方(子系统参数求值、TASK 参数等 —— 引擎真值:参数
+                // 求值失败=按未知值继续)吞掉 ⇒ 状态残留 Error,下一拍整个
+                // VM 被「VM 处于 Error 态」挡死、根因只在事件流的
+                // `evaluated[err:…]` 里 —— 日志一行不剩。现改为**只冒
+                // Err**:致命与否由调用方的控制流决定(suspend 族已各自
+                // 置 Error;容错族吞错继续,现场由 [`Self::note_swallowed`]
+                // 落一次性告警)。
                 Err(Error::format(format!(
                     "条件窗口求值失败: {e} s{} pc={}",
                     self.ctx.script_id, self.pc
@@ -3353,8 +2119,7 @@ impl GroupVm {
         if let Some(fr) = self.frames.last() {
             if fr.locals.has_array(&lval.var) {
                 let indices: Vec<i64> = if lval.indices.is_empty() {
-                    let dims =
-                        fr.locals.array_dims(&lval.var).unwrap_or_default();
+                    let dims = fr.locals.array_dims(&lval.var).unwrap_or_default();
                     vec![0; dims.len()]
                 } else {
                     lval.indices.clone()
@@ -3447,7 +2212,7 @@ impl GroupVm {
         locals: &mut VariableStore,
         windows: &[yuris_format::ystb::CommandSlot],
         gparam: u16,
-    ) {
+    ) -> Result<()> {
         // P5 定性(成果 50 + 成果 52,引擎 CMDH_004428c0 @ 004428c0):
         // gparam u16 = part1 高半(part1[pc]>>16),解码本帧局部数组维数:
         //   int_count = (gparam & 0xff) >> 3
@@ -3462,10 +2227,7 @@ impl GroupVm {
         // 帧局部数组在 locals 内以 {At,53}/{At,54}/{Dollar,55} 键承载 ——
         // 与 LET 帧局部写路径(fr.locals.set_elem)及 aload 帧局部读路径
         // (eval.rs locals 优先)共用同一寻址。
-        let int_count = ((gparam & 0xff) >> 3) as u32;
-        let flt_count = ((gparam & 7) as u32) * 4 + ((gparam >> 14) as u32);
-        let str_count = ((gparam >> 9) & 0x1f) as u32;
-        let dbg = std::env::var("YURIS_DEBUG_FRAME").is_ok();
+        let dbg = debug_frame_enabled();
         // 先收集实参窗:(type, slot) → 窗口
         let mut args: [std::collections::HashMap<u32, &yuris_format::ystb::CommandSlot>; 3] =
             Default::default();
@@ -3482,23 +2244,62 @@ impl GroupVm {
             };
             args[ty].insert(slot, w);
         }
+        // —— 槽号上界(勘误,2026-10-13)——
+        // 原实现按 v555 文档的「gparam = 维数位图」解码
+        //   int=(u16&0xff)>>3, flt=(u16&7)*4+(u16>>14), str=(u16>>9)&0x1f
+        // 对 GOSUB/GO 是**错的**:该公式属声明类命令(F_INT/G_INT 族)的数组维数
+        // 位图,不适用于调用类。实测本语料 43001 个 GOSUB/GO 组,`gparam` **全部**
+        // 等于「最大实参槽号」(= 实参窗个数 = 窗口数-1),位图公式在 40778 组上
+        // 解出的槽数不足以容纳实际实参 —— 后果是帧局部**根本没被写入**:
+        // 实测 `es._label.info.exist` 收不到标签名(读到空串)→ 场景存在性判定
+        // 恒假 → `ES.FIRST.LOOP` 永不进入 → 画面全黑。
+        //
+        // 槽号是**全局**编号(跨类型共享),实测 `es.S.GO` 调用 = str[1]+int[2]+int[3]
+        // 且 gparam=3。故:按实参窗定上界,再按该上界为三个类型各声明数组并逐槽
+        // 清零(引擎「无实参窗 → 清零」同义)。
+        let mut max_slot = 0u32;
+        for ty in 0..3 {
+            if let Some(&m) = args[ty].keys().max() {
+                max_slot = max_slot.max(m);
+            }
+        }
+        // gparam 兜底:实测 == 最大槽号;仅在**无实参窗**时启用,且只在它像一个
+        // 槽号(≤ 0x2f)时 —— 防止把别的版本的位图形态当计数用而爆内存。
+        if max_slot == 0 {
+            let g = gparam as u32;
+            if g <= 0x2f {
+                max_slot = g;
+            }
+        }
+        let int_count = max_slot;
+        let flt_count = max_slot;
+        let str_count = max_slot;
         let specs = [
             (
                 0usize,
                 int_count,
-                yuris_value::VarRef { space: yuris_value::VarSpace::At, id: 53 },
+                yuris_value::VarRef {
+                    space: yuris_value::VarSpace::At,
+                    id: 53,
+                },
                 yuris_value::ElemType::Int,
             ),
             (
                 1usize,
                 flt_count,
-                yuris_value::VarRef { space: yuris_value::VarSpace::At, id: 54 },
+                yuris_value::VarRef {
+                    space: yuris_value::VarSpace::At,
+                    id: 54,
+                },
                 yuris_value::ElemType::Float,
             ),
             (
                 2usize,
                 str_count,
-                yuris_value::VarRef { space: yuris_value::VarSpace::Dollar, id: 55 },
+                yuris_value::VarRef {
+                    space: yuris_value::VarSpace::Dollar,
+                    id: 55,
+                },
                 yuris_value::ElemType::Str,
             ),
         ];
@@ -3510,9 +2311,51 @@ impl GroupVm {
             for slot in 1..=count {
                 let cv = match args[ty].get(&slot) {
                     Some(w) => {
-                        let Some(v) = self.eval_window_condition(Some(w)).ok().flatten() else {
+                        if dbg {
+                            if let Some(b) = self.ctx.script.window_bytes_pooled_copy(w) {
+                                let mut hx = String::new();
+                                for x in b.iter().take(36) {
+                                    hx.push_str(&format!("{x:02x} "));
+                                }
+                                let ins = yuris_script::decode_window(&b)
+                                    .map(|v| {
+                                        v.iter()
+                                            .map(|i| format!("{:?}", i.kind))
+                                            .collect::<Vec<_>>()
+                                            .join("|")
+                                    })
+                                    .unwrap_or_else(|e| format!("<decode err {e}>"));
+                                yuris_log::trace_forced!(
+                                    "[f]  ARG s{} pc{} tag={:#x} off={} len={} [{}] → {}",
+                                    self.ctx.script_id, self.pc, w.tag, w.offset, w.len, hx, ins
+                                );
+                            }
+                        }
+                        // **实参缺席**:编译器用「未填右操作数的二元运算符」表示
+                        // 「本实参不存在」(形态与语料统计见
+                        // `yuris_script::is_absent_arg_idiom`)。此路不给该槽播种,
+                        // 帧局部保持声明时的零值 —— 与手册 `@_PFLG(n)`
+                        // 「跳转源是否存在 PINT/PFLT/PSTR」的语义一致。
+                        if let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) {
+                            if let Ok(instrs) = yuris_script::decode_window(&bytes) {
+                                if yuris_script::is_absent_arg_idiom(&instrs) {
+                                    if dbg {
+                                        yuris_log::trace_forced!(
+                                            "[f] seed-absent s{} pc{} {}{}[{}]",
+                                            self.ctx.script_id,
+                                            self.pc,
+                                            r.space.prefix(),
+                                            r.id,
+                                            slot
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        let Some(v) = self.eval_window_condition(Some(w))? else {
                             if dbg {
-                                eprintln!(
+                                yuris_log::trace_forced!(
                                     "[f] seed-skip s{} pc{} {}{}[{}](求值失败/空)",
                                     self.ctx.script_id,
                                     self.pc,
@@ -3528,9 +2371,7 @@ impl GroupVm {
                             (yuris_value::ElemType::Int, Value::Float(f)) => {
                                 Value::Int(f.round() as i64)
                             }
-                            (yuris_value::ElemType::Float, Value::Int(i)) => {
-                                Value::Float(i as f64)
-                            }
+                            (yuris_value::ElemType::Float, Value::Int(i)) => Value::Float(i as f64),
                             (yuris_value::ElemType::Float, Value::Float(f)) => Value::Float(f),
                             (yuris_value::ElemType::Str, Value::Str(mut s)) => {
                                 // 引擎实证:$55[1] = 8 字符(ES.FIRST),而 pushstr
@@ -3561,12 +2402,19 @@ impl GroupVm {
                         let vs = match &cv {
                             Value::Int(i) => format!("int:{}", i),
                             Value::Float(f) => format!("flt:{}", f),
-                            Value::Str(s) => format!("str:{}B", s.len()),
+                            Value::Str(s) => {
+                                let mut hx = String::new();
+                                for b in s.iter().take(28) {
+                                    hx.push_str(&format!("{b:02x} "));
+                                }
+                                format!("str:{}B [{hx}]", s.len())
+                            }
                         };
-                        eprintln!(
-                            "[f] s{} pc{} {}{}[{}]={}",
+                        yuris_log::trace_forced!(
+                            "[f] s{} pc{} space={:?} {}{}[{}]={}",
                             self.ctx.script_id,
                             self.pc,
+                            r.space,
                             r.space.prefix(),
                             r.id,
                             slot,
@@ -3577,6 +2425,8 @@ impl GroupVm {
                 }
             }
         }
+        // 静默吞掉 set_elem 失败会丢实参;至少留痕(帧局部槽越界 = 上界算错)。
+        Ok(())
     }
 
     /// LOOPBREAK/LOOPCONTINUE 的 LV 层数窗口:求值 → Int → usize。
@@ -3595,7 +2445,7 @@ impl GroupVm {
             Some(Value::Int(n)) if n >= 1 => Ok(Some(n as usize)),
             Some(v) => {
                 let reason = format!("LV 层数非正整数: {v:?}");
-                self.state = VmState::Error;
+                self.set_error_state();
                 Err(Error::format(reason))
             }
             None => Ok(Some(1)),
@@ -3603,30 +2453,142 @@ impl GroupVm {
     }
 
     /// LET 左值窗口解析(引用栈 + 下标表)。
-    fn eval_window_lvalue(
+    /// 按**槽位**求左值:窗口字节在此内部取(复用缓冲,稳态零分配)。
+    fn eval_window_lvalue_slot(
         &mut self,
-        window: &[u8],
+        w: &yuris_format::ystb::CommandSlot,
     ) -> Result<yuris_script::LValueRef> {
+        // **缓存命中直接求值**(成果 184):免去取窗拷贝,且复用已解码指令。
+        // 左值窗口同样是 `LET` 的热路径(占全部组 40.4% 的一半窗口)。
+        if let Some(hit) = self
+            .insn_cache
+            .get(&(self.ctx.script_id, w.offset, w.len))
+            .cloned()
+        {
+            let locals = self.frames.last().map(|f| &f.locals);
+            let ctx = self.eval_ctx();
+            let mut ev = Evaluator::with_locals(&mut self.store, locals);
+            ctx.apply(&mut ev);
+            return match ev.eval_lvalue_window_instrs(&hit) {
+                Ok(l) => Ok(l),
+                Err(e) => {
+                    self.set_error_state();
+                    Err(e)
+                }
+            };
+        }
+        let mut buf = std::mem::take(&mut self.bytes_buf);
+        buf.clear();
+        let ok = match self.ctx.script.window_bytes_pooled(w) {
+            Some(b) => {
+                buf.extend_from_slice(b);
+                true
+            }
+            None => match self.ctx.script.window_bytes_pooled_copy(w) {
+                Some(v) => {
+                    buf.extend_from_slice(&v);
+                    true
+                }
+                None => false,
+            },
+        };
+        if !ok {
+            self.bytes_buf = buf;
+            return Err(Error::format(format!(
+                "LET 左值窗口 {}+{} 越过 content+part4 池尾",
+                w.offset, w.len
+            )));
+        }
+        let r = self.eval_window_lvalue(&buf);
+        self.bytes_buf = buf;
+        r
+    }
+
+    /// 窗口是否为裸左值引用形态(诊断/引用槽分流用)。
+    fn window_is_lvalue(&mut self, w: &yuris_format::ystb::CommandSlot) -> bool {
+        let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) else {
+            return false;
+        };
+        let locals = self.frames.last().map(|f| &f.locals);
+        let ctx = self.eval_ctx();
+        let mut ev = Evaluator::with_locals(&mut self.store, locals);
+        ctx.apply(&mut ev);
+        ev.window_is_lvalue(&bytes)
+    }
+
+    fn eval_window_lvalue(&mut self, window: &[u8]) -> Result<yuris_script::LValueRef> {
         let instrs = match yuris_script::decode_window(window) {
             Ok(v) => v,
             Err(e) => {
-                self.state = VmState::Error;
+                self.set_error_state();
                 return Err(Error::format(format!("LET 左值解码失败: {e}")));
             }
         };
         let locals = self.frames.last().map(|f| &f.locals);
+        let ctx = self.eval_ctx();
         let mut ev = Evaluator::with_locals(&mut self.store, locals);
-        let (cx, cy) = self.input_cursor;
-        ev.set_cursor(cx, cy);
-        // @48 注入(同 eval_window_condition;左值下标表达式可读系统变量)
-        ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
+        ctx.apply(&mut ev);
         match ev.eval_lvalue_window_instrs(&instrs) {
             Ok(l) => Ok(l),
             Err(e) => {
-                self.state = VmState::Error;
+                self.set_error_state();
                 Err(e)
             }
         }
+    }
+
+    /// **窗口解码缓存**(成果 184):`(offset,len)` → 已解码指令。
+    ///
+    /// 热路径依据:`LET` 占全部组的 40.4%(345k/854k),每组两个窗口;
+    /// 稳态每帧约 70 万次求值。窗口字节在脚本装载后**完全不变**,
+    /// 而旧实现每次 `decode_window` 都重新切分并新建 `Vec`。
+    ///
+    /// 缓存按**脚本**隔离:键里带 `script_id`,换脚本无需清空也不串味
+    /// (也避免 `swap_exec` 换执行位时误命中别的脚本)。
+    fn decode_cached(
+        &mut self,
+        offset: u32,
+        len: u32,
+        bytes: &[u8],
+    ) -> std::result::Result<std::sync::Arc<[yuris_script::insn::Instruction]>, yuris_core::Error>
+    {
+        let key = (self.ctx.script_id, offset, len);
+        if let Some(hit) = self.insn_cache.get(&key) {
+            return Ok(std::sync::Arc::clone(hit));
+        }
+        let v = yuris_script::decode_window(bytes)?;
+        let arc: std::sync::Arc<[yuris_script::insn::Instruction]> = v.into();
+        self.insn_cache.insert(key, std::sync::Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// **窗口 → 已解码指令**（缓存优先，命中时**不取字节、不分配**）。
+    ///
+    /// 与 [`Self::decode_cached`] 的区别：后者要求调用方先拿到 `&[u8]`
+    ///（跨 content/part4 时那是一次 `Vec` 分配）。热路径每帧调用约 70 万次，
+    /// 而缓存命中近乎 100%，故这里先查缓存，只有**未命中**才取窗口字节。
+    ///
+    /// 调用方须先自行校验 `window_fits_pool`（本函数不做越界判断，
+    /// 未命中时会因取字节失败而返回错误）。
+    fn decode_cached_slot(
+        &mut self,
+        w: &yuris_format::ystb::CommandSlot,
+    ) -> std::result::Result<std::sync::Arc<[yuris_script::insn::Instruction]>, yuris_core::Error>
+    {
+        let key = (self.ctx.script_id, w.offset, w.len);
+        if let Some(hit) = self.insn_cache.get(&key) {
+            return Ok(std::sync::Arc::clone(hit));
+        }
+        let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) else {
+            return Err(Error::format(format!(
+                "窗口 {}+{} 越过 content+part4 池尾",
+                w.offset, w.len
+            )));
+        };
+        let v = yuris_script::decode_window(&bytes)?;
+        let arc: std::sync::Arc<[yuris_script::insn::Instruction]> = v.into();
+        self.insn_cache.insert(key, std::sync::Arc::clone(&arc));
+        Ok(arc)
     }
 
     /// strict 挂起的 `Result` 形态:记录 Unsupported 事件 + 返回 Err。
@@ -3635,14 +2597,13 @@ impl GroupVm {
     }
 
     /// strict 挂起:记录 Unsupported 事件并返回原因(状态已置 Error)。
+    ///
+    /// **勘误(2026-10-17)**:旧实现**不发任何日志**(LOAD/YSSD 族走的是
+    /// 本函数而非 `halt_or_record`,错因只写进事件流;实机看日志一行根因
+    /// 都没有)。现与 `halt_or_record` 统一走 [`Self::note_unsupported`]。
     fn halted(&mut self, pc: usize, command: u8, reason: impl Into<String>) -> String {
-        let reason = reason.into();
-        self.events.push(VmEvent::Unsupported {
-            pc,
-            command,
-            reason: reason.clone(),
-        });
-        self.state = VmState::Error;
+        let reason = self.note_unsupported(pc, command, reason);
+        self.set_error_state();
         reason
     }
 
@@ -3744,15 +2705,11 @@ impl GroupVm {
                     format!("LOAD 非 strict 载荷须标量(引擎 0x1a630)"),
                 ));
             }
-        } else if let Some(cur_ty) = self
-            .store
-            .get_opt(target)
-            .map(|v| match v {
-                Value::Int(_) => 1u8,
-                Value::Float(_) => 2,
-                Value::Str(_) => 3,
-            })
-        {
+        } else if let Some(cur_ty) = self.store.get_opt(target).map(|v| match v {
+            Value::Int(_) => 1u8,
+            Value::Float(_) => 2,
+            Value::Str(_) => 3,
+        }) {
             if cur_ty != payload.ty {
                 return Err(self.halt_err(
                     self.pc,
@@ -3768,7 +2725,10 @@ impl GroupVm {
                 return Err(self.halt_err(
                     self.pc,
                     cmd::LOAD,
-                    format!("LOAD 标量目标 {} 收到数组载荷(引擎 0x1a630)", target.display()),
+                    format!(
+                        "LOAD 标量目标 {} 收到数组载荷(引擎 0x1a630)",
+                        target.display()
+                    ),
                 ));
             }
         } else {
@@ -3803,8 +2763,8 @@ impl GroupVm {
                             format!("LOAD {} 载荷字符串记录截断", target.display()),
                         ));
                     }
-                    let len = u32::from_le_bytes(payload.data[p..p + 4].try_into().unwrap())
-                        as usize;
+                    let len =
+                        u32::from_le_bytes(payload.data[p..p + 4].try_into().unwrap()) as usize;
                     p += 4;
                     if p + len > payload.data.len() {
                         return Err(self.halt_err(
@@ -3827,11 +2787,13 @@ impl GroupVm {
             // 标量(引擎 memcpy 单元素 8B / STR 首记录)
             match values.into_iter().next() {
                 Some(v) => self.store.set(target, v),
-                None => return Err(self.halt_err(
-                    self.pc,
-                    cmd::LOAD,
-                    format!("LOAD 标量载荷为空({})", target.display()),
-                )),
+                None => {
+                    return Err(self.halt_err(
+                        self.pc,
+                        cmd::LOAD,
+                        format!("LOAD 标量载荷为空({})", target.display()),
+                    ))
+                }
             }
         }
         Ok(())
@@ -3840,7 +2802,63 @@ impl GroupVm {
     /// 变量读取(P5,成果 50):**帧局部优先** —— 当前 GOSUB 帧 locals 含
     /// 同键数组(如 @53/@54/$55 帧局部族)时读帧,否则读全局
     /// (引擎 0042158e:id<1000 走帧/系统存储,id≥1000 走 desc+0x30)。
+    /// 引擎毫秒计时(`@1[1]` 系统变量):自 VM 建立以来的单调毫秒数。
+    ///
+    /// 引擎侧对应 timeGetTime 派生计时(`docs/engine/command-layer.md` §9c
+    /// case 0x01),脚本只用其**时间差**,故单调性即全部可观测语义。
+    ///
+    /// **勘误(2026-10-17,成果 184)**:曾把这里改成「逻辑帧数 × 1000/fps」,
+    /// 实测**回归**:逻辑时间只随上屏帧数增长,而渲染只有 ~45fps ⇒
+    /// `WAIT TIME` 一秒变 0.75 秒、按钮淡入淡出整体变慢(实机「卡卡的」),
+    /// 且计时从 0 起使淡变相位与原版不同(中央多出一个游标残影)。
+    /// 引擎真值 = `timeGetTime`,即**墙钟**;还原。
+    fn timer_ms(&self) -> i64 {
+        self.epoch.elapsed().as_millis() as i64
+    }
+
+    /// 求值上下文快照(`@1[1]` 计时 / `@48` 循环计数 / `@133`·`@138` 光标 /
+    /// `@115`·`@116` 屏幕尺寸)。
+    ///
+    /// [`yuris_script::Evaluator::with_locals`] 会**可变借走 `self.store`**,
+    /// 之后无法再读 `self` 的其它字段 —— 故四处 Evaluator 构造点统一先取
+    /// 本快照、构造后再 [`EvalCtx::apply`](T20:屏幕尺寸走这条注入路径,
+    /// 与 `WINDOWINFO SX/SY` 应答共用 `screen_w/screen_h` 同一真值)。
+    fn eval_ctx(&self) -> EvalCtx {
+        EvalCtx {
+            loop_counter: self.loops.last().map(|l| l.counter as i64).unwrap_or(0),
+            timer_ms: self.timer_ms(),
+            cursor: self.input_cursor,
+            screen: (self.screen_w, self.screen_h),
+            input: self.input_vars.clone(),
+        }
+    }
+
     fn read_var_value(&self, r: &yuris_value::VarRef, indices: &[i64]) -> Option<Value> {
+        // 输入系统变量（`@_MOUSE_X`/`@_INP`/`@_KEY_*`/`@_CODE_*`）：由输入层
+        // 每帧快照提供。引擎这些 id 无存储（`FUN_00427350` 读即计算）。
+        // 同帧脚本写入的 overlay 优先（LET 之后立刻读要看到新值）。
+        if r.space == yuris_value::VarSpace::At {
+            if let Some(overlay) = self
+                .input_overlay
+                .get(&(r.id, indices.first().copied().unwrap_or(-1)))
+            {
+                return Some(overlay.clone());
+            }
+            if let Some(input) = &self.input {
+                if let Some(v) = input.read(r.id, indices) {
+                    return Some(Value::Int(v));
+                }
+            }
+        }
+        // @1 系统变量(引擎 sysvar case 0x01):timeGetTime 派生**毫秒计时**。
+        // 语料只用下标 1(1504 处时间差);其余子槽语义未证实 → 0,不猜。
+        if r.space == yuris_value::VarSpace::At && r.id == 1 {
+            return Some(Value::Int(if indices.first() == Some(&1) {
+                self.timer_ms()
+            } else {
+                0
+            }));
+        }
         // @48 系统变量(P5 定性,引擎 sysvar case 0x30/00447ebc):内层 LOOP
         // 迭代计数,读即计算、无存储(引擎 obj+0x244 栈顶记录 +0x10);
         // LOOP 置 1、LOOPEND +1、LOOPBREAK 清零;无活动循环 = 0。
@@ -3855,13 +2873,22 @@ impl GroupVm {
         if r.space == yuris_value::VarSpace::At && r.id == 114 {
             return Some(Value::Int(32));
         }
-        // @115/@116(引擎 sysvar case 0x73/0x74,DAT_0087236c/70):屏幕宽/高
-        //(显示初始化写入)。VM 无显示栈,按 oracle 环境 = 1920×1080。
+        // @115/@116(引擎 sysvar case 0x73/0x74)= `_SCREEN_SIZE_X/Y`:
+        // **当前分辨率**(手册「システム変数」表)。真值 = 游戏自身 yscfg,
+        // 由启动链 `set_screen_size` 注入(成果 123;旧实现写死 1920×1080)。
         if r.space == yuris_value::VarSpace::At && r.id == 115 {
-            return Some(Value::Int(1920));
+            return Some(Value::Int(self.screen_w));
         }
         if r.space == yuris_value::VarSpace::At && r.id == 116 {
-            return Some(Value::Int(1080));
+            return Some(Value::Int(self.screen_h));
+        }
+        // @11 = `_DEBUGMODE`(手册:「デバッグモードか否か(1=デバッグモード/
+        // 0=リリースモード)」)。**勘误(2026-10-13,成果 123)**:旧实现不提供该
+        // 系统变量 → 读落到普通全局(实测被游戏读成 1)⇒ `ES.DEBUGMODE.BTDEF`
+        // 的 `IF @11 == 1` 成立 ⇒ **调试按钮组(20,25)与调试窗一起上屏**
+        // (实机「按钮没有/一团蓝块 + 网格文字」)。本内核不是调试器 ⇒ 恒 0。
+        if r.space == yuris_value::VarSpace::At && r.id == 11 {
+            return Some(Value::Int(0));
         }
         let out: Option<Value> = (|| {
             if let Some(fr) = self.frames.last() {
@@ -3923,7 +2950,7 @@ impl GroupVm {
                 },
             }
         })();
-        if std::env::var("YURIS_DEBUG_FRAME").is_ok() && r.id == 55 {
+        if debug_frame_enabled() && r.id == 55 {
             let fr_has = self.frames.last().map(|f| f.locals.has_array(r));
             let vs = match &out {
                 Some(Value::Str(s)) => format!("str:{}B", s.len()),
@@ -3931,7 +2958,7 @@ impl GroupVm {
                 Some(Value::Float(f)) => format!("flt:{}", f),
                 None => "none".to_string(),
             };
-            eprintln!(
+            yuris_log::trace_forced!(
                 "[f] read $55{:?} frames={} frame_has={:?} -> {}",
                 indices,
                 self.frames.len(),
@@ -3976,127 +3003,203 @@ impl GroupVm {
         command: u8,
         reason: impl Into<String>,
     ) -> Option<String> {
+        let reason = self.note_unsupported(pc, command, reason);
+        if self.strict {
+            self.set_error_state();
+            Some(reason)
+        } else {
+            None
+        }
+    }
+
+    /// 未实现/未命中命令的**统一诊断汇聚点**:落 stderr 告警 +
+    /// `VmEvent::Unsupported` 事件,并把根因快照进 `err_cause`(供
+    /// `run_main` 的「VM 处于 Error 态」挡回消息携带 —— 2026-10-17 之前
+    /// 该消息不带任何原因,实机排障只能全量翻事件流)。
+    ///
+    /// **`command` 参数只是处理器声明的取值**(习惯性 `cmd::*` v555 留存
+    /// 常量);事件写入的恒为分派期真实下标(T2 修复,同 [`Self::halted`])。
+    fn note_unsupported(&mut self, pc: usize, command: u8, reason: impl Into<String>) -> String {
         let reason = reason.into();
-        self.events.push(VmEvent::Unsupported {
+        let actual = self.cur_command.unwrap_or(command);
+        // **未实现/未命中命令的统一诊断(2026-10-15,用户要求)**。
+        //
+        // 这是全部 `VmEvent::Unsupported` 的汇聚点 —— 任何「命令没实现 /
+        // 标签没找到 / 语义未逆向」都会经过这里。旧实现只在事件流里记一笔,
+        // 实机跑的时候屏幕上什么都不说,排障只能靠事后翻 trace。
+        //
+        // **2026-10-17 全量收紧(用户要求)**:这里改成**醒目横幅 + 去重**,
+        // 并在 strict(默认)下同时登记**致命错误** —— 播放器主循环据此弹出
+        // 画布中央错误窗。不再允许「未知只留一行 warn、游戏照跑」。
+        // `YURIS_QUIET_UNSUP=1` 仅用于大批量探针(仍计数、仍可能致命)。
+        let cname = self
+            .dispatch
+            .name_of(actual as u16)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("<未命名 cmd{actual}>"));
+        let relic = if actual != command {
+            format!(" [处理器常量 0x{command:02x} = v555 留存,非本版]")
+        } else {
+            String::new()
+        };
+        let sid = self.ctx.script_id;
+        let first = self.unsup_alerted.borrow_mut().insert((sid, pc, actual));
+        if self.err_cause.is_none() {
+            self.err_cause = Some(format!("{cname}(idx{actual}) s{sid} pc={pc}: {reason}{relic}"));
+        }
+        if first {
+            if std::env::var_os("YURIS_QUIET_UNSUP").is_none() {
+                yuris_log::alert!(
+                    "未实现/未命中命令\n\
+                     命令: {cname} (idx {actual}, 0x{actual:02x}){relic}\n\
+                     现场: script {sid} pc {pc}\n\
+                     原因: {reason}\n\
+                     处置: {}",
+                    if self.strict {
+                        "strict —— 挂起并上屏致命错误窗(修好后重跑)"
+                    } else {
+                        "lenient —— 记录后继续(仅供取证;此命令语义仍是 Unknown)"
+                    }
+                );
+            }
+            if self.strict && self.fatal_reporting {
+                yuris_log::report_fatal(
+                    module_path!(),
+                    "运行时缺失 / UNIMPLEMENTED",
+                    format!("{cname}(idx{actual}) s{sid} pc={pc}: {reason}{relic}"),
+                );
+            }
+        }
+        self.push_event(VmEvent::Unsupported {
             pc,
-            command,
+            command: actual,
             reason: reason.clone(),
         });
+        reason
+    }
+
+    /// 打开/关闭 **strict 未实现 → 致命错误窗** 升级。
+    ///
+    /// 库与测试默认关闭(避免全局致命状态串味);`yuris-cli` 与播放器
+    /// 启动时打开 —— 那边才有画布可以盖错误窗。
+    pub fn set_fatal_reporting(&mut self, on: bool) {
+        self.fatal_reporting = on;
+    }
+
+    /// 最近一次错误的根因(诊断/播放器升级致命用)。
+    pub fn last_error(&self) -> Option<&str> {
+        self.err_cause.as_deref()
+    }
+
+    /// **未建模参数槽**的醒目告警(每 `(命令, 槽)` 一次)。
+    ///
+    /// 这些槽当前只被求值记录、不参与语义 —— 用户要求「缺什么必须看得见」。
+    /// 不升级为致命:部分实现(如 CG 的 55 个效果槽)仍是可用状态,
+    /// 但每一个未建模槽都会在 `VmEvent` 的 `evaluated` 里留痕。
+    pub fn note_unknown_slot(&self, command: u8, slot: u8, context: &str) {
+        let key = (command, slot);
+        if !self.unknown_slot_warned.borrow_mut().insert(key) {
+            return;
+        }
+        let cname = self
+            .dispatch
+            .name_of(command as u16)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("<未命名 cmd{command}>"));
+        let pname = self
+            .dispatch
+            .param_name_of(command, slot)
+            .unwrap_or_else(|| "无参数表/未命名".to_string());
+        yuris_log::alert!(
+            "未建模参数槽\n\
+             命令: {cname} (idx {command})  槽 {slot} = {pname}\n\
+             现场: script {} pc {}\n\
+             上下文: {context}\n\
+             处置: 值已求值并记入事件,但**不参与任何语义**(Unknown)",
+            self.ctx.script_id,
+            self.pc
+        );
+    }
+
+    /// **整个子系统/命令未实装**的醒目告警(按命令名去重)。
+    ///
+    /// 用于「分类到了、但处理器只记录不执行」的命令(EMOTE / SOUNDINFO /
+    /// DIALOG / FILEACT / ERROR …)—— 这类路径以前**完全静默**,
+    /// 用户无从知道运行时缺了哪块。
+    pub fn note_missing_feature(&self, command: u8, detail: &str) {
+        let cname = self
+            .dispatch
+            .name_of(command as u16)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("<未命名 cmd{command}>"));
+        if !self
+            .missing_feature_warned
+            .borrow_mut()
+            .insert(cname.clone())
+        {
+            return;
+        }
+        yuris_log::alert!(
+            "命令已分派但子系统未实装\n\
+             命令: {cname} (idx {command})\n\
+             现场: script {} pc {}\n\
+             缺失: {detail}\n\
+             处置: {}",
+            self.ctx.script_id,
+            self.pc,
+            if self.strict {
+                "strict —— 本命令语义 Unknown,挂起并上屏致命错误窗"
+            } else {
+                "lenient —— 仅记录参数后继续(结果不可信)"
+            }
+        );
+    }
+
+    /// 未实装子系统在 strict 下的统一**中断**出口。
+    ///
+    /// 返回 `Some(原因)` = 调用方应返回 `Action::Suspend(VmSuspend::Error)`。
+    /// 语义与用户要求一致:**不再允许「未实装但特判继续」** ——
+    /// strict(运行时默认)直接挂起并上屏致命错误窗;lenient 仅用于取证。
+    pub(crate) fn missing_feature_halt(&mut self, command: u8, detail: &str) -> Option<String> {
+        self.note_missing_feature(command, detail);
         if self.strict {
-            self.state = VmState::Error;
-            Some(reason)
+            Some(self.halted(self.pc, command, detail.to_string()))
         } else {
             None
         }
     }
 }
 
-/// 解码单条 M-串窗口(`4d len "name"` 或类型 5 的无引号形式)。
-fn mstring(window: &[u8]) -> Option<&[u8]> {
-    if window.len() < 4 || window[0] != 0x4d {
-        return None;
-    }
-    let payload = &window[3..];
-    if payload.len() >= 2 && payload[0] == b'"' && *payload.last().unwrap() == b'"' {
-        return Some(&payload[1..payload.len() - 1]);
-    }
-    Some(payload)
-}
-
-/// 变量引用目标(VARACT/VARINFO/CGINFO/SAVE/LOAD 的 SET/LET 槽;kind 2 延迟求值)。
-#[derive(Debug, Clone, PartialEq)]
-enum VarTarget {
-    /// 标量(`@1041`)。
-    Scalar(yuris_value::VarRef),
-    /// 数组元素(`$0x37[1]`)。
-    ///
-    /// 2026-09-05 勘误(P1 对拍[144128]定位):基点 = **首条** var 类指令,
-    /// 其后至末条 0x29 之前的全部指令 = **下标表达式**(引擎 kind 2 延迟
-    /// 求值,写/读时求值)。旧实现用「最后一条 var 指令」当基点、下标只认
-    /// 整数字面量 → `56 @1265 | 48 @1704 | 29` 形态把下标变量 @1704 误当
-    /// 基点、写入错位(与 LET 左值窗成果 44 同族语义,此处漏同步)。
-    /// 常量下标 = 指令序列恰为 PushInt 序列的特例。
-    Indexed(yuris_value::VarRef, Vec<yuris_script::Instruction>),
-}
-
-impl VarTarget {
-    fn summary(&self) -> String {
-        match self {
-            VarTarget::Scalar(r) => r.display(),
-            VarTarget::Indexed(r, idx) => {
-                if idx.iter().all(|i| matches!(i.kind, yuris_script::Insn::PushInt(_))) {
-                    let vals: Vec<i64> = idx
-                        .iter()
-                        .filter_map(|i| match i.kind {
-                            yuris_script::Insn::PushInt(n) => Some(n),
-                            _ => None,
-                        })
-                        .collect();
-                    format!("{}[{:?}]", r.display(), vals)
-                } else {
-                    format!("{}[expr×{}]", r.display(), idx.len())
-                }
-            }
-        }
-    }
-}
-
-/// 从引用槽窗口字节提取变量目标(引擎 kind 2 延迟求值形态)。
-///
-/// 识别形态(语料 Confirmed):
-/// - 单条 `48/56/76 + [prefix][id:u16]` → 标量(0x76 裸引用 = 整数组,s37 g50);
-/// - `56 + [prefix][id]` + 下标指令×N + `29`(ArrayLoad) → 数组元素,
-///   基点 = 首条 var 指令,下标 = 其后指令序列(写/读时求值,支持
-///   变量下标与表达式下标;见 [`VarTarget::Indexed`] 勘误)。
-fn extract_var_target(bytes: &[u8]) -> Result<VarTarget> {
-    let instrs = yuris_script::decode_window(bytes)?;
-    // 单条 var 类指令 → 标量
-    if let [ins] = &instrs[..] {
-        if let yuris_script::Insn::PushVar(r)
-        | yuris_script::Insn::PushVarRef(r)
-        | yuris_script::Insn::PushVarIndexed(r) = &ins.kind
-        {
-            return Ok(VarTarget::Scalar(*r));
-        }
-    }
-    // 多指令形态:基点 = 首条 var 类指令(语料:左值窗全部 0x56 起头)
-    let base = match instrs.first().map(|i| &i.kind) {
-        Some(yuris_script::Insn::PushVar(r))
-        | Some(yuris_script::Insn::PushVarRef(r))
-        | Some(yuris_script::Insn::PushVarIndexed(r)) => *r,
-        _ => return Err(Error::format("引用窗首条不是变量指令")),
-    };
-    // 末条 0x29 = 引擎延迟模式不装载的加载标记,剥除;其余为下标表达式
-    let idx_len = instrs
-        .last()
-        .map(|i| matches!(i.kind, yuris_script::Insn::ArrayLoad { .. }))
-        .unwrap_or(false);
-    if !idx_len {
-        return Err(Error::format(
-            "引用窗多指令形态缺末条 0x29(语料外形态;不猜)",
-        ));
-    }
-    if instrs.len() < 3 {
-        return Err(Error::format("引用窗多指令形态过短"));
-    }
-    Ok(VarTarget::Indexed(
-        base,
-        instrs[1..instrs.len() - 1].to_vec(),
-    ))
-}
-
 impl GroupVm {
     /// 读 SET 目标当前值(VARINFO 查询对象)。P5:帧局部优先(成果 50)。
+    ///
+    /// **未定义变量的 `Int(0)` 是兜底值,不是真值**:引擎对未定义读取的
+    /// 默认值语义 Unknown,本内核按类型默认值继续(既有口径)。但每次
+    /// 落到兜底都必须可见 —— 否则「查询了一个没声明的变量」会静默得到 0,
+    /// 脚本分支结果不可信。
     fn read_var_target(&mut self, t: &VarTarget) -> Result<Value> {
-        match t {
-            VarTarget::Scalar(r) => {
-                Ok(self.read_var_value(r, &[]).unwrap_or(Value::Int(0)))
-            }
-            VarTarget::Indexed(r, idx) => {
-                let indices = self.eval_target_indices(idx)?;
-                Ok(self.read_var_value(r, &indices).unwrap_or(Value::Int(0)))
-            }
+        let (r, indices) = match t {
+            VarTarget::Scalar(r) => (r.clone(), Vec::new()),
+            VarTarget::Indexed(r, idx) => (r.clone(), self.eval_target_indices(idx)?),
+        };
+        if let Some(v) = self.read_var_value(&r, &indices) {
+            return Ok(v);
         }
+        yuris_log::alert_once(
+            module_path!(),
+            format!("var-target-undefined:{}:{indices:?}", r.display()),
+            format!(
+                "查询目标变量未定义,按类型默认值(Int 0)继续\n\
+                 变量: {}\n\
+                 下标: {indices:?}\n\
+                 现场: script {} pc {}\n\
+                 处置: 这是**兜底值**;引擎对未定义读取的真值语义 Unknown(铁律 2)",
+                r.display(),
+                self.ctx.script_id,
+                self.pc
+            ),
+        );
+        Ok(Value::Int(0))
     }
 
     /// 求值引用槽的下标指令(引擎 kind 2 延迟求值:写/读时求值)。
@@ -4106,7 +3209,10 @@ impl GroupVm {
         if idx.is_empty() {
             return Ok(Vec::new());
         }
-        if idx.iter().all(|i| matches!(i.kind, yuris_script::Insn::PushInt(_))) {
+        if idx
+            .iter()
+            .all(|i| matches!(i.kind, yuris_script::Insn::PushInt(_)))
+        {
             return Ok(idx
                 .iter()
                 .filter_map(|i| match i.kind {
@@ -4116,19 +3222,17 @@ impl GroupVm {
                 .collect());
         }
         let locals = self.frames.last().map(|f| &f.locals);
+        let ctx = self.eval_ctx();
         let mut ev = Evaluator::with_locals(&mut self.store, locals);
-        let (cx, cy) = self.input_cursor;
-        ev.set_cursor(cx, cy);
-        ev.set_loop_counter(self.loops.last().map(|l| l.counter as i64).unwrap_or(0));
-        let stack = ev.eval_instructions(idx).map_err(|e| {
-            Error::format(format!("引用槽下标表达式求值失败: {e}"))
-        })?;
+        ctx.apply(&mut ev);
+        let stack = ev
+            .eval_instructions(idx)
+            .map_err(|e| Error::format(format!("引用槽下标表达式求值失败: {e}")))?;
         stack
             .into_iter()
             .map(|v| {
-                v.as_int_opt().ok_or_else(|| {
-                    Error::format("引用槽下标表达式结果非整数(不猜)")
-                })
+                v.as_int_opt()
+                    .ok_or_else(|| Error::format("引用槽下标表达式结果非整数(不猜)"))
             })
             .collect()
     }
@@ -4239,23 +3343,51 @@ impl GroupVm {
                 Ok(Some(Value::Int(code)))
             }
             Some(3) => {
-                // STRTYPE:被查串 = STRTYPE 槽自身的字符串参数(引擎取最近串求值)
-                // 判定首字符 SJIS 宽度 → 1=半角 2=全角(处理器直接证据:写 LET 元素)
-                Err(Error::Unimplemented(
-                    "VARINFO STRTYPE:串参数传递路径待核(槽值未达本方法)",
-                ))
+                // STRTYPE:判定 SET 引用串**首字符**的 SJIS 宽度类型。
+                //   1 = 半角(单字节)、2 = 全角(双字节前导)、0 = 空串。
+                // 结果写 LET 引用的下标元素(引擎处理体 CMDH_004550a0 的
+                // STRTYPE 分支;证据见 docs/engine/varact_varinfo.md §1、
+                // PROGRESS 成果 40「判定结果(1=半角/2=全角)写入 LET」)。
+                //
+                // 语料唯一调用点 s70 g239(文本测宽宏):
+                //   `VARINFO STRTYPE=1 / SET=$55[1] / LET=@4305`,
+                // 紧接 `LET @4305 = @4305 + 10` ⇒ 返回值是**逐字符步进量**
+                // 的宽度档(半角 → 11、全角 → 12),与 LENGTH 的 SJIS
+                // 宽度表(`0x59b0c0`)同源。
+                //
+                // STRTYPE 槽自身是**开关**(`push 1`),不携带串;串只来自 SET。
+                let bytes = match self.read_var_target(target)? {
+                    Value::Str(b) => b,
+                    _ => {
+                        return Err(Error::format(
+                            "VARINFO STRTYPE: SET 变量非 STR(引擎 0x1a6bc)",
+                        ))
+                    }
+                };
+                let code: i64 = match bytes.first() {
+                    None => 0,
+                    // CP932 双字节前导区:0x81..=0x9F 与 0xE0..=0xFC。
+                    Some(&f) if (0x81..=0x9f).contains(&f) || (0xe0..=0xfc).contains(&f) => 2,
+                    Some(_) => 1,
+                };
+                evaluated.push((3u8, format!("STRTYPE={code}")));
+                Ok(Some(Value::Int(code)))
             }
             Some(4) => {
                 // DIMNUM:维数。裸引用(Scalar)= 整数组(s37 g50/g51 实证,
                 // 引擎 DIMSIZE/DIMNUM 直接按 id 取 desc)→ 按 store 数组解析;
                 // 真标量 → 0。
                 let n = match target {
-                    VarTarget::Scalar(r) => {
-                        self.store.array_dims(r).map(|d| d.len() as i64).unwrap_or(0)
-                    }
-                    VarTarget::Indexed(r, _) => {
-                        self.store.array_dims(r).map(|d| d.len() as i64).unwrap_or(0)
-                    }
+                    VarTarget::Scalar(r) => self
+                        .store
+                        .array_dims(r)
+                        .map(|d| d.len() as i64)
+                        .unwrap_or(0),
+                    VarTarget::Indexed(r, _) => self
+                        .store
+                        .array_dims(r)
+                        .map(|d| d.len() as i64)
+                        .unwrap_or(0),
                 };
                 evaluated.push((4u8, format!("DIMNUM={n}")));
                 Ok(Some(Value::Int(n)))
@@ -4323,28 +3455,40 @@ impl GroupVm {
                             .unwrap_or(0),
                     ),
                 };
-                let mut found = count;
-                if let Some(key) = key {
-                    for i in start..count {
-                        let Ok(v) = self.store.get_elem(r, &[i as i64]) else {
-                            break;
-                        };
-                        let hit = match (&v, &key) {
-                            (Value::Int(a), Value::Int(b)) => a == b,
-                            (Value::Float(a), Value::Float(b)) => a == b,
-                            (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
-                            (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
-                            (Value::Str(a), Value::Str(b)) => a == b,
-                            _ => false,
-                        };
-                        if hit {
-                            found = i;
-                            break;
+                // 未命中 → **-1**(勘误,2026-10-13)。
+                // 旧实现返回「扫描边界(元素个数)」,刻意为该版引擎语义,但被
+                // 调用侧**直接证伪**:本语料 `es.BT.NO.GET`(s0 g2448-2456)
+                // 拿到结果后立即做 `if (@[0x5bc] != -1) { @[0x5bb] = @[0x5bc] }`
+                // —— 0x52 是**一元取负**(insn.rs `0x52 => Unary(Neg)`),故常量
+                // 侧是 -1,即 -1 才是「未命中」哨兵。旧值 301(元素个数)在该
+                // 判定下为真 → 被当成下标写 `@[0x4a4][301]` → 越界崩溃
+                // (实测挂起:`idx[0]=301, bound=301`)。
+                let found: i64 = match key {
+                    Some(key) => {
+                        let mut hit: i64 = -1;
+                        for i in start..count {
+                            let Ok(v) = self.store.get_elem(r, &[i as i64]) else {
+                                break;
+                            };
+                            let m = match (&v, &key) {
+                                (Value::Int(a), Value::Int(b)) => a == b,
+                                (Value::Float(a), Value::Float(b)) => a == b,
+                                (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
+                                (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
+                                (Value::Str(a), Value::Str(b)) => a == b,
+                                _ => false,
+                            };
+                            if m {
+                                hit = i as i64;
+                                break;
+                            }
                         }
+                        hit
                     }
-                }
+                    None => -1,
+                };
                 evaluated.push((14u8, format!("SEARCH={found}(n={count})")));
-                Ok(Some(Value::Int(found as i64)))
+                Ok(Some(Value::Int(found)))
             }
             Some(slot) => Err(Error::format(format!(
                 "VARINFO 查询槽 {slot}(STRFIRST/SJISCODE)未实现(不猜)"
@@ -4353,239 +3497,167 @@ impl GroupVm {
     }
 }
 
-/// SJIS 字符数(VARINFO LENGTH 汇编终证 0x4551dc-0x455208:strlen 只作循环
-/// 边界,入栈结果 = 宽度表步进循环的 EAX 计数器 —— 每字符恰 +1,双字节
-/// 首区额外跳 1 字节。即 LENGTH = 字符数,非字节数)。
-fn sjis_char_len(bytes: &[u8]) -> usize {
-    let mut off = 0usize;
-    let mut n = 0usize;
-    while off < bytes.len() {
-        let b = bytes[off];
-        off += if (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b) {
-            2
-        } else {
-            1
-        };
-        n += 1;
+#[cfg(test)]
+mod cp932_tests {
+    use super::{sjis_char_len, varact_ascii_case, varact_char_to_byte};
+    use yuris_value::Value;
+
+    // ---- sjis_char_len:VARINFO/VARACT 的 LENGTH/POS 都按**字符**计数 ----
+    //
+    // 语义来源:引擎宽度步进表(汇编终证:strlen 只作循环边界,入栈结果 =
+    // 每字符 +1 的计数器)。双字节首区步进 2,其余步进 1。
+
+    #[test]
+    fn ascii_is_one_byte_per_char() {
+        assert_eq!(sjis_char_len(b"Hello"), 5);
+        assert_eq!(sjis_char_len(b""), 0);
     }
-    n
-}
 
-/// VARACT UPPER/LOWER 的 SJIS 感知 ASCII 大小写转换
-/// (引擎 FUN_004546cc=UPPER / FUN_00464dac=LOWER,Ghidra 逐行,57B 各):
-/// 双字节首区(步进表 DAT_0059b0c0==1)连跳 2 字节不转换;单字节
-/// `to_upper`: 'a'-'z' → -0x20;`!to_upper`: 'A'-'Z' → +0x20;其余原样。
-/// 引擎按 NUL 终止扫描,缓冲区语义由调用方保证 —— 这里按字节长度截住。
-fn varact_ascii_case(bytes: &[u8], to_upper: bool) -> Vec<u8> {
-    let mut out = bytes.to_vec();
-    let mut i = 0usize;
-    while i < out.len() {
-        let b = out[i];
-        if (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b) {
-            i += 2; // 双字节整体跳过(引擎 in_EAX += 2)
-            continue;
-        }
-        if to_upper && (b'a'..=b'z').contains(&b) {
-            out[i] = b - 0x20;
-        } else if !to_upper && (b'A'..=b'Z').contains(&b) {
-            out[i] = b + 0x20;
-        }
-        i += 1;
+    /// 半角片假名(0xA1–0xDF)是**单字节**——最容易被误当双字节的一族。
+    #[test]
+    fn halfwidth_katakana_is_single_byte() {
+        // 0xB1 = 'ｱ', 0xB2 = 'ｲ', 0xDF = 'ﾟ'
+        assert_eq!(sjis_char_len(&[0xB1, 0xB2, 0xDF]), 3);
     }
-    out
-}
 
-/// 字符序数 → SJIS 字节偏移(引擎 FUN_00471cf5/00471d7f 语义,字符步进表
-/// `DAT_0059b0c0`:双字节首区 +1 → 步进 2,其余步进 1)。
-/// 越界(序数超过字符数)→ `None`(引擎报错 0x1d52e/0x1d538 同族)。
-fn varact_char_to_byte(s: &Value, ordinal: usize) -> Option<usize> {
-    let Value::Str(bytes) = s else {
-        return None;
-    };
-    let mut off = 0usize;
-    for _ in 0..ordinal {
-        if off >= bytes.len() {
-            return None;
-        }
-        let b = bytes[off];
-        off += if (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b) {
-            2
-        } else {
-            1
-        };
+    #[test]
+    fn double_byte_kanji_is_one_char() {
+        // 0x93 0xFA = '日'
+        assert_eq!(sjis_char_len(&[0x93, 0xFA]), 1);
     }
-    Some(off)
-}
 
-/// 字节偏移 → 字符序数(引擎 FUN_00471d7f 逆换算;非字符边界 → 界内序数)。
-#[allow(dead_code)]
-fn varact_byte_to_char(s: &Value, byte_off: usize) -> usize {
-    let Value::Str(bytes) = s else {
-        return 0;
-    };
-    let mut off = 0usize;
-    let mut n = 0usize;
-    while off < bytes.len() && off < byte_off {
-        let b = bytes[off];
-        off += if (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b) {
-            2
-        } else {
-            1
-        };
-        n += 1;
+    /// 混排:ASCII + 半角片假名 + 双字节 —— 逐段都要对。
+    #[test]
+    fn mixed_ascii_halfwidth_and_doublebyte() {
+        // '$' + 'ｱ'(0xB1) + '日'(0x93FA) + 'b'
+        let s = [0x24u8, 0xB1, 0x93, 0xFA, 0x62];
+        assert_eq!(sjis_char_len(&s), 4);
     }
-    n
-}
 
-/// 消费 `ctx` 的**声明组**写入 `store`。
-///
-/// 声明命令族(YSCM 名表 Confirmed):
-/// - FLT 族:F_FLT(0x10)/FLT(0x19)/G_FLT..4(0x1d-0x20)/S_FLT(0x52) → Float
-/// - INT 族:F_INT(0x11)/INT(0x32)/G_INT..4(0x21-0x24)/S_INT(0x53) → Int
-/// - STR 族:F_STR(0x12)/STR(0x5c)/G_STR..4(0x25-0x28)/S_STR(0x54) → Str
-/// - VAR 族(0x13/0x29/0x55):类型不定 → 跳过(Unknown,不猜)
-///
-/// 窗口形态(样本探针):
-/// - 标量:单条 `48/56 [prefix][id]` → 默认值
-/// - 数组:`56/76 [prefix][id]` + 下标表达式 + `29`(ArrayLoad) →
-///   declare_array(bounds=[表达式值+1])(**上界引用**;yst00000 F_STR 实测
-///   `$1226[400+1]`;引擎 0x29 行主序装载 Confirmed,上界语义 Likely)
-/// - M-串名字窗(tag B2=3):非引用,自然跳过
-///
-/// 幂等:已定义标量/同型数组不覆盖(YSVR 初值应用须在本消费之后)。
-pub fn consume_declarations_into(
-    store: &mut yuris_value::VariableStore,
-    ctx: &crate::host::ScriptCtx,
-) -> Result<usize> {
-    use yuris_script::Insn;
-    use yuris_value::{ElemType, Value};
-    let mut count = 0usize;
-    for (gi, g) in ctx.groups.iter().enumerate() {
-        let elem: ElemType = match g.command_type {
-            0x10 | 0x19 | 0x1d..=0x20 | 0x52 => ElemType::Float,
-            0x11 | 0x32 | 0x21..=0x24 | 0x53 => ElemType::Int,
-            0x12 | 0x5C | 0x25..=0x28 | 0x54 => ElemType::Str,
-            _ => continue,
-        };
-        let default = match elem {
-            ElemType::Float => Value::Float(0.0),
-            ElemType::Int => Value::Int(0),
-            ElemType::Str => Value::Str(Vec::new()),
-        };
-        let first = ctx.first_slots[gi];
-        let wins: Vec<yuris_format::ystb::CommandSlot> = ctx.script.slots()
-            [first..first + g.window_count as usize]
-            .to_vec();
-        for w in &wins {
-            if w.tag & 0xFF != 0 {
-                continue;
-            }
-            let Some(bytes) = ctx.script.window_bytes_pooled_copy(w) else {
-                continue;
-            };
-            let Ok(instrs) = yuris_script::decode_window(&bytes) else {
-                continue;
-            };
-            // 引用窗必须以单条变量指令开头
-            let Some(base) = (match instrs.first().map(|i| &i.kind) {
-                Some(Insn::PushVar(r)) | Some(Insn::PushVarRef(r))
-                | Some(Insn::PushVarIndexed(r)) => Some(r.clone()),
-                _ => None,
-            }) else {
-                continue;
-            };
-            if instrs.len() == 1 {
-                // 标量声明
-                if store.get_opt(&base).is_none() && !store.has_array(&base) {
-                    store.set(&base, default.clone());
-                    count += 1;
-                }
-                continue;
-            }
-            // 数组声明:存在 ArrayLoad;取其前的下标表达式值(变量指令压 0 占位)
-            let has_load = instrs.iter().any(|i| matches!(i.kind, Insn::ArrayLoad { .. }));
-            if !has_load {
-                continue;
-            }
-            let mut stack: Vec<i64> = Vec::new();
-            for ins in &instrs {
-                match &ins.kind {
-                    Insn::PushInt(n) => stack.push(*n),
-                    Insn::PushVar(_) | Insn::PushVarRef(_) | Insn::PushVarIndexed(_) => {
-                        stack.push(0)
-                    }
-                    Insn::Binary(op) => {
-                        let (Some(rhs), Some(lhs)) = (stack.pop(), stack.pop()) else {
-                            break;
-                        };
-                        let v = match op {
-                            yuris_script::BinOp::Add => lhs.wrapping_add(rhs),
-                            yuris_script::BinOp::Sub => lhs.wrapping_sub(rhs),
-                            yuris_script::BinOp::Mul => lhs.wrapping_mul(rhs),
-                            _ => 0,
-                        };
-                        stack.push(v);
-                    }
-                    Insn::ArrayLoad { .. } => break,
-                    _ => break,
-                }
-            }
-            if let Some(&max_idx) = stack.last() {
-                if max_idx >= 0 {
-                    let need = (max_idx + 1) as u32;
-                    match store.array_dims(&base) {
-                        None => {
-                            store.declare_array(&base, elem, &[need]);
-                            count += 1;
-                        }
-                        Some(dims) => {
-                            // 同数组多条上界声明 → 取最大(扩容保留旧值)
-                            if dims.len() == 1 && dims[0] < need {
-                                store.resize_array(&base, &[need])?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    /// 双字节首区边界值。
+    ///
+    /// **勘误(T5 取证,2026-10-16)**:旧实现只认 `0x81..=0x9F` 与
+    /// `0xE0..=0xEF`,把 `0xF0-0xFC`(CP932 用户区/IBM 扩展)当单字节 ——
+    /// 当时标注 "引擎宽度表是否也步进 2 未取到证据"(U-CP932)。现已取证:
+    /// v494 引擎表 `0x5b40a0` dump = `0x81-0x9F` 与 **`0xE0-0xFC`** 为 1
+    /// (双字节前导),`0x80/0xA0/0xFD-0xFF` 为 0;三处使用点交叉证实
+    /// (`FUN_0045543c`/`FUN_0045f0dc`/`FUN_00444f10`)。
+    #[test]
+    fn lead_byte_boundaries() {
+        // 步进 2 区间:0x81..=0x9F、0xE0..=0xFC(取证后)
+        assert_eq!(sjis_char_len(&[0x81, 0x40]), 1);
+        assert_eq!(sjis_char_len(&[0x9F, 0x40]), 1);
+        assert_eq!(sjis_char_len(&[0xE0, 0x40]), 1);
+        assert_eq!(sjis_char_len(&[0xEF, 0x40]), 1);
+        assert_eq!(sjis_char_len(&[0xF0, 0x40]), 1, "0xF0 取证为前导(T5)");
+        assert_eq!(sjis_char_len(&[0xFC, 0x40]), 1, "0xFC 取证为前导(T5)");
+        // 区间外:0x80 / 0xA0 / 0xFD / 0xFF 仍按**单字节**步进(表为 0)
+        assert_eq!(sjis_char_len(&[0x80, 0x40]), 2);
+        assert_eq!(sjis_char_len(&[0xA0, 0x40]), 2);
+        assert_eq!(sjis_char_len(&[0xFD, 0x40]), 2);
+        assert_eq!(sjis_char_len(&[0xFF, 0x40]), 2);
     }
-    Ok(count)
-}
 
-/// 声明类命令集合(加载期数据,运行器不执行):INT/FLT/STR 及全局/局部/存档变量族。
-fn is_declaration(cmd: u8) -> bool {
-    // 精确集合(来自 YSCM 名表):F_*/G_*/S_* 变量声明族 + INT/FLT/STR/VAR 单声明。
-    // 注意:0x2a=GO、0x2b=GOSUB、0x29=G_FLT3? —— 0x29 是 G_VAR,保留。
-    matches!(
-        cmd,
-        0x10..=0x13                          // F_FLT/F_INT/F_STR/F_VAR
-            | 0x1d..=0x29                     // G_FLT?..G_VAR(全局声明族)
-            | 0x52..=0x55                     // S_FLT/S_INT/S_STR/S_VAR
-            | 0x19                            // FLT(局部)
-            | 0x5c                            // STR(局部)
-            | 0x65                            // VAR(局部)
-            | 0x32                            // INT(局部)
-    )
-}
-
-/// 值摘要(事件记录用;Str 截断到 24 字节防爆炸)。
-fn value_summary(v: &Value) -> String {
-    match v {
-        Value::Int(n) => format!("int:{n}"),
-        Value::Float(f) => format!("flt:{f}"),
-        Value::Str(b) => {
-            let shown: Vec<u8> = b.iter().copied().take(24).collect();
-            format!("str:{}..({}B)", String::from_utf8_lossy(&shown), b.len())
-        }
+    /// 截断的双字节(串尾只剩余首字节)—— 仍计 1 字符,不 panic、不越界。
+    #[test]
+    fn truncated_lead_byte_at_tail_is_safe() {
+        assert_eq!(sjis_char_len(&[0x93]), 1);
+        assert_eq!(sjis_char_len(b"A\x93"), 2);
     }
+
+    // ---- varact_char_to_byte:字符序数 → 字节偏移 ----
+
+    /// 语义:返回第 `ordinal` 个字符的**字节起始偏移**;
+    /// `ordinal == 字符数` 时返回**串尾偏移**(排他上界,调用方切片用);
+    /// 仅 `ordinal > 字符数` 才是 `None`。
+    #[test]
+    fn char_to_byte_ascii_and_bounds() {
+        let s = Value::Str(b"ABC".to_vec());
+        assert_eq!(varact_char_to_byte(&s, 0), Some(0));
+        assert_eq!(varact_char_to_byte(&s, 2), Some(2));
+        assert_eq!(
+            varact_char_to_byte(&s, 3),
+            Some(3),
+            "== 字符数 → 串尾(排他上界)"
+        );
+        assert_eq!(varact_char_to_byte(&s, 4), None, "> 字符数 → None");
+        assert_eq!(varact_char_to_byte(&s, usize::MAX), None);
+    }
+
+    #[test]
+    fn char_to_byte_mixed_widths() {
+        // 'ｱ'(1B) + '日'(2B) + 'b'(1B) = 4 字节 / 3 字符
+        let s = Value::Str(vec![0xB1, 0x93, 0xFA, 0x62]);
+        assert_eq!(varact_char_to_byte(&s, 0), Some(0));
+        assert_eq!(varact_char_to_byte(&s, 1), Some(1));
+        assert_eq!(varact_char_to_byte(&s, 2), Some(3));
+        assert_eq!(varact_char_to_byte(&s, 3), Some(4), "== 字符数 → 串尾");
+        assert_eq!(varact_char_to_byte(&s, 4), None);
+    }
+
+    #[test]
+    fn char_to_byte_non_string_is_none() {
+        assert_eq!(varact_char_to_byte(&Value::Int(1), 0), None);
+    }
+
+    // ---- varact_ascii_case:UPPER/LOWER 的 SJIS 感知 ----
+
+    #[test]
+    fn ascii_case_conversion() {
+        assert_eq!(varact_ascii_case(b"aBc", true), b"ABC".to_vec());
+        assert_eq!(varact_ascii_case(b"aBc", false), b"abc".to_vec());
+    }
+
+    /// 陷阱:双字节**尾字节**可能落在 ASCII 字母区(SJIS 尾区 0x40–0x7E),
+    /// 若按单字节扫描就会被错误改写。实现按首区跳 2,必须原样保留。
+    #[test]
+    fn trail_byte_in_ascii_letter_range_is_untouched() {
+        // 0x93 0x61:首 0x93 在前导区,尾 0x61 = 'a'
+        let s = vec![0x93u8, 0x61];
+        assert_eq!(varact_ascii_case(&s, true), s, "尾字节 'a' 不得被大写化");
+        assert_eq!(varact_ascii_case(&s, false), s);
+    }
+
+    /// 半角片假名(0xA1–0xDF)不得被大小写转换。
+    #[test]
+    fn halfwidth_katakana_untouched_by_case_ops() {
+        let s = vec![0xB1u8, 0xDF];
+        assert_eq!(varact_ascii_case(&s, true), s);
+        assert_eq!(varact_ascii_case(&s, false), s);
+    }
+
+    /// 单字节区间外侧(0x80 / 0xA0 / 0xFD)按实现语义:非字母 → 原样。
+    ///
+    /// **勘误(T5,2026-10-16)**:旧用例含 `0xF0` 并按"单字节"断言 ——
+    /// 0xF0 现取证为**双字节前导**(见 `lead_byte_boundaries`),此处改用
+    /// 表确认为 0 的 0xFD 作样例。
+    #[test]
+    fn non_ascii_single_bytes_untouched() {
+        let s = vec![0x80u8, 0xA0, 0xFD];
+        assert_eq!(varact_ascii_case(&s, true), s);
+    }
+
+    // U-CP932(**已解除**,T5 取证 2026-10-16):
+    //   0xF0–0xFC 前导区问题已定性 —— v494 引擎表 0x5b40a0 dump 显示
+    //   0x81-0x9F 与 0xE0-0xFC 为 1(双字节前导),0xFD-0xFF 为 0;
+    //   三处使用点(FUN_0045543c / FUN_0045f0dc / FUN_00444f10)交叉证实。
+    //   实现已按此修正(见 util.rs `is_sjis_lead`)。
 }
 
-/// 值真值(引擎真值语义 Unknown → 仅实现 Int!=0/非空串,**Likely**;
-/// Float/其他 → 显式报错,不猜)。
-fn value_truthy(v: &Value) -> Result<bool> {
-    match v {
-        Value::Int(i) => Ok(*i != 0),
-        Value::Str(s) => Ok(!s.is_empty()),
-        Value::Float(_) => Err(Error::Unimplemented("float 真值语义")),
+#[cfg(test)]
+mod truthy_tests {
+    use super::value_truthy;
+    use yuris_value::Value;
+
+    /// 三类元素类型的真值语义(为 Float 补的回归;原先 Float 直接报未实现)。
+    #[test]
+    fn truthiness_across_element_types() {
+        assert!(value_truthy(&Value::Int(1)).unwrap());
+        assert!(!value_truthy(&Value::Int(0)).unwrap());
+        assert!(value_truthy(&Value::Str(b"x".to_vec())).unwrap());
+        assert!(!value_truthy(&Value::Str(Vec::new())).unwrap());
+        assert!(value_truthy(&Value::Float(0.5)).unwrap());
+        assert!(value_truthy(&Value::Float(-0.5)).unwrap());
+        assert!(!value_truthy(&Value::Float(0.0)).unwrap());
     }
 }

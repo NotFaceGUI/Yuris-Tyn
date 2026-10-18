@@ -17,7 +17,7 @@ fn main() {
     // ---- 1. sysse/SE 条目清单 + sse01~06 提取 ----
     let mut sse_keys: Vec<String> = index
         .keys()
-        .map(|k| String::from_utf8_lossy(k).into_owned())
+        .map(|k| k.strip_root().display())
         .filter(|k| k.to_ascii_lowercase().contains("sse"))
         .collect();
     sse_keys.sort();

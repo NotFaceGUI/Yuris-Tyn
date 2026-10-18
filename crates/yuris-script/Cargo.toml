@@ -8,6 +8,7 @@ description = "L2：变长 VM 字节码 -> Instruction IR。未识别 opcode 保
 
 [dependencies]
 yuris-core = { workspace = true }
+yuris-log = { workspace = true }
 yuris-value = { workspace = true }
 
 [dev-dependencies]

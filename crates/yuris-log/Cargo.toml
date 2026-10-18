@@ -1,0 +1,9 @@
+[package]
+name = "yuris-log"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "统一日志与致命错误汇聚层：等级过滤、环形缓存、画布错误窗数据源。"
+
+[dependencies]

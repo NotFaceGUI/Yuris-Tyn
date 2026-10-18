@@ -70,7 +70,7 @@ impl SceneBridge {
                     let (x, y, z) = position.unwrap_or((0, 0, 0));
                     let layer = Layer::new(
                         num,
-                        z as i32,
+                        z,
                         x as f32,
                         y as f32,
                         Some(ResourceId(num)),
@@ -91,6 +91,14 @@ impl SceneBridge {
                         clear: *clear_flag,
                     });
                     changed = true;
+                }
+                // **媒体模式**(T23b):MOVIE/FLASH 播放期间屏蔽其他图层
+                // (手册原文见 `Scene::media_mode`)。置/清都算可视变化 ——
+                // 退出模式时其他层要重新出现,上层必须重绘。
+                VmEvent::MediaMode { on, .. } => {
+                    if self.scene.set_media_mode(*on) {
+                        changed = true;
+                    }
                 }
                 _ => {}
             }

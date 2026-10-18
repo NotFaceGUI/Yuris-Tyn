@@ -8,5 +8,6 @@ description = "Value 类型与变量存储。YU-RIS 的类型转换语义在此�
 
 [dependencies]
 yuris-core = { workspace = true }
+yuris-log = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

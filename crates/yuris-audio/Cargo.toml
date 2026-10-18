@@ -4,10 +4,18 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "L6：AudioBackend 实现（BGM / SE / Voice 通道语义）。"
+description = "L6：音频后端（按 SOUND 声层 ID 建模的 BGM / SE / Voice 播放与查询）。"
+
+[features]
+default = ["device"]
+# 真实声卡输出（cpal）。关闭后得到可确定性渲染的无头实现，供测试/服务端/未来 Android 壳替换。
+device = ["dep:cpal"]
 
 [dependencies]
 yuris-core = { workspace = true }
+yuris-log = { workspace = true }
 yuris-runtime = { workspace = true }
+yuris-scene = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
+symphonia = { workspace = true }
+cpal = { workspace = true, optional = true }

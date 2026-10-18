@@ -152,6 +152,7 @@ impl winit::application::ApplicationHandler for App {
                         alpha,
                         rotation: 0.0,
                         resource: Some(ResourceId(ID_LOGO)),
+                                        ..Default::default()
                     });
                 } else {
                     // 注意事项图:铺满逻辑区(按实际尺寸缩放)
@@ -167,6 +168,7 @@ impl winit::application::ApplicationHandler for App {
                         alpha: 1.0,
                         rotation: 0.0,
                         resource: Some(ResourceId(ID_ATTENTION)),
+                                        ..Default::default()
                     });
                 }
                 if let Err(e) = backend.render(&scene) {

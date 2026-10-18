@@ -11,6 +11,8 @@
 //! | [`ysvr`] | YSVR 变量定义表（`ysv.ybn`） | Confirmed |
 //! | [`yssd`] | YSSD 系统数据（`save/*.sd`）+ SNP 解码 | Confirmed |
 //! | [`yslb`] | YSLB 标签表（`ysl.ybn`，GO/GOSUB 目标） | Confirmed |
+//! | [`ystl`] | YSTL 脚本名表（`yst_list.ybn`，脚本槽 ↔ 源文件/文本数） | Confirmed |
+//! | [`scriptpos`] | `SCRIPTPOS` 执行位置字符串（容器格式 Confirmed；引擎字节兼容未验证） | 部分确认 |
 //!
 //! 规格文档：`docs/formats/ypf.md`、`docs/formats/ystb.md`、`docs/formats/yscm.md`、
 //! `docs/engine/command-layer.md`。
@@ -22,6 +24,8 @@ pub mod ypf;
 pub mod yscf;
 pub mod yscm;
 pub mod yslb;
+pub mod ystl;
+pub mod scriptpos;
 pub mod ystb;
 pub mod ysvr;
 pub mod yssd;

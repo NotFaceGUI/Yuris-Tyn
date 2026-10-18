@@ -228,6 +228,30 @@ pub(crate) fn resolve(op: u8, operand: &[u8]) -> Insn {
     }
 }
 
+/// 编译器对「**实参缺席**」的发射形态判定。
+///
+/// **实测形态（本机，引擎 494 第三方发行版，全语料扫描）**：窗口内容恰为
+/// `42 01 00 00 41 00 00` —— `PushInt(0)` 紧跟一个**未填右操作数**的 `0x41`
+/// （bit-and）。裸跑该序列在栈机上必然操作数不足。
+///
+/// **语料统计支撑**：全语料共 20 个窗口以 `41 00 00` 结尾，其中 **19 个**
+/// 左右操作数齐全（`X & 0xff` 之类的掩码，如 `48 03 00 40 0c 0d 57 02 00 ff 00 41 00 00`）；
+/// **唯一**缺操作数的那个正是 s91 `ES.DEBUG.DEFINE` 里「无值」的分隔行实参
+/// （`es.DBG.VAR.DEF("--------------------", <无值>)`）。
+///
+/// **手册侧概念对应**：系统变量页 `@_PFLG(n)` =「GOSUB 跳转源是否存在
+/// PINT/PFLT/PSTR」—— 引擎把「实参不存在」当作一等概念。
+///
+/// 本函数**只承认这一种已观测形态**；其它「操作数不足」一律不认（沿用报错），
+/// 因为引擎对该情形的机械行为仍属 Unknown。
+pub fn is_absent_arg_idiom(instrs: &[Instruction]) -> bool {
+    matches!(
+        instrs,
+        [a, b]
+            if matches!(a.kind, Insn::PushInt(_)) && matches!(b.kind, Insn::Binary(_))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +261,28 @@ mod tests {
         let mut v = decode_window(window).unwrap();
         assert_eq!(v.len(), 1);
         v.remove(0).kind
+    }
+
+    #[test]
+    fn absent_arg_idiom_is_the_unfilled_operator_form() {
+        // 实测形态 `42 01 00 00 41 00 00`(s91 g48 的「无值」分隔行实参)。
+        let b = [0x42, 0x01, 0x00, 0x00, 0x41, 0x00, 0x00];
+        let ins = decode_window(&b).unwrap();
+        assert!(is_absent_arg_idiom(&ins), "{ins:?}");
+
+        // 补齐操作数的 bit-and(`X & 0xff` 掩码)不是缺席记号 ——
+        // 全语料 20 个以 `41 00 00` 结尾的窗里,19 个是这一形态。
+        let full = [
+            0x48, 0x03, 0x00, 0x40, 0x0c, 0x0d, // PushVar(@, 0x0d0c)
+            0x57, 0x02, 0x00, 0xff, 0x00, // PushInt16(0xff)
+            0x41, 0x00, 0x00, // BitAnd
+        ];
+        let ins2 = decode_window(&full).unwrap();
+        assert!(!is_absent_arg_idiom(&ins2), "{ins2:?}");
+
+        // 单个字面量也不是。
+        let one_ins = decode_window(&[0x42, 0x01, 0x00, 0x00]).unwrap();
+        assert!(!is_absent_arg_idiom(&one_ins));
     }
 
     #[test]

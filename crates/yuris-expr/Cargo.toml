@@ -10,4 +10,3 @@ description = "表达式引擎：Token -> AST -> Evaluator。不转译成其他�
 yuris-core = { workspace = true }
 yuris-value = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }

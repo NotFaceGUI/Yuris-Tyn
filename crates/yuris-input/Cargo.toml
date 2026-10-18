@@ -4,10 +4,16 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "L6：InputBackend 实现（点击 / 选择 / Skip）。"
+description = "L6：输入层（引擎键/鼠标/手柄状态机、键映射、坐标反算、命中测试、平台适配）。"
+
+[features]
+default = []
+# 桌面窗口事件适配（winit 0.30）。VM 侧只依赖纯模型，不启用本特性。
+winit = ["dep:winit"]
 
 [dependencies]
 yuris-core = { workspace = true }
 yuris-runtime = { workspace = true }
+yuris-log = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
+winit = { workspace = true, optional = true }

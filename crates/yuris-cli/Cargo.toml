@@ -8,13 +8,14 @@ description = "播放器入口。"
 
 [dependencies]
 yuris-core = { workspace = true }
+yuris-log = { workspace = true }
 yuris-format = { workspace = true }
 yuris-resource = { workspace = true }
 yuris-vm = { workspace = true }
 yuris-scene = { workspace = true }
+yuris-stage = { path = "../yuris-stage" }
 yuris-value = { workspace = true }
 fontdue = { workspace = true }
-rodio = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,13 +24,12 @@ encoding_rs = "0.8"
 yuris-runtime = { workspace = true }
 yuris-player-core = { path = "../yuris-player-core" }
 yuris-render = { workspace = true }
+yuris-debug = { workspace = true }
 yuris-audio = { workspace = true }
-yuris-input = { workspace = true }
+yuris-input = { workspace = true, features = ["winit"] }
 yuris-save = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 bytemuck = { workspace = true }
 winit = { workspace = true }
 wgpu = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }

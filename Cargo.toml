@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/yuris-core",
+    "crates/yuris-log",
     "crates/yuris-format",
     "crates/yuris-value",
     "crates/yuris-script",
@@ -15,7 +16,9 @@ members = [
     "crates/yuris-input",
     "crates/yuris-save",
     "crates/yuris-scenario",
+    "crates/yuris-stage",
     "crates/yuris-tools",
+    "crates/yuris-debug",
     "crates/yuris-player-core",
     "crates/yuris-cli",
 ]
@@ -28,8 +31,14 @@ license = "GPL-3.0-or-later"
 repository = ""
 
 [workspace.dependencies]
+# --- 通用小依赖 ---
+# 热路径哈希表(`insn_cache`:每帧约 70 万次查表)用 FxHash:键是
+# `(script_id, offset, len)` 这类整数元组,SipHash 的 DoS 防护在这里纯属开销。
+rustc-hash = "2"
+
 # --- internals ---
 yuris-core     = { path = "crates/yuris-core" }
+yuris-log      = { path = "crates/yuris-log" }
 yuris-format   = { path = "crates/yuris-format" }
 yuris-value    = { path = "crates/yuris-value" }
 yuris-script   = { path = "crates/yuris-script" }
@@ -43,6 +52,7 @@ yuris-audio    = { path = "crates/yuris-audio" }
 yuris-input    = { path = "crates/yuris-input" }
 yuris-save     = { path = "crates/yuris-save" }
 yuris-scenario = { path = "crates/yuris-scenario" }
+yuris-debug    = { path = "crates/yuris-debug" }
 
 # --- externals ---
 thiserror          = "2"
@@ -64,7 +74,7 @@ wgpu               = "24"
 winit              = "0.30"
 pollster           = "0.4"
 fontdue            = "0.9"
-rodio              = { version = "0.19", features = ["vorbis"] }
+cpal               = "0.15"
 bytemuck           = "1"
 
 [profile.release]

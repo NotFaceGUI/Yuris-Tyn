@@ -30,11 +30,11 @@
 //! (繁中版)36 文件中 34 个含高位字节的文件**SJIS 严格解码全部失败**,
 //! 而 **Big5(CP950)全部成功**(如 maho2_22 的 `\LT` 文本解码为繁体中文)。
 //! YU-RIS 引擎本身为日文引擎(日文原版应为 SJIS),剧本编码随发行版本地化
-//! 而定。因此顶层 API 提供两个入口:
+//! 而定。因此提供三个入口(2026-10-16 起生产路径用第三个):
 //!
-//! - [`parse_scenario`]:默认 **SJIS**(任务规格/日文原版默认);
-//! - [`parse_scenario_with`]:显式指定编码(本样本须用
-//!   `encoding_rs::BIG5`,见 `tests/real_sample.rs`)。
+//! - [`parse_scenario_auto`]: **数据侧判定**(新,生产路径);
+//! - [`parse_scenario`]: 默认 **SJIS**(任务规格/日文原版默认);
+//! - [`parse_scenario_with`]: 显式指定编码(诊断/带外信息场景)。
 //!
 //! 解码失败(非法字节序列)**报错**并给出行号,不做替换字符静默吞。
 //!
@@ -163,6 +163,104 @@ pub fn parse_scenario(bytes: &[u8]) -> Result<Scenario> {
 /// [`ScenarioError::Decode`] 并携带该行行号(不做替换字符静默吞)。
 pub fn parse_scenario_with(bytes: &[u8], encoding: &'static Encoding) -> Result<Scenario> {
     parser::parse(bytes, encoding)
+}
+
+// ---------------------------------------------------------------------------
+// 跨层文本编码策略(T1 + T21 一次定稿;数据侧判定,全层唯一入口)
+// ---------------------------------------------------------------------------
+//
+// 历史缺陷(2026-10-16 审查):编码在两个层各写死一个方向且**互相矛盾** ——
+// 剧本层写死 Big5(`player-core/scenario.rs`,繁中样本),VM 文本层写死 SJIS
+// (`player-core/lib.rs` `WORD` 显示,日文引擎默认)。两个方向各自只因台词
+// 恰好走另一条路径而未爆:CP932 作品走剧本层即整篇乱码,Big5 作品走 VM 层
+// 即整篇乱码。
+//
+// 定稿策略:**数据侧判定、全层生效**。判定规则(确定性):
+//
+// 1. strict 解码只有一方**无非法字节** → 取该方;
+// 2. 两方都无非法字节(歧义)→ 取**半角片假名更少**的一方
+//    (见下「歧义票」);数量相同 → SJIS(引擎默认);
+// 3. 两方都有非法字节 → **报错**(不静默替换、不猜)。
+//
+// 为什么 SJIS 优先:YU-RIS 是日文引擎,日文原版 / 官方 SDK 语料(SJIS/CP932)
+// 是规范形态;Big5 只在繁中本地化版本出现(样本实测:36 文件中 34 个含高位
+// 字节的文件 SJIS 严格解码全部失败而 Big5 全部成功 —— 即对该语料两方向
+// 在**文件级**互斥,优先序不引入歧义)。
+//
+// **歧义票(为何需要,证据等级 Likely)**:Big5 汉字(= 高位双字节)可能恰好
+// 落在 SJIS 的合法编码空间里 —— 实测(2026-10-16 探针,`tmp_enc_probe`):
+//
+// | 文本 | Big5 字节 | SJIS 严格解码 | Big5 严格解码 |
+// |---|---|---|---|
+// | `測試` | `b4 fa b8 d5` | `ｴ弴ﾕ`(合法!)| `測試` |
+// | `開始` | `b6 7d a9 6c` | `ｶ}ｩl`(合法!)| `開始` |
+// | `中文` | `a4 a4 a4 e5` | 非法 | `中文` |
+//
+// 即 Big5 文本与 SJIS **唯一可能的偶然重合形态 = 半角片假名串**
+// (SJIS 半角片假名 0xA1–0xDF 单字节区 + 0x40–0x7E ASCII 尾字节)。
+// 反过来,日文剧本经 CP932 解码不会产生大片半角片假名(全角假名/汉字),
+// 故「半角片假名字节占比」是有效判别票。纯 ASCII 两方解码逐字节相同
+// (半角计数同为 0)→ 落回 SJIS 默认,结果无差异。
+//
+// 不做的事:不按**单个字符串**报错或猜测 —— 判定的调用场景是整份剧本 /
+// 整条台词(字节量足够),短串歧义留给上层按本项目其它证据处理。
+
+/// 数据侧编码判定错误:两种候选编码都存在非法字节序列。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("文本编码判定失败:SJIS 与 Big5 严格解码均有非法字节序列(数据既非日文亦非繁中语料;)")]
+pub struct UndecodableText;
+
+/// 半角片假名字节计数(U+FF61–U+FF9F;判定的歧义票,见模块文档)。
+fn halfwidth_katakana_count(text: &str) -> usize {
+    text.chars()
+        .filter(|c| ('\u{FF61}'..='\u{FF9F}').contains(c))
+        .count()
+}
+
+/// **数据侧编码判定**(跨层唯一策略,见模块文档)。
+///
+/// 返回 `Ok(encoding)` = 按「strict 有效性 → 歧义票」选出的编码;
+/// 两种候选都失败 → [`UndecodableText`](不静默替换、不猜)。
+pub fn detect_encoding(bytes: &[u8]) -> std::result::Result<&'static Encoding, UndecodableText> {
+    let mut valid: Vec<(&'static Encoding, bool, usize)> = Vec::new();
+    for enc in [encoding_rs::SHIFT_JIS, encoding_rs::BIG5] {
+        let (text, had_errors) = enc.decode_without_bom_handling(bytes);
+        if !had_errors {
+            valid.push((enc, true, halfwidth_katakana_count(&text)));
+        }
+    }
+    match valid.as_slice() {
+        // 单方合法 → 直接取该方(语料主体形态)
+        [(enc, _, _)] => Ok(*enc),
+        // 双方合法(歧义)→ 半角片假名更少者;相同 → SJIS(引擎默认)
+        [(s_enc, _, s_hw), (b_enc, _, b_hw)] => {
+            Ok(if b_hw < s_hw { *b_enc } else { *s_enc })
+        }
+        _ => Err(UndecodableText),
+    }
+}
+
+/// **跨层文本解码**(剧本层 / VM `WORD`·`TEXT` 台词 / 标题 caption 共用)。
+///
+/// 与 [`detect_encoding`] 同策略:判不出 → `Err`(调用方须显式处理,
+/// 不得回落到某个写死编码)。
+pub fn decode_text(bytes: &[u8]) -> std::result::Result<String, UndecodableText> {
+    let enc = detect_encoding(bytes)?;
+    let (text, _) = enc.decode_without_bom_handling(bytes);
+    Ok(text.into_owned())
+}
+
+/// 解析剧本(**数据侧判定编码**;T1 定稿入口)。
+///
+/// 与 [`parse_scenario`](写死 SJIS)/[`parse_scenario_with`](显式编码)并列;
+/// 生产路径(播放器装载 sc.ypf 条目)应走本入口 —— 定位不再依赖某一版
+/// 本地化的写死编码。
+pub fn parse_scenario_auto(bytes: &[u8]) -> Result<Scenario> {
+    let enc = detect_encoding(bytes).map_err(|_| ScenarioError::Decode {
+        line: 1,
+        encoding: "SJIS/Big5(数据侧判定均失败)",
+    })?;
+    parser::parse(bytes, enc)
 }
 
 #[cfg(test)]

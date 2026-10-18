@@ -1,0 +1,10 @@
+[package]
+name = "yuris-stage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+yuris-log = { workspace = true }
+yuris-scene = { path = "../yuris-scene" }
+
+[dev-dependencies]

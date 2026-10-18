@@ -8,6 +8,5 @@ description = "错误类型、版本 Profile、字节工具（XOR / 定长整数
 
 [dependencies]
 thiserror = { workspace = true }
-tracing = { workspace = true }
 serde = { workspace = true }
 byteorder = { workspace = true }

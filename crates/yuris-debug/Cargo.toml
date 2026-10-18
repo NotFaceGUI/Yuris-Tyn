@@ -1,0 +1,17 @@
+[package]
+name = "yuris-debug"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "调试框架:FPS 与 VM 运行时序 HUD(独立调试窗)。"
+
+[dependencies]
+yuris-log = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+# 取 HWND 用(winit/wgpu 的传递依赖,零新增编译成本;Windows 分层窗口路径)。
+raw-window-handle = "0.6"
+fontdue = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }

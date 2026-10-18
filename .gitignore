@@ -40,3 +40,12 @@ __pycache__/
 tmp_*.py
 tmp_*.txt
 bt_probe.log
+
+# ===== 实机截图/抓帧(分析工作产物,不入库;文件保留在磁盘)=====
+shots_*/
+dump_tex/
+
+# ===== 参考压缩包(不入库;文件保留在磁盘)=====
+*.rar
+
+AGENTS.md

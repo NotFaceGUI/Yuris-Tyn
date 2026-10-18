@@ -8,9 +8,9 @@ description = "资源管理器：懒加载 + LRU 缓存 + 免封包目录覆盖�
 
 [dependencies]
 yuris-core = { workspace = true }
+yuris-log = { workspace = true }
 yuris-format = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 lru = { workspace = true }
 image = { workspace = true }
 symphonia = { workspace = true }

@@ -124,7 +124,7 @@ fn main() {
                     ));
                 }
             }
-            yuris_vm::VmEvent::CgAct { pc, id, evaluated } => {
+            yuris_vm::VmEvent::CgAct { pc, id, evaluated, .. } => {
                 *by_script.entry((0, 2)).or_default() += 1;
                 if interesting.len() < 60 {
                     interesting.push(format!("CgAct pc{pc} id={id:?} ev={evaluated:?}"));

@@ -118,7 +118,7 @@ impl ResourceStack {
             match YpfReader::open(p, self.name_key) {
                 Ok(r) => self.packs.push(r),
                 Err(Error::BadMagic { .. }) => {
-                    tracing::info!(path = ?p, "跳过非 YPF 文件(ASF/WMV 等)");
+                    yuris_log::debug!("跳过非 YPF 文件(ASF/WMV 等): {p:?}");
                 }
                 Err(e) => return Err(e.into()),
             }

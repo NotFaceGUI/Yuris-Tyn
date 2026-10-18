@@ -10,6 +10,19 @@ pub fn make_ystb(
     groups: &[(u8, u8, u16)],               // (command_type, window_count, param)
     windows: &[([u8; 4], u32, u32, &[u8])], // (tag, len, offset, content)
 ) -> Vec<u8> {
+    make_ystb_version(key, 555, groups, windows)
+}
+
+/// 同 [`make_ystb`]，但可指定 YSTB header 的**引擎版本号**。
+///
+/// 跨版本分派测试用：脚本的 `command_type` 序号必须与 header 声明的引擎版本
+/// 一致（VM 据此选分派表）。
+pub fn make_ystb_version(
+    key: [u8; 4],
+    version: u32,
+    groups: &[(u8, u8, u16)],
+    windows: &[([u8; 4], u32, u32, &[u8])],
+) -> Vec<u8> {
     fn xor_region(region: &[u8], key: [u8; 4]) -> Vec<u8> {
         region.iter().enumerate().map(|(i, b)| b ^ key[i % 4]).collect()
     }
@@ -45,7 +58,7 @@ pub fn make_ystb(
 
     let mut out = Vec::new();
     out.extend_from_slice(b"YSTB");
-    out.extend_from_slice(&555u32.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
     out.extend_from_slice(&(p1.len() as u32).to_le_bytes());
     out.extend_from_slice(&(cm.len() as u32).to_le_bytes());

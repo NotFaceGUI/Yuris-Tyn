@@ -1,6 +1,6 @@
 {
  "_meta": {
-  "source": "AnimalTrailGirlishSquare 2/pac/bn.ypf -> %ysbin\\ysc.ybn",
+  "source": "<game-a>/pac/bn.ypf -> %ysbin\\ysc.ybn",
   "engine_version": 555,
   "command_count": 121,
   "header_A": 121,

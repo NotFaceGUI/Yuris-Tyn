@@ -95,9 +95,18 @@ impl YscfFile {
     }
 }
 
-/// caption 编码 Unknown（样本为 ASCII）。先按 ASCII 容错解码。
+/// caption 解码。
+///
+/// **勘误（2026-10-13）**：原实现把非 ASCII 字节一律换成 `'?'`，注释写「编码 Unknown
+/// （样本为 ASCII）」—— 那只对 v555 样本（`Kemonomichi Girlish Square 2`）成立。
+/// 实测第三方发行版（引擎 494）的 `yscfg.ybn` caption 是 **Shift-JIS**
+/// （字节 `83 52 83 67 83 6c 83 43 83 8d` + `ver1.02`），原实现解出 `????ver1.02`。
+/// 现按 SJIS 解码（纯 ASCII 输入结果与旧实现逐字符相同，样本行为不变）。
+/// 证据：`crates/yuris-tools --example entry_dump -- <游戏目录> yscfg.ybn`。
 fn decode_caption(b: &[u8]) -> String {
-    b.iter()
-        .map(|&c| if c.is_ascii_graphic() || c == b' ' { c as char } else { '?' })
-        .collect()
+    if b.iter().all(|c| c.is_ascii_graphic() || *c == b' ') {
+        return b.iter().map(|&c| c as char).collect();
+    }
+    let (s, _, _) = encoding_rs::SHIFT_JIS.decode(b);
+    s.into_owned()
 }

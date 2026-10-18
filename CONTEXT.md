@@ -5,7 +5,7 @@
 ## 项目与方法
 
 **YurisKernel**:
-本项目产物：YU-RIS 引擎兼容运行内核（Rust workspace，17 crates）。
+本项目产物：YU-RIS 引擎兼容运行内核（Rust workspace，18 crates）。
 _Avoid_: Yuris-Tyn（那是仓库名）、模拟器（本项目是兼容重实现，非模拟）
 
 **样本游戏**:
@@ -147,5 +147,59 @@ _Avoid_: 单 VM 全接管（目标态，尚未达成）
 sc.ypf 内的明文台词脚本（SJIS/Big5，`scenario*.txt`）：背景/立绘/淡入淡出/双语台词，独立于 YSTB 字节码。
 _Avoid_: 脚本（"脚本"专指 YSTB）
 
+**声层（SoundLayer）**:
+`SOUND` 命令操作的音频对象：以脚本给的 `ID` 字符串为键，一个 ID 一条流。
+`SOUND` 换 `FILE` = 替换源，不同 ID 并行混音，`SOUNDEND[ID]` 删除，`SOUNDINFO[ID]` 查询。
+**不是**固定 BGM/SE/Voice 三通道（那只是播放器侧桥接约定，见 `yuris_audio::compat`）。
+语料实测 ID 形态为 `BGM/B1`、`VO/A1`、`:/S0/…`；`FILE` 为带目录、无扩展名的 CP932 名字。
+_Avoid_: 音轨、通道（"通道"仅指 PCM 声道数 CHANNEL）
+
 **VersionProfile（版本 Profile）**:
-按引擎版本分支的兼容性配置点（如 v555 的 YSTB 布局与 content 语义）。跨版本差异必须走 Profile，不得散落硬编码。
+按引擎版本分支的兼容性配置点（如 YSTB 布局与 content 语义）。跨版本差异必须走 Profile，不得散落硬编码。
+_Avoid_: 用样本游戏名指代版本（profile 一律按**引擎版本号**命名，不绑定某一款游戏）
+
+**CommandProfile（命令 Profile）**:
+一个引擎版本的**命令名 ↔ 序号**表，由启动链从游戏自己的 `ysc.ybn`（YSCM）构建。序号 = YSCM 表次序；YSTB part1 的 `command_type` 字节即此序号。
+_Avoid_: 命令常量表（`cmd::*` 只是某一版序号的留存常量，**不参与分派**）
+
+**引擎版本号 / SDK 版本号**:
+`ysc.ybn`（YSCM）header 的 `version` 字段，也是 `yst*.ybn`（YSTB）header 的 `version` 字段。官方 SDK 与发行游戏共用同一编号空间（实测：SDK 0.479 / 0.495；发行 494 / 555）。
+命令表**以官方 SDK 为准**（`YSCom.ycd` 的命令序 == 运行期 `ysc.ybn` 的命令序，两版实测逐条相同）；SDK 未覆盖的版本只能靠游戏自身 YSCM。
+
+**CmdKind（命令种类）**:
+与版本无关的命令分类（`Go` / `Wait` / `VarAct` / …）。运行期分派链路：
+`YSTB part1 byte0 → CommandProfile.name_of(index) → CmdKind::from_name(name) → 处理器`。
+分类只认**命令名**，因为名字跨版本稳定、序号会漂移（实测两版共有 116 条命令中 104 条序号不同）。
+_Avoid_: 按序号 `match`（跨版本必然错位）
+
+**未解析分派（unresolved）**:
+引擎版本不在内置表、且尚未注入游戏 YSCM 时的分派态。任何命令都得到 `CmdKind::Other` → 显式报未实现（`strict` 下挂起）。
+**不得**用某个无关版本的内置表兜底执行 —— 那是静默的错误语义。
+
+## 诊断与日志
+
+**日志器（Logger / `yuris-log`）**:
+全仓库唯一的日志入口（`crates/yuris-log`）：等级过滤 + 环形缓存 + stderr/文件输出端 + 致命错误汇聚。
+等级语义 = 「至少这么严重才输出」：阈值 `warn` 放行 warn/error/fatal。
+_Avoid_: 各 crate 自建 eprintln 前缀体系、tracing/log 双轨并行
+
+**日志等级（Level）**:
+`Trace`（逐指令/逐事件取证）/ `Debug`（诊断细节）/ `Info`（生命周期与状态变化）/
+`Warn`（可恢复异常：资源缺失、未实装特性）/ `Error`（功能失败但可继续）/ `Fatal`（崩坏级）。
+运行期由 `YURIS_LOG_LEVEL` 统一控制，`Off` 仅作阈值。
+
+**崩坏级错误（Fatal）**:
+使游戏无法继续的错误（图形后端初始化失败、渲染连续失败、strict 下 VM 挂起、事件循环异常）。
+与 `Error` 的区别：`Fatal` **旁路等级阈值**、生成 `FatalReport`、并在画布中央渲染错误窗。
+_Avoid_: 用 panic/exit 直接了事（那样没有可读的现场）
+
+**错误窗（Fatal Overlay）**:
+画布中央的只读错误面板：标题栏 + 主消息 + 最近日志回溯 + Esc 提示。
+数据源 = `yuris_log::fatal_report()`；位图由 `yuris_player_core::overlay::build_fatal_panel`
+排版后作为最高 z 图层提交 —— 与游戏画面共用同一渲染路径（随画布/letterbox 一致缩放）。
+_Avoid_: 独立 UI 子系统、wgpu 侧另开一条错误绘制通道
+
+**日志环形缓存（Ring）**:
+`yuris-log` 内固定容量的最近记录队列（缺省 512 条，`YURIS_LOG_RING` 可调）。
+用途 = 崩溃现场回溯（错误窗只取最近 12 条，优先 warn 及以上）。它不是 trace 语料，不入库。
+_Avoid_: 把它当 trace/golden 语料

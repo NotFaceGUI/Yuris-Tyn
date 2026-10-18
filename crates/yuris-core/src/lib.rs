@@ -11,11 +11,15 @@
 #![warn(missing_docs)]
 
 pub mod bytes;
+pub mod command_params;
+pub mod commands;
 pub mod error;
 pub mod hash;
 pub mod version;
 
 pub use bytes::{decode_xor_cstring, xor_cyclic_skip, Reader};
+pub use command_params::{SDK_479_COMMAND_PARAMS, SDK_495_COMMAND_PARAMS, V555_COMMAND_PARAMS};
+pub use commands::{CommandProfile, V555_COMMAND_NAMES};
 pub use error::{Error, Result};
 pub use hash::murmur2;
 pub use version::{CharEncoding, VersionProfile};

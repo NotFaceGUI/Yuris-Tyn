@@ -92,7 +92,7 @@ def main():
 
     names = {}
     try:
-        j = json.load(open("docs/opcode/yscm-commands-v555.json"))
+        j = json.load(open("docs/opcode/yscm-commands-555.json"))
         for i, c in enumerate(j["commands"]):
             names[i] = c["name"]
     except Exception:
@@ -127,7 +127,7 @@ def main():
     for cmd in wanted:
         params = {}
         try:
-            j = json.load(open("docs/opcode/yscm-commands-v555.json"))
+            j = json.load(open("docs/opcode/yscm-commands-555.json"))
             params = {i: p[0] for i, p in enumerate(j["commands"][cmd]["params"])}
         except Exception:
             pass

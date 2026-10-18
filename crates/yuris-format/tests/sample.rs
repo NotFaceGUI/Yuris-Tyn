@@ -5,6 +5,37 @@
 //! 样本缺失时测试**跳过**（CI 里可以设 `YURIS_SAMPLE_BNYPF` 指向样本）。
 //! 所有期望值来自 `PROGRESS.md` 的实测记录，与 `scripts/probe_format.py` 交叉验证。
 
+/// 样本缺失时的**可观测**跳过(审查待办 01 T19)。
+///
+/// 旧行为:27 个用例在样本缺失时只 `eprintln!` 一行然后**报 ok** ——
+/// 默认测试输出被捕获,报告里完全看不出"没断言",`ignored` 也恒为 0。
+///
+/// 现在:① 标准前缀 `sample not found, skip:`(单条 grep 可计数);
+/// ② 追加写 `$TEMP/yuris-sample-skips.txt`(捕获也可见,`wc -l` 计数);
+/// ③ `YURIS_REQUIRE_SAMPLE=1` 时改为 panic(CI/本机强制真跑)。
+#[allow(dead_code)]
+fn skip_sample() {
+    let name = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed>")
+        .to_string();
+    let line = format!("sample not found, skip: {name}\n");
+    eprint!("{line}");
+    let dir = std::env::var_os("TEMP")
+        .or_else(|| std::env::var_os("TMP"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join("yuris-sample-skips.txt");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    if std::env::var_os("YURIS_REQUIRE_SAMPLE").is_some() {
+        panic!("YURIS_REQUIRE_SAMPLE=1 但样本缺失: {name}");
+    }
+}
+
 use yuris_core::VersionProfile;
 use yuris_format::{
     ypf::YpfArchive,
@@ -29,7 +60,7 @@ fn sample_path() -> Option<std::path::PathBuf> {
 #[test]
 fn ypf_parses_309_entries_and_closes_exactly() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -54,7 +85,7 @@ fn ypf_parses_309_entries_and_closes_exactly() {
 #[test]
 fn ypf_engine_entries_have_expected_magics() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -87,7 +118,7 @@ fn ypf_engine_entries_have_expected_magics() {
 #[test]
 fn ystb_key_is_recoverable_and_slots_are_contiguous() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -128,7 +159,7 @@ fn ystb_key_is_recoverable_and_slots_are_contiguous() {
 #[test]
 fn ystb_wrong_key_is_detected_by_contiguity() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -148,7 +179,7 @@ fn ystb_wrong_key_is_detected_by_contiguity() {
 #[test]
 fn yscf_reports_screen_and_caption() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -173,7 +204,7 @@ fn yscf_reports_screen_and_caption() {
 #[test]
 fn yscm_parses_121_commands_and_1113_params() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -226,7 +257,7 @@ fn yscm_parses_121_commands_and_1113_params() {
 #[test]
 fn ystb_sequential_file_all_windows_segment() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -257,7 +288,7 @@ fn ystb_sequential_file_all_windows_segment() {
 #[test]
 fn ystb_pool_file_key_and_windows() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -305,7 +336,7 @@ fn ystb_pool_file_key_and_windows() {
 #[test]
 fn ystb_empty_script_has_no_slots() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -326,7 +357,7 @@ fn ystb_empty_script_has_no_slots() {
 #[test]
 fn ystb_group_model_holds_on_entire_corpus() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -392,7 +423,7 @@ fn ystb_group_model_holds_on_entire_corpus() {
 #[test]
 fn yst00000_group_types_match_expected_histogram() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -425,7 +456,7 @@ fn yst00000_group_types_match_expected_histogram() {
 #[test]
 fn yst_list_is_not_a_v555_ystb() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -439,7 +470,7 @@ fn yst_list_is_not_a_v555_ystb() {
 #[test]
 fn yscm_tail_parses_as_37_crt_messages_plus_256b_table() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -468,7 +499,7 @@ fn yscm_tail_parses_as_37_crt_messages_plus_256b_table() {
 #[test]
 fn ysvr_parses_3362_entries_with_exact_closure() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -509,7 +540,7 @@ fn ysvr_parses_3362_entries_with_exact_closure() {
 #[test]
 fn yslb_parses_4153_labels_with_exact_closure() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();
@@ -541,7 +572,7 @@ fn yslb_parses_4153_labels_with_exact_closure() {
 #[test]
 fn go_and_gosub_labels_resolve_in_yslb_across_corpus() {
     let Some(p) = sample_path() else {
-        eprintln!("sample not found, skip");
+        skip_sample();
         return;
     };
     let data = std::fs::read(&p).unwrap();

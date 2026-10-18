@@ -8,13 +8,14 @@ description = "平台无关播放器核心:PlayerCore/Player/scenario 播放器/
 
 [dependencies]
 yuris-core = { workspace = true }
+yuris-log = { workspace = true }
 yuris-format = { workspace = true }
 yuris-resource = { workspace = true }
 yuris-vm = { workspace = true }
 yuris-scene = { workspace = true }
+yuris-stage = { path = "../yuris-stage" }
 yuris-value = { workspace = true }
 fontdue = { workspace = true }
-rodio = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,5 +30,4 @@ anyhow = { workspace = true }
 bytemuck = { workspace = true }
 winit = { workspace = true }
 wgpu = { workspace = true }
-tracing = { workspace = true }
 fast2s = "0.3.1"

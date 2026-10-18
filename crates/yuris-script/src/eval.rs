@@ -6,14 +6,110 @@
 //! - `Unknown` 指令:走 [`yuris_core::Error::UnresolvedOpcode`]
 //! - 未定义变量读取:报错(引擎默认值行为 Unknown,不猜)
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use yuris_core::{Error, Result};
 use yuris_value::{Value, VarRef, VarSpace, VariableStore};
 
 use crate::insn::{BinOp, Cast, Insn, Instruction};
 
+/// 引擎输入系统变量的求值快照（由 VM 每帧注入）。
+///
+/// ## 为什么放在 `yuris-script`
+///
+/// `yuris-vm` 依赖本 crate（VM → 表达式求值），输入状态机 `yuris-input`
+/// 是 L6（平台层）。求值器需要在 `load_auto`/`ArrayLoad` 里读 `@_MOUSE_X`、
+/// `@_INP(code)` 等，而这条路径不经过 VM 的 `read_var_value`。把**纯数据**
+/// 定义在这里，VM 负责从输入层填快照，依赖方向保持单向。
+///
+/// 语义：id 空间与 YSCM 系统变量表一致（SDK 0.495：133/138 = 光标，
+/// 144 = `_INP`，145/146 = `_KEYLAST`/`_MOUSELAST`，147..=166 鼠标键，
+/// 167..=275 键盘键，276..=280 手柄，281.. 计数与 `_CODE_*` 常量）。
+#[derive(Debug, Clone, Default)]
+pub struct InputVars {
+    /// 本帧声明为引擎输入系统变量的 id 集合（未声明的 id 走普通变量存储）。
+    pub claimed: std::collections::HashSet<u16>,
+    /// 标量系统变量。
+    pub scalars: HashMap<u16, i64>,
+    /// 数组型输入变量（`_PAD_UP/DOWN/LEFT/RIGHT`、`_PAD_BUTTON`）。
+    pub pad: HashMap<u16, Vec<i64>>,
+    /// `_INP` 数组（下标 = 按钮码）。
+    pub inp: Vec<i64>,
+}
+
+impl InputVars {
+    /// `_INP(code)`；越界/负值 → 0（引擎边界外读 = 类型默认值）。
+    pub fn inp_at(&self, code: i64) -> i64 {
+        if code < 0 {
+            return 0;
+        }
+        self.inp.get(code as usize).copied().unwrap_or(0)
+    }
+
+    /// 手柄数组扁平下标（与 `yuris-vm::InputSnapshot::pad_index` 同式）。
+    pub fn pad_index(id: u16, indices: &[i64]) -> Option<usize> {
+        match id {
+            // `_PAD_UP(n)`：无下标按手柄 0（引擎参数必填；不因缺省报错）。
+            276..=279 => Some(indices.first().map(|p| (*p).max(0) as usize).unwrap_or(0)),
+            280 => match indices {
+                [p, b, ..] => Some(((*p).max(0) as usize) * 32 + (*b).clamp(0, 31) as usize),
+                [p] => Some(((*p).max(0) as usize) * 32),
+                _ => Some(0),
+            },
+            _ => None,
+        }
+    }
+
+    /// 带下标的读；`None` = 该 id 不由输入层提供。
+    pub fn read(&self, id: u16, indices: &[i64]) -> Option<i64> {
+        if !self.claimed.contains(&id) {
+            return None;
+        }
+        if id == 144 {
+            return Some(self.inp_at(indices.first().copied().unwrap_or(0)));
+        }
+        if let Some(v) = self.pad.get(&id) {
+            let i = Self::pad_index(id, indices)?;
+            return Some(v.get(i).copied().unwrap_or(0));
+        }
+        // 已声明但未展开的输入 id：引擎里始终有值，缺省 0。
+        Some(self.scalars.get(&id).copied().unwrap_or(0))
+    }
+
+    /// 无下标读（引擎 0x48）：标量直读；数组取 **0 号元素**（引擎
+    /// `load_auto` 语义）。未声明的 id → `None`。
+    pub fn read_auto(&self, id: u16) -> Option<i64> {
+        if !self.claimed.contains(&id) {
+            return None;
+        }
+        if let Some(v) = self.scalars.get(&id) {
+            return Some(*v);
+        }
+        if id == 144 {
+            return Some(self.inp_at(0));
+        }
+        if let Some(v) = self.pad.get(&id) {
+            return Some(v.first().copied().unwrap_or(0));
+        }
+        Some(0)
+    }
+
+    /// 该 id 是否由输入层提供。
+    pub fn contains(&self, id: u16) -> bool {
+        self.claimed.contains(&id)
+    }
+}
+
 /// 栈式求值器。
 pub struct Evaluator<'s> {
     store: &'s mut VariableStore,
+    /// **求值栈复用缓冲**(成果 183)。
+    ///
+    /// `eval_slots` 每个窗口都 `Vec::new()`;LET 实测 345k 次/帧 × 2 窗
+    /// = 69 万次堆分配。该缓冲由调用方(VM)持有并复用,稳态零分配。
+    /// 空 Vec 时行为与旧实现完全相同。
+    pub slot_buf: Vec<Slot>,
     /// 当前 GOSUB 帧局部(可选):PushVar 优先查帧局部,再查全局。
     /// 帧局部 id 空间与全局分离(引擎:声明命令 id + 帧内槽)。
     locals: Option<&'s VariableStore>,
@@ -25,6 +121,29 @@ pub struct Evaluator<'s> {
     /// +0x2ac/+0x2b0,每帧 GetCursorPos→ScreenToClient→逻辑缩放,
     /// recon_00403f2c_input_poll.c)。由 VM 注入;(0,0) = 无输入面。
     cursor: (i64, i64),
+    /// `@1[1]` 系统变量当前值 = **引擎毫秒计时**(引擎 sysvar case 0x01,
+    /// `docs/engine/command-layer.md` §9c:`00447ebc`/`00447d4c` 的 id<1000
+    /// 二次派发,timeGetTime 派生计时)。
+    ///
+    /// 语料用法恒为**时间差**:`@1[1] - 起始` 再除时长 = 进度;全语料 1504 处,
+    /// **只用下标 1**。缺它会怎样:本游戏 `es.CGFADEOUT`(s8 pc470 的
+    /// `LOOP -1`)以「alpha == 256」为出口,alpha 由 `(@1[1]-起始)*256/时长`
+    /// 得出 —— 计时恒 0 ⇒ alpha 恒 0 ⇒ `LOOPBREAK` 永不命中 ⇒ 启动链卡死
+    /// 在淡入淡出循环(实机:VM 停在 s8 pc=511,画面永远出不来)。由 VM 在
+    /// 每次求值前注入(读即计算、无存储;引擎同)。
+    timer_ms: i64,
+    /// `@115/@116` 系统变量 = **屏幕宽/高**(引擎 sysvar case 0x73/0x74,
+    /// `00447ebc`;手册「システム変数」= `_SCREEN_SIZE_X/Y`)。
+    ///
+    /// 真值 = 游戏自身 `yscfg.ybn` 的 `screen_width/height`,由 VM 每次求值前
+    /// 注入 —— 与 `WINDOWINFO NO=0 SX/SY` 应答**同源**
+    /// (成果 123;T20 修复前本模块写死 oracle 环境的 1920×1080,
+    /// 与 WINDOWINFO 路径(本作 1100×825)矛盾)。
+    ///
+    /// `None` = 未注入(VM 未提供分辨率)→ 读取**报错**,不猜。
+    screen: Option<(i64, i64)>,
+    /// 输入系统变量快照（VM 每帧注入；未注入 = 无输入面）。
+    input: Option<Arc<InputVars>>,
     /// 调试:打印变量装载(默认 false)。
     pub verbose: bool,
 }
@@ -32,7 +151,17 @@ pub struct Evaluator<'s> {
 impl<'s> Evaluator<'s> {
     /// 绑定变量存储(无帧局部)。
     pub fn new(store: &'s mut VariableStore) -> Self {
-        Self { store, locals: None, loop_counter: 0, cursor: (0, 0), verbose: false }
+        Self {
+            store,
+            locals: None,
+            slot_buf: Vec::new(),
+            loop_counter: 0,
+            cursor: (0, 0),
+            timer_ms: 0,
+            screen: None,
+            input: None,
+            verbose: false,
+        }
     }
 
     /// 绑定变量存储 + 帧局部。
@@ -40,7 +169,22 @@ impl<'s> Evaluator<'s> {
         store: &'s mut VariableStore,
         locals: Option<&'s VariableStore>,
     ) -> Self {
-        Self { store, locals, loop_counter: 0, cursor: (0, 0), verbose: false }
+        Self {
+            store,
+            locals,
+            slot_buf: Vec::new(),
+            loop_counter: 0,
+            cursor: (0, 0),
+            timer_ms: 0,
+            screen: None,
+            input: None,
+            verbose: false,
+        }
+    }
+
+    /// 注入 `@1[1]`(引擎毫秒计时)。
+    pub fn set_timer_ms(&mut self, ms: i64) {
+        self.timer_ms = ms;
     }
 
     /// 注入 @48 当前值(内层 LOOP 迭代计数;无循环 = 0)。
@@ -53,12 +197,46 @@ impl<'s> Evaluator<'s> {
         self.cursor = (x, y);
     }
 
+    /// 注入 `@115/@116`(屏幕宽/高;真值 = 游戏自身 yscfg 分辨率,
+    /// 与 `WINDOWINFO SX/SY` 应答同源)。
+    pub fn set_screen_size(&mut self, w: i64, h: i64) {
+        self.screen = Some((w, h));
+    }
+
+    /// 注入引擎输入系统变量快照（`@_MOUSE_X` / `@_INP` / `@_KEY_*` …）。
+    pub fn set_input(&mut self, input: Arc<InputVars>) {
+        self.input = Some(input);
+    }
+
+    /// `@115/@116` 当前值;未注入 → 报错(不猜)。
+    fn screen_dims(&self, id: u16) -> Result<Value> {
+        let (w, h) = self.screen.ok_or_else(|| {
+            Error::format(format!(
+                "@{id} 屏幕尺寸未注入(VM 未提供 yscfg 分辨率;不猜)"
+            ))
+        })?;
+        Ok(Value::Int(if id == 115 { w } else { h }))
+    }
+
     /// 解码并执行整个窗口,返回**剩余栈**(自底向上)。
     ///
     /// 正常的单值窗口余栈恰为 1 个元素;含组分隔的参数列表窗口可能为空。
     pub fn eval_window(&mut self, window: &[u8]) -> Result<Vec<Value>> {
         let instrs = crate::decode_window(window)?;
         self.eval_instructions(&instrs)
+    }
+
+    /// 窗口的**左值引用形态**是否可判:栈上含未解引用槽。
+    ///
+    /// **用途(成果 173)**:诊断/通用参数记录循环会对**所有**窗口调
+    /// `eval_window_condition`;而 `MATH3D`/`VARINFO` 的引用槽是
+    /// 裸左值(`0x76`),按值求值必然失败 —— 那是**用法不同**,不是错误。
+    /// 调用方据此跳过,避免把正常引用窗记成「求值失败」。
+    pub fn window_is_lvalue(&mut self, window: &[u8]) -> bool {
+        let Ok(instrs) = crate::decode_window(window) else {
+            return false;
+        };
+        matches!(self.eval_slots(&instrs), Ok(slots) if slots.iter().any(|s| matches!(s, Slot::LValue(_))))
     }
 
     /// 执行已解码的指令序列,返回剩余栈。
@@ -82,7 +260,55 @@ impl<'s> Evaluator<'s> {
     /// - 0x56 → 平行**左值引用栈**(不装值);0x76 → 延迟占位(细节 Likely)
     /// - 0x29 → 从最近的左值引用点收集其上全部纯值项作下标表,行主序装载元素
     pub fn eval_slots(&mut self, instrs: &[Instruction]) -> Result<Vec<Slot>> {
-        let mut stack: Vec<Slot> = Vec::new();
+        // 返回值必须**属于调用方**,无法复用共享缓冲 —— 这里把缓冲搬出、
+        // 求值后把它交给调用方(不搬回)。真正的零分配入口是
+        // [`Self::eval_last_value`](热路径:只取末值)。
+        let mut stack = std::mem::take(&mut self.slot_buf);
+        self.eval_slots_fill(instrs, &mut stack)?;
+        Ok(stack)
+    }
+
+    /// **热路径专用**:执行指令序列,只返回**末值**,缓冲原地复用(零分配)。
+    ///
+    /// 为什么需要:条件窗口求值每帧约 70 万次,调用方几乎都只要「最后一个
+    /// 值」(`eval_window_condition` 的 `stack.next_back()`)。旧实现每次
+    /// `eval_instructions` 都 `collect::<Vec<Value>>()` 再丢前 n-1 个元素。
+    ///
+    /// 语义与 `eval_instructions(...)?.pop()` 完全一致:
+    /// - 空栈 → `Ok(None)`
+    /// - 末槽是左值引用 → `Err(Unimplemented(…))`(与旧路径同文本)
+    pub fn eval_last_value(&mut self, instrs: &[Instruction]) -> Result<Option<Value>> {
+        let mut stack = std::mem::take(&mut self.slot_buf);
+        let out = self.eval_last_value_in(instrs, &mut stack);
+        self.slot_buf = std::mem::take(&mut stack);
+        out
+    }
+
+    /// **热路径**:用**调用方持有**的缓冲求值,只返回末值。
+    ///
+    /// 为什么需要调用方持有:`Evaluator` 是每次求值临时构造的（借用
+    /// `&mut VariableStore`），它的内部缓冲**活不过一次调用** ⇒
+    /// 自动复用无效，每次仍是一次 `Vec` 分配。把缓冲提到长寿命对象
+    /// （[`crate::GroupVm`]）上，才能真正做到稳态零分配。
+    pub fn eval_last_value_in(
+        &mut self,
+        instrs: &[Instruction],
+        stack: &mut Vec<Slot>,
+    ) -> Result<Option<Value>> {
+        self.eval_slots_fill(instrs, stack)?;
+        match stack.pop() {
+            Some(Slot::Val(v)) => Ok(Some(v)),
+            Some(Slot::LValue(_)) => Err(Error::Unimplemented(
+                "窗口以左值引用结尾(LET 语境需 eval_lvalue_window)",
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// `eval_slots` 的内核:把槽位**原地**写进调用方缓冲(不 take)。
+    fn eval_slots_fill(&mut self, instrs: &[Instruction], stack: &mut Vec<Slot>) -> Result<()> {
+        let stack = &mut *stack;
+        stack.clear();
         for ins in instrs {
             match &ins.kind {
                 Insn::PushInt(v) => stack.push(Slot::Val(Value::Int(*v))),
@@ -116,7 +342,26 @@ impl<'s> Evaluator<'s> {
                     };
                     // 帧局部数组优先(引擎 0042158e:id<1000 系统变量族值的
                     // 读写走帧/系统存储,desc 仅作形状校验;P5 定性成果 50)
-                    let v = if r.space == VarSpace::At && r.id == 48 {
+                    let input_v = if r.space == VarSpace::At {
+                        self.input
+                            .as_ref()
+                            .and_then(|iv| iv.read(r.id, &indices))
+                            .map(Value::Int)
+                    } else {
+                        None
+                    };
+                    let v = if let Some(v) = input_v {
+                        v
+                    } else if r.space == VarSpace::At && r.id == 1 {
+                        // @1(引擎 sysvar case 0x01):timeGetTime 派生毫秒计时。
+                        // 语料**只用下标 1**(1504 处时间差),故只有子槽 1 是
+                        // 已证实语义;其余子槽语义未证实 → 保持 0,不猜。
+                        if indices.first() == Some(&1) {
+                            Value::Int(self.timer_ms)
+                        } else {
+                            Value::Int(0)
+                        }
+                    } else if r.space == VarSpace::At && r.id == 48 {
                         // @48(引擎 sysvar case 0x30):LOOP 迭代计数,读即
                         // 计算、无存储;引擎对下标不敏感(语料无索引用法)
                         Value::Int(self.loop_counter)
@@ -124,12 +369,13 @@ impl<'s> Evaluator<'s> {
                         // @114(sysvar case 0x72):显示色深 bpp(成果 59c)
                         Value::Int(32)
                     } else if r.space == VarSpace::At && r.id == 115 {
-                        // @115(sysvar case 0x73,DAT_0087236c):屏幕宽
-                        //(s41 g104 `@1074 != @115` 引擎假 → 1920;oracle 环境)
-                        Value::Int(1920)
+                        // @115(sysvar case 0x73)= `_SCREEN_SIZE_X`:屏幕宽。
+                        // T20 修复:曾写死 oracle 环境 1920;现由 VM 注入真值
+                        // (与 WINDOWINFO SX 同源),未注入报错。
+                        self.screen_dims(115)?
                     } else if r.space == VarSpace::At && r.id == 116 {
-                        // @116(sysvar case 0x74,DAT_00872370):屏幕高(oracle)
-                        Value::Int(1080)
+                        // @116(sysvar case 0x74)= `_SCREEN_SIZE_Y`:屏幕高。
+                        self.screen_dims(116)?
                     } else if let Some(locals) = self.locals {
                         if locals.has_array(&r) {
                             match locals.get_elem(&r, &indices) {
@@ -179,20 +425,20 @@ impl<'s> Evaluator<'s> {
                 }
                 Insn::Binary(op) => {
                     // 先弹右操作数,再弹左操作数(lhs op rhs)
-                    let rhs = pop_val(&mut stack, ins)?;
-                    let lhs = pop_val(&mut stack, ins)?;
+                    let rhs = pop_val(stack, ins)?;
+                    let lhs = pop_val(stack, ins)?;
                     stack.push(Slot::Val(apply_binary(*op, &lhs, &rhs)?));
                 }
                 Insn::Unary(_) => {
-                    let v = pop_val(&mut stack, ins)?;
+                    let v = pop_val(stack, ins)?;
                     stack.push(Slot::Val(v.neg()?));
                 }
                 Insn::Cast(Cast::ToStr) => {
-                    let v = pop_val(&mut stack, ins)?;
+                    let v = pop_val(stack, ins)?;
                     stack.push(Slot::Val(v.cast_to_str()?));
                 }
                 Insn::Cast(Cast::ToInt) => {
-                    let v = pop_val(&mut stack, ins)?;
+                    let v = pop_val(stack, ins)?;
                     stack.push(Slot::Val(v.cast_to_int()?));
                 }
                 Insn::GroupSep => {}
@@ -204,7 +450,7 @@ impl<'s> Evaluator<'s> {
                 }
             }
         }
-        Ok(stack)
+        Ok(())
     }
 
     /// LET 左值解析:窗口执行后,栈底为 LValue、其上全部为 Int 下标
@@ -273,6 +519,15 @@ impl<'s> Evaluator<'s> {
 
     /// 引擎 0x48 装载:数组 → 0 号元素;标量 → 值;都无 → 报错(0x1a5ea 同族)。
     fn load_auto(&mut self, r: &VarRef) -> Result<Value> {
+        // 输入系统变量（`@_MOUSE_X` / `@_KEY_*` / `@_KEYLAST` …）：由输入层
+        // 每帧快照提供，**优先于变量存储**（引擎这些 id 无存储，读即计算）。
+        if r.space == VarSpace::At {
+            if let Some(input) = &self.input {
+                if let Some(v) = input.read_auto(r.id) {
+                    return Ok(Value::Int(v));
+                }
+            }
+        }
         // @48 系统变量(引擎 sysvar case 0x30):内层 LOOP 迭代计数,
         // 独立于变量存储(引擎无 desc,读即计算);下标被忽略(引擎同)。
         if r.space == VarSpace::At && r.id == 48 {
@@ -293,17 +548,15 @@ impl<'s> Evaluator<'s> {
         if r.space == VarSpace::At && r.id == 114 {
             return Ok(Value::Int(32));
         }
-        // @115/@116(sysvar case 0x73/0x74,DAT_0087236c/70):屏幕宽/高。
-        // VM 无显示栈,按 oracle 环境 = 1920×1080(s41 g104 引擎假反推)。
-        if r.space == VarSpace::At && r.id == 115 {
-            return Ok(Value::Int(1920));
-        }
-        if r.space == VarSpace::At && r.id == 116 {
-            return Ok(Value::Int(1080));
+        // @115/@116(sysvar case 0x73/0x74)= `_SCREEN_SIZE_X/Y`:屏幕宽/高。
+        // T20 修复:曾写死 oracle 环境的 1920×1080,与 WINDOWINFO 应答路径
+        // (游戏自身 yscfg,本作 1100×825)矛盾;现两路径同源,由 VM 注入。
+        if r.space == VarSpace::At && (r.id == 115 || r.id == 116) {
+            return self.screen_dims(r.id);
         }
         // 帧局部优先(引擎:帧局部变量 id 属独立空间)
         if self.verbose {
-            eprintln!("DEBUG load_auto: prefix={:#04x} id={} ({:#x})", r.space.prefix(), r.id, r.id);
+            yuris_log::trace_forced!("load_auto: prefix={:#04x} id={} ({:#x})", r.space.prefix(), r.id, r.id);
         }
         if let Some(locals) = self.locals {
             if let Some(v) = locals.get_opt(r) {
@@ -400,17 +653,27 @@ pub fn type_default(et: Option<yuris_value::ElemType>) -> Value {
 
 /// 从槽位切片收集下标表:全部为 `Val(Int)`,否则报错
 /// (引擎下标为 i64;Float/Str 下标语义 Unknown)。
+///
+/// **报错带实际取值与下标序号** —— 只写「非整数下标」定位不到是哪一个、值是什么,
+/// 排查时只能回去猜(本仓已为此返工过一次)。
 fn gather_indices(slots: &[Slot]) -> Result<Vec<i64>> {
     slots
         .iter()
-        .map(|s| match s {
-            Slot::Val(Value::Int(i)) => Ok(*i),
-            Slot::Val(_) => Err(Error::Unimplemented(
-                "非整数下标语义 Unknown(引擎下标域为 i64)",
-            )),
-            Slot::LValue(_) => Err(Error::format(
-                "下标表中混入左值引用(引擎 0x2710a 同族)",
-            )),
+        .enumerate()
+        .map(|(i, s)| match s {
+            Slot::Val(Value::Int(v)) => Ok(*v),
+            Slot::Val(Value::Float(f)) => Err(Error::format(format!(
+                "unimplemented: 非整数下标语义 Unknown(引擎下标域为 i64);\
+                 下标[{i}] = 浮点 {f}"
+            ))),
+            Slot::Val(Value::Str(s)) => Err(Error::format(format!(
+                "unimplemented: 非整数下标语义 Unknown(引擎下标域为 i64);\
+                 下标[{i}] = 字符串 {:?}",
+                String::from_utf8_lossy(s)
+            ))),
+            Slot::LValue(_) => Err(Error::format(format!(
+                "下标表中混入左值引用(引擎 0x2710a 同族);下标[{i}]"
+            ))),
         })
         .collect()
 }
@@ -494,10 +757,11 @@ pub fn decode_pushstr(payload: &[u8]) -> Vec<u8> {
             }
             continue;
         }
-        // SJIS 双字节:首字节 + 后续整体拷贝(引擎 0x0059b0c0 表引导)
+        // SJIS 双字节:首字节 + 后续整体拷贝(引擎步进表 0x0059b0c0/v494 的
+        // 0x5b40a0,首个/末个前导区为 **0x81-0x9F 与 0xE0-0xFC**)。
         out.push(b);
         i += 1;
-        if (0x81..=0x9F).contains(&b) || (0xE0..=0xEF).contains(&b) {
+        if (0x81..=0x9F).contains(&b) || (0xE0..=0xFC).contains(&b) {
             if let Some(&b2) = payload.get(i) {
                 out.push(b2);
                 i += 1;
@@ -590,6 +854,80 @@ mod tests {
         assert_eq!(decode_pushstr(b"\"\x83\x5c\""), b"\x83\x5c".to_vec());
         // 空载荷 → 空串
         assert_eq!(decode_pushstr(b""), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn sysvar_at1_is_engine_millisecond_timer() {
+        // @1[1] = 引擎毫秒计时(引擎 sysvar case 0x01,`command-layer.md` §9c)。
+        // 窗口: pushvarref(@,1) pushint(1) aload
+        let w1 = [0x56, 3, 0, 0x40, 0x01, 0x00, 0x42, 1, 0, 1, 0x29, 1, 0, 0];
+        let mut store = VariableStore::new();
+        let mut ev = Evaluator::new(&mut store);
+        ev.set_timer_ms(1234);
+        assert_eq!(ev.eval_window(&w1).unwrap(), vec![Value::Int(1234)]);
+        // 未证实的子槽(下标 != 1)保持 0 —— 不猜
+        let w2 = [0x56, 3, 0, 0x40, 0x01, 0x00, 0x42, 1, 0, 2, 0x29, 1, 0, 0];
+        let mut store2 = VariableStore::new();
+        let mut ev2 = Evaluator::new(&mut store2);
+        ev2.set_timer_ms(1234);
+        assert_eq!(ev2.eval_window(&w2).unwrap(), vec![Value::Int(0)]);
+        // 未注入(无 VM)= 0:恒定 0 正是「计时缺失」的旧行为,由 VM 侧注入修正
+        let mut store3 = VariableStore::new();
+        assert_eq!(
+            Evaluator::new(&mut store3).eval_window(&w1).unwrap(),
+            vec![Value::Int(0)]
+        );
+    }
+
+    #[test]
+    fn screen_dims_injected_or_error() {
+        // @115/@116 = 屏幕宽/高(T20):旧实现写死 oracle 环境的 1920×1080,
+        // 与 WINDOWINFO 应答路径矛盾。现:注入 → 真值;未注入 → 报错(不猜)。
+        // 窗口: pushvar(@,115)  → 0x48 装载路径(load_auto)
+        let w115 = [0x48, 3, 0, 0x40, 0x73, 0x00];
+        let w116 = [0x48, 3, 0, 0x40, 0x74, 0x00];
+        let mut store = VariableStore::new();
+        let mut ev = Evaluator::new(&mut store);
+        ev.set_screen_size(1100, 825);
+        assert_eq!(ev.eval_window(&w115).unwrap(), vec![Value::Int(1100)]);
+        assert_eq!(ev.eval_window(&w116).unwrap(), vec![Value::Int(825)]);
+        // 未注入 → **报错**,绝不回落 1920/1080
+        let mut store2 = VariableStore::new();
+        let e = Evaluator::new(&mut store2).eval_window(&w115).unwrap_err();
+        assert!(
+            e.to_string().contains("未注入"),
+            "未注入须显式报错,得到: {e}"
+        );
+    }
+
+    #[test]
+    fn input_sysvars_are_read_from_snapshot() {
+        // @_MOUSE_X(133) / @_KEY_ENTER(244) / @_INP(144)[code]。
+        use std::sync::Arc;
+        let mut vars = InputVars::default();
+        vars.claimed.extend([133u16, 244, 144]);
+        vars.scalars.insert(133, 640);
+        vars.scalars.insert(244, 7);
+        vars.inp = vec![0; 256];
+        vars.inp[0x0D] = -3;
+        // pushvar(@,133) → 0x48
+        let w_mouse_x = [0x48, 3, 0, 0x40, 133, 0];
+        // pushvar(@,244)
+        let w_enter = [0x48, 3, 0, 0x40, 244, 0];
+        // _INP: pushvarref(@,144) pushint(0x0D) aload
+        let w_inp = [0x56, 3, 0, 0x40, 144, 0, 0x42, 1, 0, 0x0D, 0x29, 1, 0, 0];
+        let mut store = VariableStore::new();
+        let mut ev = Evaluator::new(&mut store);
+        ev.set_input(Arc::new(vars));
+        assert_eq!(ev.eval_window(&w_mouse_x).unwrap(), vec![Value::Int(640)]);
+        assert_eq!(ev.eval_window(&w_enter).unwrap(), vec![Value::Int(7)]);
+        assert_eq!(ev.eval_window(&w_inp).unwrap(), vec![Value::Int(-3)]);
+        // 未注入 = 无输入面:`@133` 回落到旧的光标注入路径（缺省 0）。
+        let mut store2 = VariableStore::new();
+        assert_eq!(
+            Evaluator::new(&mut store2).eval_window(&w_mouse_x).unwrap(),
+            vec![Value::Int(0)]
+        );
     }
 
     #[test]
