@@ -909,6 +909,9 @@ impl GroupVm {
                 // 还原时把 SX/SY 写成 0 ⇒ 渲染侧 `text_px_or_default`
                 // 把 0 当「未设置」回落 40px(实机「字号忽然变大」)。
                 let mut font_state_query: Option<u8> = None;
+                // NAME 查询(手册 `font/fontinfo.html`[3] `FONTINFO[LET=$NAME NAME=1]`)
+                // —— 字符串应答,必须走 Str 写回而不是 Int。
+                let mut font_name_query = false;
                 for w in windows {
                     if w.len == 0 {
                         continue;
@@ -956,6 +959,14 @@ impl GroupVm {
                         // 实测)→ oracle 常量 1。
                         query_b =
                             matches!(self.eval_window_condition(Some(w)), Ok(Some(Value::Int(1))));
+                    } else if kind == CmdKind::FontInfo && slot == 1 {
+                        // NAME 查询:v494 槽 1(v555 也在 1,但按名解析更稳)。
+                        if matches!(
+                            self.eval_window_condition(Some(w)),
+                            Ok(Some(Value::Int(n))) if n != 0
+                        ) {
+                            font_name_query = true;
+                        }
                     } else if kind == CmdKind::FontInfo && matches!(slot, 2..=10) {
                         // ANTIALIASING(2)/COLOR(3)/COLOR2(4)/GRADATION(5)/
                         // ROTATION(6)/DRAWMODE(7)/SX(8)/SY(9)/BOLD(10):
@@ -985,6 +996,11 @@ impl GroupVm {
                         self.write_var_target(t, Value::Int(783))?;
                     } else if query_b {
                         self.write_var_target(t, Value::Int(1))?;
+                    } else if font_name_query {
+                        // 当前字体名(引擎当前字体名缓冲;本内核 = 最近一次
+                        // `FONT NAME=` 的原文,未设过则空串)。
+                        let v = self.font_name.clone().unwrap_or_default();
+                        self.write_var_target(t, Value::Str(v))?;
                     } else if let Some(q) = font_state_query {
                         // 查询返回**当前生效值**。等级:Likely —— 依据 =
                         // 脚本自带的保存/还原惯用法(`s70 g290-299`)只有
@@ -1095,6 +1111,10 @@ impl GroupVm {
                 let mut aa: Option<i64> = None;
                 let mut gradation: Option<i64> = None;
                 let mut rotation: Option<i64> = None;
+                // NAME = 字体名字符串(手册 `font/font.html`)。
+                // 本内核无法按名装载任意字体,但必须**保存并回读** ——
+                // `FONTINFO[NAME=1]` 要原样应答(见 `GroupVm::font_name`)。
+                let mut name: Option<Vec<u8>> = None;
                 let mut evaled: Vec<(u8, String)> = Vec::new();
                 for w in windows {
                     if w.len == 0 {
@@ -1157,6 +1177,12 @@ impl GroupVm {
                         if let Ok(Some(Value::Int(n))) = self.eval_window_condition(Some(w)) {
                             rotation = Some(n);
                         }
+                    } else if self.slot_is(other, slot, "NAME", 2) {
+                        // NAME = 字体名字符串(手册示例 `FONT[NAME="ＭＳ 明朝"]`)。
+                        recognized = true;
+                        if let Ok(Some(Value::Str(b))) = self.eval_window_condition(Some(w)) {
+                            name = Some(b);
+                        }
                     }
                     // 未识别的 FONT 槽:**不再静默丢弃** —— 大告警一次,
                     // 值仍只进事件(语义 Unknown,不猜)。
@@ -1188,6 +1214,9 @@ impl GroupVm {
                 }
                 if let Some(v) = rotation {
                     self.font_rotation = Some(v);
+                }
+                if let Some(n) = name {
+                    self.font_name = Some(n);
                 }
                 if bno.is_some() || no.is_some() {
                     self.font_sel = Some((

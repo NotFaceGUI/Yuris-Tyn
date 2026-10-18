@@ -620,8 +620,31 @@ impl PacFileIndex {
         Some(payload)
     }
 
-    /// **按原始字节**取图像尺寸(PNG/JPEG;CP932 名安全)。
+    /// **纹理解析失败的原因**(诊断用;不改变任何解析行为)。
     ///
+    /// 区分两类完全不同的情况,避免告警只丢一句「检查资源是否在封包内」:
+    /// 1. **包内没有这个名字**(`NoEntry`):引擎/脚本请求了不存在的资源
+    ///    —— 语料实测 `<game-b>` 的 `cgsys/main/nextvoice/icon_01`、
+    ///    `cg/face/face_back` 属此类(它们只在"语音播放中"提示图标里用,
+    ///    该作品封包未提供);
+    /// 2. **有名字但载荷不是可解码图像**(`NotImage`):解压/魔数问题。
+    pub fn explain_image_miss(&self, raw: &[u8]) -> ImageMiss {
+        let Some((pack_path, e)) = self.resolve_entry_raw(raw, false) else {
+            return ImageMiss::NoEntry;
+        };
+        let name = String::from_utf8_lossy(&e.name).into_owned();
+        let Some(payload) = self.read_entry_payload(pack_path, e) else {
+            return ImageMiss::Unreadable(name);
+        };
+        if yuris_format::ypf::looks_like_image(&payload) {
+            // 名字与载荷都正常 ⇒ 失败发生在解码/上传阶段(宿主侧)。
+            ImageMiss::DecodeFailed(name, payload.len())
+        } else {
+            ImageMiss::NotImage(name, payload.len())
+        }
+    }
+
+    /// **按原始字节**取图像尺寸(PNG/JPEG;CP932 名安全)。    ///
     /// 与 [`Self::image_dims`] 同义,只是不做字符串往返 —— `CG` 的 FILE 槽
     /// 是字节串,`from_utf8_lossy` 会把 CP932 名毁成 U+FFFD,于是
     /// `CGINFO SX/SY` 应答恒 0,官方脚本的
@@ -709,6 +732,37 @@ impl PacFileIndex {
         self.read_entry_payload(pack_path, e)
     }
 
+}
+
+/// 纹理解析失败的原因([`PacFileIndex::explain_image_miss`])。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageMiss {
+    /// 全部封包 + 松散根里都没有这个名字(VFS 候选族已穷举)。
+    NoEntry,
+    /// 条目存在但载荷读不出来(压缩/偏移问题)。
+    Unreadable(String),
+    /// 条目存在且能读,但魔数不是图像。
+    NotImage(String, usize),
+    /// 载荷是图像但宿主解码/上传失败。
+    DecodeFailed(String, usize),
+}
+
+impl ImageMiss {
+    /// 面向用户的一句话说明(含条目名与实际字节数)。
+    pub fn describe(&self) -> String {
+        match self {
+            ImageMiss::NoEntry => {
+                "封包内**不存在**该名字(已按扩展名探测序 / CP932 / 大小写归一检索)".into()
+            }
+            ImageMiss::Unreadable(n) => format!("条目存在但载荷读取失败: {n}"),
+            ImageMiss::NotImage(n, len) => {
+                format!("条目存在({n})但载荷不是图像魔数(解压后 {len}B)")
+            }
+            ImageMiss::DecodeFailed(n, len) => {
+                format!("条目存在且是图像({n}, {len}B)但解码/上传失败")
+            }
+        }
+    }
 }
 
 /// PNG 尺寸(IHDR 块;`[16..20]`=宽 / `[20..24]`=高,大端)。

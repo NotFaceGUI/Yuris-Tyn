@@ -1256,6 +1256,8 @@ struct StageAssets<'a> {
     /// (8 槽),否则第二次以后的 COPY2 全拿到第一张旧图(实测后果:
     /// boot 黑幕采到空场景 ⇒ 透明,底下的 config 页穿帮)。
     snap_seq: &'a mut HashMap<u64, u64>,
+    /// 填色产物纹理 id 的轮转序号(见 [`StageAssets::upload_rgba`])。
+    paint_seq: u64,
 }
 
 impl<'a> yuris_stage::Assets for StageAssets<'a> {
@@ -1280,6 +1282,11 @@ impl<'a> yuris_stage::Assets for StageAssets<'a> {
                 None
             }
         }
+    }
+
+    /// 纹理解析失败原因(转 [`PacFileIndex::explain_image_miss`])。
+    fn explain_miss(&self, file: &[u8]) -> Option<String> {
+        Some(self.index.explain_image_miss(file).describe())
     }
 
     fn solid(&mut self) -> TexId {
@@ -1360,6 +1367,68 @@ impl<'a> yuris_stage::Assets for StageAssets<'a> {
             }
             Err(e) => {
                 yuris_log::warn!("[stage] BLIT 纹理上传失败 rid={rid:#x}: {e}");
+                None
+            }
+        }
+    }
+
+    /// 整窗截图(**带字节**):`CGACT[RECTPAINT*]` 要改写位图,必须能拿到
+    /// 像素。这里与 `snapshot` 同源(每次重新合成 + 上传),额外把字节返回。
+    fn snapshot_ex(
+        &mut self,
+        view: &Scene,
+        target: LayerId,
+    ) -> Option<(TexId, Vec<u8>, u32, u32)> {
+        let seq = {
+            let e = self.snap_seq.entry(target).or_insert(0);
+            *e = e.wrapping_add(1);
+            *e
+        };
+        let rid = 0x5C53_4E41_5000_0000
+            | ((seq & 0x7) << 40)
+            | (target & 0xFFFF_FFFF);
+        let b = self.backend.as_deref_mut()?;
+        let (rgba, w, h) = b.render_scene_to_rgba(view).ok()?;
+        match b.load_image_rgba(ResourceId(rid), &rgba, w, h) {
+            Ok(()) => {
+                self.loaded.insert(rid);
+                Some((rid, rgba, w, h))
+            }
+            Err(e) => {
+                yuris_log::warn!("[stage] 截图上传失败 {target:#x}: {e}");
+                None
+            }
+        }
+    }
+
+    /// 解码 FILE 图像为 RGBA(填色改写位图用)。按文件字节寻址,不碰纹理。
+    fn decode_rgba(&mut self, file: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+        let raw = self.index.read_image_bytes_raw(file)?;
+        let img = image::load_from_memory(&raw).ok()?.to_rgba8();
+        let (w, h) = (img.width(), img.height());
+        Some((img.into_raw(), w, h))
+    }
+
+    /// 上传改写后的像素(填色产物)。
+    ///
+    /// **每次都必须真上传**:内容是"上一次截屏 + 通道覆盖",逐帧都不同;
+    /// 若按内容长度/尺寸派生成 rid 并命中缓存,就会永远返回第一张
+    /// (实机后果:全屏缓冲停在黑帧,标题背景全黑且动画消失)。
+    /// 因此按单调序号轮转 rid(64 槽,远超同时在场的填色层数)。
+    fn upload_rgba(&mut self, rgba: &[u8], w: u32, h: u32) -> Option<TexId> {
+        let seq = {
+            self.paint_seq = self.paint_seq.wrapping_add(1);
+            self.paint_seq
+        };
+        let rid = 0x5041_494E_5400_0000 | ((seq & 0x3F) << 40);
+        let b = self.backend.as_deref_mut()?;
+        match b.load_image_rgba(ResourceId(rid), rgba, w, h) {
+            Ok(()) => {
+                self.loaded.insert(rid);
+                Some(rid)
+            }
+            Err(e) => {
+                yuris_log::warn!("[stage] 填色纹理上传失败 {rid:#x}: {e}");
                 None
             }
         }
@@ -1743,8 +1812,7 @@ impl PlayerCore {
                                 yuris_log::trace_forced!("[cgact] size but NO ID2");
                             }
                             continue;
-                        };
-                        let fixed = effects
+                        };                        let fixed = effects
                             .iter()
                             .any(|(_, n, _)| n.eq_ignore_ascii_case("FSX"));
                         let fix = |v: Option<i64>| -> Option<i64> {
@@ -1787,9 +1855,57 @@ impl PlayerCore {
                         });
                         continue;
                     }
+                    // **`RECTPAINT` 族(2026-10-18 实装)**
+                    //
+                    // 手册 `cg/cgact.html`[18]-[20]:`RECTPAINT` 填 RGB、
+                    // `RECTPAINT2` 填 α、`RECTPAINT3` 填 `SET=0xAARRGGBB`。
+                    // 引擎逐像素改写该层位图;本内核在 Stage 侧**烘焙**
+                    // (渲染该层像素 → 覆盖通道 → 作为新像素替换),语义一致:
+                    // 一次性生效、不可逆、换图后失效。目标 = `ID`(原地加工)。
+                    let paint = effects
+                        .iter()
+                        .find(|(_, en, v)| {
+                            ["RECTPAINT", "RECTPAINT2", "RECTPAINT3"]
+                                .iter()
+                                .any(|n| en.eq_ignore_ascii_case(n))
+                                && match v {
+                                    yuris_vm::EffectValue::Int(x) => *x != 0,
+                                    yuris_vm::EffectValue::Float(f) => *f != 0.0,
+                                    yuris_vm::EffectValue::Str(s) => !s.is_empty(),
+                                }
+                        })
+                        .map(|(_, en, _)| en.clone());
+                    if let Some(which) = paint {
+                        let kind = if which.eq_ignore_ascii_case("RECTPAINT2") {
+                            yuris_stage::PaintKind::Alpha
+                        } else if which.eq_ignore_ascii_case("RECTPAINT3") {
+                            yuris_stage::PaintKind::Both
+                        } else {
+                            yuris_stage::PaintKind::Rgb
+                        };
+                        let Some(color) = val_of("SET") else {
+                            yuris_log::alert_once(
+                                module_path!(),
+                                format!("cgact-paint-no-set:{which}"),
+                                format!(
+                                    "CGACT {which} 缺少 SET 颜色
+                                     层: {name}
+                                     后果: 本次填色不执行(引擎必填 SET)"
+                                ),
+                            );
+                            continue;
+                        };
+                        let (base, _) = vm_ui_base_prio(name.as_bytes());
+                        cmds.push(yuris_stage::Command::Paint {
+                            dst: fnv1a(&base),
+                            kind,
+                            color,
+                        });
+                        continue;
+                    }
                     // **未识别的 CGACT 效果槽(2026-10-17 用户要求:必须大告警)**。
                     //
-                    // 本函数只消费 COPY/COPY2/SIZE 三族;CGACT 其余 60+ 个
+                    // 本函数只消费 COPY/COPY2/SIZE 三族;CGACT 其余
                     // 效果槽(旋转/色调/滤镜/模糊/扩散/光栅/文字…)在 VM 侧
                     // 已如实带出,但**下游没有任何效果实现** —— 以前这里一行
                     // 注释就静默结束。现在按「效果名集合」去重打一条横幅,
@@ -1804,6 +1920,12 @@ impl PlayerCore {
                                 && !n.eq_ignore_ascii_case("SIZE2")
                                 && !n.eq_ignore_ascii_case("ID")
                                 && !n.eq_ignore_ascii_case("ID2")
+                                // RECTPAINT 族已在上面单独消费;`SET` 是它的
+                                // 颜色实参,不单列。
+                                && !n.eq_ignore_ascii_case("RECTPAINT")
+                                && !n.eq_ignore_ascii_case("RECTPAINT2")
+                                && !n.eq_ignore_ascii_case("RECTPAINT3")
+                                && !n.eq_ignore_ascii_case("SET")
                         })
                         .collect();
                     if !unhandled.is_empty() {
@@ -1947,6 +2069,7 @@ impl PlayerCore {
                 text_slots: &mut self.text_slots,
                 text_seq: &mut self.text_slot_seq,
                 snap_seq: &mut self.snap_seq,
+                paint_seq: 0,
             };
             self.stage.apply(&stage_cmds, scene, &mut host);
         }
@@ -2056,6 +2179,7 @@ impl PlayerCore {
                 text_slots: &mut self.text_slots,
                 text_seq: &mut self.text_slot_seq,
                 snap_seq: &mut self.snap_seq,
+                paint_seq: 0,
             };
             self.stage.apply(&cmds, scene, &mut host);
             // VM 消息窗部件已上屏 → 撤掉 scenario 近似底框(双重叠层修复)
@@ -3874,6 +3998,7 @@ impl ScenarioHost for PlayerCore {
             text_slots: &mut self.text_slots,
             text_seq: &mut self.text_slot_seq,
             snap_seq: &mut self.snap_seq,
+            paint_seq: 0,
         };
         self.stage.apply(&cmds, scene, &mut host);
     }

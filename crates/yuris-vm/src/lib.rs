@@ -352,6 +352,9 @@ pub struct CgState {
     pub file: Option<Vec<u8>>,
     /// 色(COLOR;CGINFO 槽 24 查询,CG 命令无对应槽)。
     pub color: i64,
+    /// **A = 不透明度 0〜256**(`CG` 的 A 槽;引擎图层对象 `+0x80` i16,
+    /// `CGINFO[A=1]` 读回同一偏移)。新建层缺省 = 256(完全不透明)。
+    pub a: i64,
     /// **E = 显隐**(本作 CG 槽 2;官方手册语义:该 CG 是否显示)。
     ///
     /// **勘误(2026-10-13,成果 121)**:旧实现没有该字段 —— 游戏用 `E=0`
@@ -368,6 +371,29 @@ pub struct CgState {
     pub mid: Option<Vec<u8>>,
     /// **MODE = 描画模式 0〜18**(手册;本作槽 41)。
     pub mode: Option<i64>,
+    /// **LINT / LINT2**(`CG` 槽 43/44;本作 v494 为 43/44)。
+    ///
+    /// 引擎侧实证(v494 `CG` 处理体 `0x42b64b`/`0x42b6b9`):
+    /// 两槽分别写图层对象 `+0x58` 与 `+0x60`(i64),`CGINFO` 的
+    /// `LINT`/`LINT2` 查询(`0x43dd34`/`0x43dd47`)原样读回同一偏移。
+    /// 语义 = 线性插值(移动/动画的插值开关与精度),**渲染侧尚未消费**;
+    /// 但值必须持久保存,否则 `CGINFO` 往返读到 0(脚本会判错)。
+    pub lint: Option<i64>,
+    /// 见 [`Self::lint`]。
+    pub lint2: Option<i64>,
+    /// **TEX = テクスチャ化**(`CG` 槽 12;本作 v494 槽 12)。
+    ///
+    /// 引擎侧实证(v494 `CG` 处理体 `0x42ba39`):`TEX=1` 置图层对象
+    /// `+0xa4` 字节为 1;`CGINFO[TEX=1]`(`0x43d8cf`)读回同一字节。
+    /// 手册 `cg/cgact.html` 的 `SIZE` 族以「テクスチャ」为源,
+    /// 官方 `es_Sprite.yst` 的 `CG[ID=… TEX=@_DXMODE]` 即此。
+    pub tex: bool,
+    /// **REMALLOC**(`CG` 槽 32;v494 槽 32)。
+    ///
+    /// 引擎侧实证(v494 `CG` 处理体 `0x42b5b0`):值写图层对象 `+0x214`
+    /// (有符号 16 位)。语义 = 缓冲重分配(图层作为离屏缓冲时的尺寸重算),
+    /// 本内核**尚未实现重分配**,但必须持久保存并如实带出。
+    pub remalloc: Option<i64>,
     /// `SX`/`SY` 是否由脚本**显式给出**（手册：レイヤセットの幅/高さ）。
     ///
     /// `CGINFO ONMOUSE*` 的命中矩形需要区分「显式尺寸」与「图像原始尺寸」：
@@ -427,6 +453,7 @@ impl Default for CgState {
             img_h: 0,
             file: None,
             color: 0x80_80_80,
+            a: 256,
             e: 1,
             // 过渡/遮罩/描画模式(成果 125):未指定 = None(引擎「未给槽保持原值」)。
             t: None,
@@ -434,6 +461,10 @@ impl Default for CgState {
             ta: None,
             mid: None,
             mode: None,
+            lint: None,
+            lint2: None,
+            tex: false,
+            remalloc: None,
             size_explicit: false,
             z_explicit: false,
         }
@@ -556,6 +587,14 @@ pub struct GroupVm {
     font_gradation: Option<i64>,
     /// `FONT` 的 `ROTATION` 槽(`FONTINFO` 查询回读)。
     font_rotation: Option<i64>,
+    /// `FONT` 的 `NAME` 槽(字体名字符串,**CP932 原始字节**)。
+    ///
+    /// 手册 `font/font.html`:`NAME = 文字フォント設定(フォント名指定)`
+    /// —— 与 `NO` 是同一选择的两种寻址(名字 / 字体表序号)。本内核只有
+    /// 一条系统 CJK 字体链,无法按名装载任意字体,但**必须保存名字**:
+    /// ① `FONTINFO[NAME=1 LET=$v]` 要原样回读(引擎 `0x5d8420` 一带的
+    /// 当前字体名缓冲);② 诊断日志要能看出脚本请求了哪个字体。
+    font_name: Option<Vec<u8>>,
     /// **错误输出级别配置**(`ERROR` 命令;按**命令参数名** `COM_<CMD>` 索引)。
     ///
     /// 取证:YSCM 的 `ERROR` 参数表是 `NO / SET / COM_CG / COM_CGACT / …`
@@ -904,6 +943,7 @@ impl GroupVm {
             font_aa: None,
             font_gradation: None,
             font_rotation: None,
+            font_name: None,
             error_levels: HashMap::new(),
             error_code: None,
             ystl: None,
@@ -1418,6 +1458,11 @@ impl GroupVm {
         self.font_drawmode
     }
 
+    /// 当前字体名(`FONT NAME=` 的 CP932 原文;未设过 = None)。
+    pub fn font_name(&self) -> Option<&[u8]> {
+        self.font_name.as_deref()
+    }
+
     /// 启用/关闭逻辑时钟(播放器启用;单测保持墙钟)。
     pub fn set_logical_clock(&mut self, on: bool) {
         self.logical_clock = on;
@@ -1498,6 +1543,51 @@ impl GroupVm {
     /// 变量存储(可变;供外部预置全局变量)。
     pub fn store_mut(&mut self) -> &mut VariableStore {
         &mut self.store
+    }
+
+    /// `SAVE`/`LOAD` 的 12 个**脚本自备存档槽**所覆盖的全局变量数。
+    ///
+    /// 槽名 → `(类型, 恢复组)`：`G_INT`=组1 INT、`G_INT2`=组2 INT、…
+    /// `G_STR4`=组4 STR（组号 = 名字末尾数字，缺省 1；与 `VARACT INIT`
+    /// 的 12 位掩码同一编号空间，见 [`Self::varact_restore_globals`]）。
+    /// 计数对象 = YSVR `kind==1` 且 `(ty, category)` 命中者 —— 那正是
+    /// 「全局初值/恢复组」的变量集合，也是存档组要写出的集合。
+    ///
+    /// **证据**:官方手册 `file/save.html` 的关键字表只有
+    /// `FILE/DNO/SET/ID`；`G_*` 十二槽不在手册里，但 SDK 自带
+    /// `es_GSD.yst` 的 `SAVE[DNO=03 G_INT2=1]` 紧邻注释掉的
+    /// `SAVE[DNO=03 SET=@G()]` —— 两者等价 ⇒ `G_*` = **按恢复组保存**。
+    pub fn ysvr_group_len(&self, group_names: &[&str]) -> usize {
+        let want: Vec<(u8, u8)> = group_names
+            .iter()
+            .filter_map(|name| {
+                let ty = if name.starts_with("G_INT") {
+                    1u8
+                } else if name.starts_with("G_FLT") {
+                    2
+                } else if name.starts_with("G_STR") {
+                    3
+                } else {
+                    return None;
+                };
+                let group: u8 = name
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .fold(0u8, |a, c| {
+                        a.saturating_mul(10)
+                            .saturating_add(c.to_digit(10).unwrap() as u8)
+                    })
+                    .max(1)
+                    .min(4);
+                Some((ty, group))
+            })
+            .collect();
+        self.ysvr_globals
+            .iter()
+            .filter(|e| {
+                e.kind == 1 && want.iter().any(|(ty, cat)| e.ty == *ty && e.category == *cat)
+            })
+            .count()
     }
 
     /// 应用 YSVR 变量定义表(启动链 FUN_0046b63c 的「应用初值」步)。
@@ -3218,8 +3308,13 @@ impl GroupVm {
 
     /// 把查询结果写入 LET 引用目标。
     /// 目标的元素类型(引擎描述符 byte+1 等价:数组按声明类型,标量按现值)。
-    /// 都不可知 → `None`(调用方按标量 INT 处理,SAVE 语境与引擎 STR 分支
-    /// 「无存储写入」不同处如实标注)。
+    /// 都不可知 → `None`(调用方按标量 INT 处理)。
+    ///
+    /// **当前无调用者**(2026-10-18):SAVE 的 SET 语义勘误为「要保存的变量」
+    /// 后不再需要按目标类型决定写值;LOAD 的类型判定走
+    /// [`Self::load_yssd`] 内的载荷类型比对。保留实现供存档容器实装时
+    /// 校验「SET 变量的类型」。
+    #[allow(dead_code)]
     fn var_target_elem(&self, t: &VarTarget) -> Option<yuris_value::ElemType> {
         match t {
             VarTarget::Scalar(r) => match self.store.get_opt(r) {

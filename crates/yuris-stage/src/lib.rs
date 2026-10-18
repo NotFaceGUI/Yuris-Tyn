@@ -103,6 +103,17 @@ pub enum Pixel {
     Alias(LayerId),
 }
 
+/// `CGACT` 矩形填色模式(手册 `cg/cgact.html` 示例[18]–[20])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaintKind {
+    /// `RECTPAINT`:只填 RGB，α 保持。
+    Rgb,
+    /// `RECTPAINT2`:只填 α(0..255)。
+    Alpha,
+    /// `RECTPAINT3`:`SET = 0xAARRGGBB`，α 与 RGB 一起填。
+    Both,
+}
+
 /// 宿主提供的像素服务(解码/裁剪/截屏与 IO 全在这里,Stage 不做)。
 pub trait Assets {
     /// FILE 路径 → 纹理。`owner` = 申请层名(宿主纹理 id 按层名约定,如
@@ -122,7 +133,37 @@ pub trait Assets {
         target: LayerId,
     ) -> Option<TexId>;
     /// 整窗截图:`view` = 批开始前的已提交景(I6,引擎=上一呈现帧)。
-    fn snapshot(&mut self, view: &Scene, target: LayerId) -> Option<TexId>;
+    fn snapshot(&mut self, view: &Scene, target: LayerId) -> Option<TexId> {
+        self.snapshot_ex(view, target).map(|s| s.0)
+    }
+    /// 整窗截图(**带像素字节**)。
+    ///
+    /// `CGACT[RECTPAINT*]` 要"改写位图",而截屏产物是唯一由本内核生成、
+    /// 字节可得的像素源 —— 返回字节后 Stage 就能就地覆盖通道再上传,
+    /// 与引擎"逐像素改写"同语义,且**不需要改渲染管线**。
+    fn snapshot_ex(
+        &mut self,
+        _view: &Scene,
+        _target: LayerId,
+    ) -> Option<(TexId, Vec<u8>, u32, u32)> {
+        None
+    }
+    /// 上传改写后的像素(返回新纹理 id)。缺省 = 不支持。
+    fn upload_rgba(&mut self, _rgba: &[u8], _w: u32, _h: u32) -> Option<TexId> {
+        None
+    }
+    /// 解码 FILE 指向的图像为 RGBA(填色改写位图用)。
+    fn decode_rgba(&mut self, _file: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+        None
+    }
+    /// 宿主侧失败原因(诊断;缺省 = 无信息)。
+    ///
+    /// Stage 只把 `resolve` 的 `None` 变成告警;若宿主能区分「包内没有」/
+    /// 「有但不是图像」/「解码失败」,实现本方法后告警会带上精确原因
+    /// (播放器侧接 `PacFileIndex::explain_image_miss`)。
+    fn explain_miss(&self, _file: &[u8]) -> Option<String> {
+        None
+    }
     /// 文本渲染:内容 → (纹理, 宽, 高);None = 不可用(不进景)。
     fn text(&mut self, content: &str) -> Option<(TexId, u32, u32)>;
 }
@@ -158,6 +199,19 @@ pub enum Command {
     /// CGACT[COPY/COPY2] = 模板层 → 目标层合成结果复制(引擎方向:ID=源、
     /// ID2=目标;成果 134 三次语料验证)。目标层此后渲染取源层合成结果。
     CopyAlias { dst: LayerId, src: LayerId },
+    /// `CGACT[RECTPAINT/RECTPAINT2/RECTPAINT3]` = 用指定颜色填图层通道。
+    ///
+    /// 手册 `cg/cgact.html`[18]–[20]。与引擎一致:改写位图、不可逆,
+    /// 换图后失效。本内核在 Stage 侧**烘焙**(渲染该层像素 → 覆盖通道 →
+    /// 作为新像素替换)。
+    Paint {
+        /// 目标层(引擎 `ID`)。
+        dst: LayerId,
+        /// 填充模式。
+        kind: PaintKind,
+        /// `SET` 原值(`RECTPAINT3` = 0xAARRGGBB)。
+        color: i64,
+    },
     /// 消息窗开合(I9)。
     MessageWindow(bool),
     /// TEXT:窗开才进景(位置/字号由宿主 Assets 与 plug 层定;Stage 记层与纹理)。
@@ -195,6 +249,8 @@ struct Entity {
     sy: Option<i64>,
     /// 像素代号:换图自增;BLIT 产物随代号失效(宿主缓存参与)。
     pixel_gen: u64,
+    /// **像素字节**(仅截屏产物:用来实现 `CGACT[RECTPAINT*]` 的"改写位图")。
+    pixels: Option<(Vec<u8>, u32, u32)>,
     /// **创建序**(单调自增;I11 → 成果 159)。
     ///
     /// 引擎的同 Z 层叠放次序 = **创建序(链表序)**(`docs/engine/render/
@@ -226,6 +282,7 @@ impl Entity {
             sx: None,
             sy: None,
             pixel_gen: 0,
+            pixels: None,
             seq,
             carry_tex: None,
         }
@@ -458,7 +515,22 @@ impl Stage {
                     file,
                     slots,
                     fallback_z,
-                } => self.apply_layer(*id, name, file, slots, *fallback_z, assets),
+                } => {
+                    // **同批内 Kill → Layer:撤销那次延迟删除(勘误 2026-10-18)**。
+                    // 引擎的 `CGEND` 从链表摘除、随后的 `CG` 重建同名对象;
+                    // 本实现的 Kill 延迟到批末,若同批又建了同名层,批末仍会
+                    // 把它删掉 —— 实测 `s66` 每帧 `CGEND SPLBUF401` 紧接
+                    // `CG SPLBUF401 FILE=…`,新层被删 ⇒ 下一帧 `CGACT[SIZE]`
+                    // 报「复制找不到源层」、画面全黑。
+                    //
+                    // 只撤销删除、**不销毁实体**:重建后的层仍按同名对象持有
+                    // 属性(引擎未给的槽不重置),销毁会让每帧重建的动画层
+                    // 反复回到缺省态。
+                    if let Some(pos) = deferred_kills.iter().position(|k| k == id) {
+                        deferred_kills.swap_remove(pos);
+                    }
+                    self.apply_layer(*id, name, file, slots, *fallback_z, assets)
+                }
                 Command::Kill(id) => {
                     if std::env::var_os("YURIS_TRACE_KILL").is_some() {
                         let nm = self
@@ -485,6 +557,11 @@ impl Stage {
                     // 新截图(黑幕自锁:幕布拍到的全是自己,永远黑)。
                     let mut view = scene.clone();
                     self.project(&mut view);
+                    // **注意:截屏**包含**目标层的上一帧内容**(引擎抓的是
+                    // 当前屏幕,目标层此刻若已在屏上就会被拍到)。这不是缺陷
+                    // —— `CGS100` 正是靠这条"自我累积"承载整屏画面的。
+                    // 反例留痕:曾在此 `view.hide_layer(dst)` 排除目标层,
+                    // 实测开屏 LOGO 立刻全黑(整条累积链被切断)。
                     if std::env::var_os("YURIS_TRACE_SNAPVIEW").is_some() {
                         let vis: Vec<String> = view
                             .drawable_layers()
@@ -539,6 +616,7 @@ impl Stage {
                         Some(e) => {
                             e.pixel = Some(Pixel::Alias(*src));
                             e.pixel_gen += 1;
+                            e.pixels = None;
                         }
                         None => {
                             // **目标层已不存在时不得凭空重建(勘误 2026-10-17)**。
@@ -564,6 +642,7 @@ impl Stage {
                     }
                 },
                 Command::MessageWindow(open) => self.window_open = *open,
+                Command::Paint { dst, kind, color } => self.apply_paint(*dst, *kind, *color, assets),
                 Command::Text { layer, content } => self.apply_text(*layer, content, assets),
                 Command::TextClear(id) => {
                     if Some(*id) == self.text_layer {
@@ -657,6 +736,7 @@ impl Stage {
                     if changed {
                         ent.pixel = Some(Pixel::Solid);
                         ent.pixel_gen += 1;
+                        ent.pixels = None;
                         if self.solid_tex.is_none() {
                             self.solid_tex = Some(assets.solid());
                         }
@@ -667,6 +747,9 @@ impl Stage {
                 if !same {
                     ent.file = Some(f.clone());
                     ent.pixel_gen += 1;
+                    // 换图 = 新像素,旧填色失效(手册:还原靠重新读图)。
+                    ent.pixels = None;
+                    // 换图 = 新像素,旧通道填充失效(手册:还原靠重新读图)。
                     match assets.resolve(f, &ent.name) {
                         Some(tex) => ent.pixel = Some(Pixel::Product(tex)),
                         None => {
@@ -674,6 +757,9 @@ impl Stage {
                             // 渲染时无纹理被跳过 —— 用户只看到「这层不显示」。
                             // 现在按文件名去重打横幅(资源缺失/名字编码问题)。
                             let nm = String::from_utf8_lossy(f).into_owned();
+                            let reason = assets
+                                .explain_miss(f)
+                                .unwrap_or_else(|| "宿主未提供原因".to_string());
                             yuris_log::alert_once(
                                 module_path!(),
                                 format!("layer-resolve:{nm}"),
@@ -681,8 +767,8 @@ impl Stage {
                                     "图层纹理解析失败\n\
                                      FILE: {nm}\n\
                                      层名: {}\n\
-                                     后果: 该层无纹理,渲染时被跳过(不上屏)\n\
-                                     处置: 检查资源是否在封包内 / CP932 名字是否可回查",
+                                     原因: {reason}\n\
+                                     后果: 该层无纹理,渲染时被跳过(不上屏);其余层照常",
                                     String::from_utf8_lossy(&ent.name)
                                 ),
                             );
@@ -750,7 +836,11 @@ impl Stage {
             return;
         };
         match self.entities.get_mut(&dst) {
-            Some(e) => e.pixel = Some(Pixel::Product(tex)),
+            Some(e) => {
+                e.pixel = Some(Pixel::Product(tex));
+                // 拷贝产物 = 新像素 ⇒ 旧通道填色失效(手册:还原靠重读图)。
+                e.pixels = None;
+            }
             None => {
                 // 先搬运后建层的挂回(引擎同批内汇合;目标层创建会覆盖 carry_tex 语义)
                 let seq = self.take_seq();
@@ -763,13 +853,110 @@ impl Stage {
         }
     }
 
+    /// `CGACT[RECTPAINT*]`:把指定颜色填进图层通道(手册 `cg/cgact.html`[18]-[20])。
+    ///
+    /// 语义 = **逐像素改写图层自己的位图**(与图层在屏幕上的位置无关)。
+    /// 本内核只有截屏产物持有 CPU 侧字节 ⇒ 就地覆盖通道后重新上传,
+    /// 与引擎"改写位图"完全同语义(**不可逆**);其余像素源没有可写字节,
+    /// 如实告警(铁律 2)。
+    fn apply_paint(&mut self, dst: LayerId, kind: PaintKind, color: i64, assets: &mut dyn Assets) {
+        let Some(e) = self.entities.get_mut(&dst) else {
+            // 引擎:对不存在的层做加工 = 错误路径,不凭空建层(同 I5)。
+            return;
+        };
+        // ---- 真实图像层:按 FILE 解码出字节(改写后仍是同尺寸纹理)----
+        if e.pixels.is_none() {
+            if let Some(f) = e.file.clone() {
+                if !f.is_empty() {
+                    if let Some(px) = assets.decode_rgba(&f) {
+                        e.pixels = Some(px);
+                    }
+                }
+            }
+        }
+        // ---- 纯色层(FILE="" = 1×1 黑):按定义生成 1×1 字节后改写 ----
+        // 手册示例[3]:`FILE=""` = 1×1 黑色图像;`SX/SY` 只做拉伸。
+        // 因此它的"位图"就是 1 个像素,改写后仍由 SX/SY 拉伸显示。
+        if matches!(e.pixel, Some(Pixel::Solid)) && e.pixels.is_none() {
+            e.pixels = Some((vec![0, 0, 0, 255], 1, 1));
+        }
+        let Some((rgba, w, h)) = e.pixels.as_mut() else {
+            yuris_log::alert_once(
+                module_path!(),
+                format!("paint-no-bytes:{dst:#x}"),
+                format!(
+                    "CGACT 矩形填色需要改写位图,但该层没有可写像素字节
+                     层: {} id={dst:#x} kind={kind:?} SET={color:#x}
+                     后果: 本次填色未生效(目前仅截屏产物与纯色层支持)",
+                    String::from_utf8_lossy(&e.name)
+                ),
+            );
+            return;
+        };
+        let c = color as u32;
+        let (r, g, b) = (
+            ((c >> 16) & 0xFF) as u8,
+            ((c >> 8) & 0xFF) as u8,
+            (c & 0xFF) as u8,
+        );
+        // 取值位按模式区分(手册示例):
+        //   RECTPAINT  SET=0x2840ff   → rgb = 低 24 位,α 保持
+        //   RECTPAINT2 SET=0x80       → α   = 低 8 位
+        //   RECTPAINT3 SET=0xff2840ff → α = 高 8 位 + rgb = 低 24 位
+        let alpha = match kind {
+            PaintKind::Alpha => (c & 0xFF) as u8,
+            _ => ((c >> 24) & 0xFF) as u8,
+        };
+        let (pw, ph) = (*w, *h);
+        for px in rgba.chunks_exact_mut(4) {
+            match kind {
+                PaintKind::Rgb => {
+                    px[0] = r;
+                    px[1] = g;
+                    px[2] = b;
+                }
+                PaintKind::Alpha => px[3] = alpha,
+                PaintKind::Both => {
+                    px[0] = r;
+                    px[1] = g;
+                    px[2] = b;
+                    px[3] = alpha;
+                }
+            }
+        }
+        let new_tex = assets.upload_rgba(rgba, pw, ph);
+        if let Some(tex) = new_tex {
+            if let Some(e) = self.entities.get_mut(&dst) {
+                e.pixel = Some(Pixel::Product(tex));
+                e.pixel_gen += 1;
+            }
+        } else {
+            yuris_log::alert_once(
+                module_path!(),
+                format!("paint-upload-fail:{dst:#x}"),
+                format!(
+                    "CGACT 矩形填色改写后上传失败
+层: {} id={dst:#x}",
+                    String::from_utf8_lossy(&e.name)
+                ),
+            );
+        }
+    }
+
     fn apply_snapshot(&mut self, view: &Scene, dst: LayerId, assets: &mut dyn Assets) {
-        match assets.snapshot(view, dst) {
-            Some(tex) => match self.entities.get_mut(&dst) {
+        // 取像素字节一并缓存:`CGACT[RECTPAINT*]` 要"改写位图",而截屏产物
+        // 是本内核唯一字节可得的像素源(见 `Assets::snapshot_ex`)。
+        let shot = match assets.snapshot_ex(view, dst) {
+            Some(v) => Some(v),
+            None => assets.snapshot(view, dst).map(|t| (t, Vec::new(), 0, 0)),
+        };
+        match shot {
+            Some((tex, rgba, w, h)) => match self.entities.get_mut(&dst) {
                 Some(e) => {
                     e.pixel = Some(Pixel::Product(tex));
                     e.pixel_gen += 1;
                     e.carry_tex = None;
+                    e.pixels = if rgba.is_empty() { None } else { Some((rgba, w, h)) };
                 }
                 None => {
                     // 目标层不存在 ⇒ 截图落点由本次操作**建立**(幕布缓冲层;
@@ -783,6 +970,7 @@ impl Stage {
                     let seq = self.take_seq();
                     let mut e = Entity::new(Vec::new(), 0, seq);
                     e.carry_tex = Some(tex);
+                    e.pixels = if rgba.is_empty() { None } else { Some((rgba, w, h)) };
                     self.entities.insert(dst, e);
                 }
             },
@@ -954,6 +1142,7 @@ impl Stage {
                 ..Default::default()
             };
             layer.alias_of = alias_src;
+            
             // 过渡与遮罩:提交时把层名落到 TexId(沿用播放器 resolve 约定)。
             // (Assets 不在 commit 签名里;这里用与播放器同源的 fnv 纹理约定,
             //  resolve 未命中的名字由播放器纹理层表现为"加载失败",不臆造。)

@@ -191,6 +191,14 @@ impl GroupVm {
         let mut ctex: Option<i64> = None;
         let mut cdxbuf: Option<i64> = None;
         let mut cdxdraw: Option<i64> = None;
+        // **LINT/LINT2/REMALLOC**(v494 `CG` 处理体实证,见 `CgState` 文档):
+        // 三者都是**图层对象持久字段**,不是一次性效果。旧实现落到
+        // 「未建模参数槽」大告警里 —— 值丢弃 ⇒ `CGINFO[LINT=1 LET=@v]`
+        // 恒读到 0。现按名解析并落库;渲染侧的插值/缓冲重分配仍未实现,
+        // 但查询往返是真值。
+        let mut clint: Option<i64> = None;
+        let mut clint2: Option<i64> = None;
+        let mut cremalloc: Option<i64> = None;
         let cmd = g.command_type;
         for w in windows {
             if w.len == 0 {
@@ -279,6 +287,18 @@ impl GroupVm {
                     if let Value::Int(n) = &v {
                         csy = Some(*n);
                     }
+                } else if self.slot_is(cmd, slot, "LINT", 43) {
+                    if let Value::Int(n) = &v {
+                        clint = Some(*n);
+                    }
+                } else if self.slot_is(cmd, slot, "LINT2", 44) {
+                    if let Value::Int(n) = &v {
+                        clint2 = Some(*n);
+                    }
+                } else if self.slot_is(cmd, slot, "REMALLOC", 32) {
+                    if let Value::Int(n) = &v {
+                        cremalloc = Some(*n);
+                    }
                 } else if self.command_dispatch().profile().has_params() {
                     // **未建模的 CG 参数槽**:以前整块静默丢弃。CG 有 ~55 个
                     // 效果/渐变槽(见 `bridge.rs` 的表),未建模 = 画面效果
@@ -339,6 +359,10 @@ impl GroupVm {
                 if let Some(e) = ce {
                     st.e = e;
                 }
+                // A(不透明度 0〜256;引擎图层 +0x80)。CGINFO[A=1] 读回。
+                if let Some(a) = ca {
+                    st.a = a;
+                }
                 // 过渡/遮罩/描画模式(成果 125;手册关键字)。
                 if let Some(t) = ct {
                     st.t = Some(t);
@@ -354,6 +378,21 @@ impl GroupVm {
                 }
                 if let Some(m) = cmode {
                     st.mode = Some(m);
+                }
+                // LINT/LINT2/REMALLOC/TEX:图层对象持久字段(见 `CgState`)。
+                // 「未给槽保持原值」与引擎逐槽 if 写同族。
+                if let Some(v) = clint {
+                    st.lint = Some(v);
+                }
+                if let Some(v) = clint2 {
+                    st.lint2 = Some(v);
+                }
+                if let Some(v) = cremalloc {
+                    st.remalloc = Some(v);
+                }
+                // 引擎 `CG TEX` 只在值 == 1 时置位(0x42b011 dec/or/je 判定)。
+                if ctex == Some(1) {
+                    st.tex = true;
                 }
                 if let Some((w, h)) = image_dims {
                     st.img_w = w;
@@ -703,8 +742,19 @@ impl GroupVm {
             match self.cg_registry.get(name) {
                 Some(st) => match qname.as_str() {
                     "EXIST" => answer = Some(1),
+                    "E" => answer = Some(st.e),
+                    "A" => answer = Some(st.a),
                     "X" => answer = Some(st.x),
                     "Y" => answer = Some(st.y),
+                    "Z" => answer = Some(st.z),
+                    "MODE" => answer = Some(st.mode.unwrap_or(0)),
+                    "T" => answer = Some(st.t.unwrap_or(0)),
+                    "TA" => answer = Some(st.ta.unwrap_or(0)),
+                    "LINT" => answer = Some(st.lint.unwrap_or(0)),
+                    "LINT2" => answer = Some(st.lint2.unwrap_or(0)),
+                    // `TEX` = 图层 +0xa4 的字节(v494 `CGINFO` 0x43d8cf
+                    // 读 `[edx+0xa4]`;`CG TEX=1` 置位)。0/1。
+                    "TEX" => answer = Some(i64::from(st.tex)),
                     "SX" => answer = Some(if st.size_explicit { st.sx } else { st.img_w }),
                     "SY" => answer = Some(if st.size_explicit { st.sy } else { st.img_h }),
                     "COLOR" => answer = Some(st.color),

@@ -1363,8 +1363,17 @@ fn apply_ysvr_kind2_applies_matching_script_entries() {
     assert_eq!(vm.apply_ysvr_for_script(23).unwrap(), 0);
 }
 
-/// SAVE(0x56):SET 引用 ← 位图置位/清零(引擎 CMDH_00451838 a0 分支:
-/// INT desc → 1/0,FLT desc → 1.0/0.0;语料 298 组 [DNO,SET]×284)。
+/// SAVE(0x56):`SET` = **要保存的变量**,不是写回目标。
+///
+/// **勘误(2026-10-18)**:官方手册 `file/save.html` 写明
+/// `SET = 変数名`(「保存する変数」),而 `LET = 変数名` 才是读取目标
+/// (`file/load.html`)。旧实现把 SET 引用当左值写入 `set_flag?1:0`
+/// —— 等于"每存一次档就把被存变量改成 0/1"。v555 布局下该缺陷被
+/// `_` 分支挡住;按参数名解析到 v494 的 SET(槽 2)后立刻炸出
+/// `array dimension mismatch: got 0 indices, declared 2`(@1113 是
+/// `INT[256,128]`)。
+///
+/// 本内核没有存档容器 ⇒ 只记录「要保存谁」,**绝不回写**。
 /// 真实语料形态:script25 `SAVE[DNO=1, SET=$1042]`。
 #[test]
 fn save_sets_bitmap_target() {
@@ -1389,10 +1398,9 @@ fn save_sets_bitmap_target() {
     vm.store_mut().set(&VarRef { space: VarSpace::At, id: 6001 }, Value::Int(0));
     let s = vm.run(100).unwrap();
     assert_main_script_yields(&s);
-    // 引擎 a0:desc INT → SET 求值(缺省无值窗)位图写 1(语料 [DNO,SET] 全部置位)
-    // 注:SET 值窗未给 → set_flag=false → 写 0(清零路径;语料亦存在)
+    // SET = 要保存的变量 ⇒ 值必须**保持不变**(不得回写)。
     let v = vm.store().get(&VarRef { space: VarSpace::At, id: 6001 }).unwrap();
-    assert_eq!(v, &Value::Int(0), "SET 窗无值 → 清零路径写 0");
+    assert_eq!(v, &Value::Int(0), "SAVE 不得改写被保存的变量");
     // 事件断言
     assert!(vm.events().iter().any(|e| matches!(
         e,
@@ -1419,8 +1427,8 @@ fn save_sets_bitmap_target() {
     assert_main_script_yields(&s2);
     assert_eq!(
         vm2.store().get_elem(&VarRef { space: VarSpace::At, id: 6002 }, &[0]).unwrap(),
-        &Value::Float(1.0),
-        "FLT 位图置位 = 1.0(引擎 0x3ff0000000000000)"
+        &Value::Float(0.0),
+        "SAVE 不得改写被保存的数组元素(旧实现误写 1.0)"
     );
 }
 

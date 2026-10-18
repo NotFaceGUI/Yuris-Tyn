@@ -10515,3 +10515,155 @@ git diff --stat --ignore-cr-at-eol       # 与 git diff --stat 数字一致(无�
   仍 `use yuris_scenario::{Element, Param, Scenario}` 并调用 `parse_scenario_auto` /
   `decode_text`;被并入 VM 的是**剧本通道运行器**(原在 player-core,2026-10-17 迁入),
   不是这个解析 crate —— 故保留。
+
+## 2026-10-18(告警对齐)— 成果 193:**SAVE/LOAD 槽位按名解析(真 bug)+ CG/FONT 属性槽建模 + RECTPAINT 族真实现(改写位图)** —— Confirmed(参数表实测 + 引擎手册 + 475 测试)
+
+### 一、这串告警里混着的真 bug:SAVE/LOAD 用错槽
+
+`CG`/`CGINFO`/`FONT` 一直按**游戏自身 YSCM 的参数名**解析槽位(正确);
+但 `SAVE`/`LOAD` 仍按**写死的 v555 槽序** `match slot`。本作 v494 是
+`FILE(0) DNO(1) SET(2) ID(3) IDNO(4) G_INT(5)…`,于是 SAVE 的 DNO 落到
+槽 1 被判「未知槽」,`G_INT2`(槽 6)/`G_STR2`(槽 14)同样被丢弃;
+LOAD 把 DNO 当 MEM、把 LET 引用窗当 ID 值求值。
+
+**改法**:全部槽位走 `param_slot(cmd, "名字", fallback)`(无参数表才回落
+v555 号,且经 `note_slot_fallback` 可观测)。
+
+**SAVE 的 SET 语义勘误(手册 Confirmed)**:`SET = 保存する変数`,
+`LOAD` 才是 `LET = 格納先`。旧实现把 SET 引用当左值写入 `set_flag?1:0`
+—— 等于「每存一次档就把被存变量改成 0/1」。v555 布局下被 `_` 分支挡住,
+按名解析到 v494 的 SET 后立刻炸出
+`array dimension mismatch: got 0 indices, declared 2`(@1113 是
+`INT[256,128]`)。现只记录「要保存谁」,**绝不回写**。
+
+**12 个自备槽 = 恢复组选择位**:SDK 自带 `es_GSD.yst` 的
+`SAVE[DNO=03 G_INT2=1]` 紧邻注释掉的 `SAVE[DNO=03 SET=@G()]`(等价写法)。
+现统计该组覆盖的 YSVR `kind==1` 变量数并记入事件。
+
+### 二、CG / FONT 属性槽(不再是"未建模")
+
+- `CG` 新增 **LINT/LINT2/REMALLOC/TEX** 落库。引擎 v494 处理体实证:
+  LINT→`+0x58`、LINT2→`+0x60`、REMALLOC→`+0x214`、TEX→`+0xa4`。
+- `CGINFO` 相应新增 `E/A/Z/MODE/T/TA/LINT/LINT2/TEX` **按名应答**。
+- `FONT NAME` 保存 CP932 原文;`FONTINFO NAME=1` 以**字符串**写回 LET。
+
+### 三、`CGACT[RECTPAINT/RECTPAINT2/RECTPAINT3]` 真实现
+
+手册 `cg/cgact.html`[18]–[20]:三种模式分别填 **RGB / α / 0xAARRGGBB**。
+引擎语义 = **逐像素改写图层自己的位图**(与图层在屏幕上的位置无关),
+且**不可逆**(「元のイメージには戻せません」)。
+
+本内核没有通用纹理回读,按像素源分三条路径**改写字节后重新上传**
+(Stage 内 `apply_paint`,不碰渲染管线):
+
+| 像素源 | 取字节方式 |
+|---|---|
+| 截屏产物(`Pixel::Product` from COPY2) | `Assets::snapshot_ex` 随截图一并返回字节 |
+| 纯色层(`FILE=""`,1×1) | 按手册定义生成 `[0,0,0,255]` 1×1 字节 |
+| 真实图片层(有 FILE) | `Assets::decode_rgba` 解码 FILE 指向的图像 |
+
+改写后 `upload_rgba` 上传为新纹理并替换该层像素;换像素(FILE/截屏/拷贝)
+时清空缓存字节(等价于引擎"重新读图")。
+
+**参数取值位按模式区分**(手册示例):
+`RECTPAINT SET=0x2840ff` → rgb;`RECTPAINT2 SET=0x80` → α = **低 8 位**;
+`RECTPAINT3 SET=0xff2840ff` → α = 高 8 位 + rgb。
+
+### 四、三次失败实现留痕(避免重犯)
+
+1. **着色器每帧覆盖通道**(场景层字段 + uniform):`CGS100` 这类全屏截屏
+   缓冲每帧拍到自己 ⇒ 画面冻在某一帧,标题菜单动画消失。
+2. **着色器版 α 一律取 `SET>>24`**:`RECTPAINT2 SET=0xff` 算出 α=0 ⇒
+   全屏缓冲全透明 ⇒ 开屏全黑。
+3. **烘焙法(按屏幕矩形裁剪渲染结果)**:`SMTX rect=(60,-600,…)` 在画布外
+   ⇒ 失败;且引擎填色与屏幕位置无关,方案本身错。
+4. **填色产物纹理 id 按"字节数+宽高"派生**:每帧值相同 ⇒ 命中缓存返回
+   第一张(空黑帧)⇒ 标题背景全黑。改为**单调序号轮转 rid**。
+
+### 五、其它
+
+- 纹理解析失败告警带**原因**(`PacFileIndex::explain_image_miss`:
+  包内不存在 / 载荷非图像 / 解码失败)。本作仅剩的 2 条已确证为
+  **封包内确实不存在**(`cgsys/main/nextvoice/icon_01`、`cg/face/face_back`,
+  12211 条目全量检索 + 扩展名探测序/CP932/大小写归一全穷举)。
+- 同批 `Kill → Layer` 撤销延迟删除(修 `s66` 每帧
+  `CGEND SPLBUF401` → `CG SPLBUF401 FILE=…` 导致「复制找不到源层」)。
+
+### 验证
+
+```bash
+cargo check --workspace --all-targets   # 0 error / 0 warning
+cargo test  --workspace --no-fail-fast  # 474 passed / 0 failed / 1 ignored
+git diff --numstat crates/yuris-render/src/lib.rs crates/yuris-scene/src/lib.rs  # 空
+```
+
+实机(`<game-b>`):WARN 只剩上述 2 条"包内不存在"。
+帧序亮度 60/100/140/240 = 103.7 / 136.0 / 160.6 / 180.0(logo 淡入正常),
+标题段 260→280 有 17697 像素变化(菜单动画在动)。
+
+**测试同步更新**:`save_sets_bitmap_target` 原断言"SAVE 回写变量 1.0",
+按手册勘误改为"不得改写被保存的变量"。
+
+
+## 2026-10-18(遗留登记)— 待办:**logo 淡出 → title 之间约 3 帧纯黑(非本轮引入)**
+
+### 现象(实测,可复现)
+
+`<game-b>` 启动时序逐帧亮度(逻辑画布 1100×825,`--shot` 帧量化):
+
+```
+f158-163  170.3 → 171.7   (logo 全显)
+f164-166  **0.0**          ← 纯黑(3 帧)
+f167-176  100.7 → 148.3   (title 背景淡入)
+```
+
+### 已确证:与成果 193 的改动无关
+
+把工作区**整体还原到 HEAD**(仅 `git show` 覆盖、无 git 写操作)后重跑同一段,
+f164-166 同样为 0.0 —— **HEAD 基线即存在该黑屏**,不是本轮 SAVE/LOAD/CG/RECTPAINT
+改动引入的回归。
+
+### 机制(事件序实测)
+
+```
+f164  CGEND SPL401                       ← logo 实体销毁
+f164  scene visible=3(只剩 SKIPICON/CLICK/CTRLSKIP)
+      ⇒ 屏幕上没有任何内容层 → 黑
+f166  CG CGS100 E=1 A=0
+      CGACT :/W0/ COPY2 → CGS100         ← 截的是**此刻已黑的屏幕**
+      CGACT CGS100 RECTPAINT2 SET=255
+      CG CGS100 A=256
+      CG CGS1  E=1 A=0
+      CGACT :/W0/ COPY2 → CGS1           ← 同样是黑
+      CG CGS1 A=256
+      CG BT.OFFES.TITLE.TIP.BG FILE=cgsys/title/back1   ← title 从这里才开始建
+f167  title 淡入可见
+```
+
+即:**幕布 CGS100 在 logo 被销毁后已处于 A=0(不可见),而 title 相位要到下一轮
+才建层**,中间这一帧窗口里屏幕无内容 ⇒ 黑。官方引擎这里应表现为
+"logo 淡出 → title 淡入"的交叉叠化(见 `docs/handoff-boot-scheduler.md` §0 症状 #2)。
+
+### 两个最可能的根因(需下一步取证)
+
+1. **`SnapshotTo` 用"当前实体投影"而不是"上一呈现帧"**
+   (`yuris-stage` `Command::SnapshotTo` 里 `let mut view = scene.clone(); self.project(&mut view);`)。
+   引擎「スクリーンショット」抓的是**已呈现的帧缓冲**;本内核抓的是本批已执行的
+   实体状态。若改为抓"最近一次非空呈现帧",f166 的 CGS100/CGS1 就会拿到
+   logo 的最后一帧,黑屏自然消失、且形成交叉叠化。
+   *风险*:与 I6 的既有修复(截屏要看到同批 `CG[E=1 A=0]` 的 patch)冲突,
+   需要区分"同批 patch 可见"与"已销毁实体仍留在呈现帧"两件事。
+2. **幕布淡出时长被钳成 1 帧**(成果 163 已记录):`es.CGFADEEXEC` 收到 0 →
+   `@0x0732 <= 0` → 置 1,幕布约 62 ms 就退场。若官方对 0 的解释是
+   "用缺省时长",则应有渐变重叠窗口。
+
+### 下一步探针(建议顺序)
+
+1. `YURIS_TRACE_CG=CGS100 YURIS_TRACE_SNAPVIEW=1` 逐帧确认 CGS100 的
+   `A` 与快照内容,定位 fade 完成时刻;
+2. 对照官方 trace(`scripts/engine_trace.py`,Windows + 32 位引擎)取
+   logo→title 之间官方 `CG CGS100` 的 `A/T` 序列;
+3. 若确认根因 1,改 `SnapshotTo` 为"最近非空呈现帧"并加回归测试:
+   同批 `CGEND` 后 `COPY2` 必须仍拍到被销毁层(这正是成果 134 的延迟 Kill 语义)。
+
+**当前状态**:已登记为待办,本轮未改(改动会触碰 stage 批语义,需先取证再动)。
