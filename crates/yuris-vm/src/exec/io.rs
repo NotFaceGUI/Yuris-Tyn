@@ -14,7 +14,7 @@ use crate::exec::Action;
 use crate::util::{
     extract_var_target, value_summary, VarTarget,
 };
-use crate::{cmd, GroupVm};
+use crate::GroupVm;
 impl GroupVm {
 
 
@@ -61,6 +61,7 @@ impl GroupVm {
             .collect();
 
         let mut file = None;
+        let mut load_id: Option<Vec<u8>> = None;
         let mut mem: Option<i64> = None;
         let mut dno: Option<i64> = None;
         let mut groups: Vec<&'static str> = Vec::new();
@@ -93,9 +94,15 @@ impl GroupVm {
                     mem = v.as_int_opt();
                 } else if Some(slot) == s_dno {
                     dno = v.as_int_opt();
-                } else if Some(slot) == s_id || Some(slot) == s_idno {
-                    // 图层载入(ID/IDNO)未实装 —— 明确留痕,不静默。
-                    self.note_unknown_slot(cmd, slot, "LOAD 图层载入(ID/IDNO)未实装");
+                } else if Some(slot) == s_id {
+                    // ID = 层名(btype1 存档截图块的目标层;成果 196)。
+                    if let Value::Str(b) = &v {
+                        load_id = Some(b.clone());
+                    }
+                } else if Some(slot) == s_idno {
+                    // IDNO = 图层文件序号(引擎拼 `save\<ID><IDNO>` 路径;
+                    // 本作语料恒走 ID 路径,IDNO 未出现 —— 留痕)。
+                    self.note_unknown_slot(cmd, slot, "LOAD IDNO(语料未出现)");
                 } else if let Some((_, gname)) = group_slots.iter().find(|(s, _)| *s == slot) {
                     if matches!(&v, Value::Int(n) if *n != 0) {
                         groups.push(gname);
@@ -108,30 +115,44 @@ impl GroupVm {
         }
         if !groups.is_empty() {
             // 12 个自备槽 = 恢复组选择位(见 SAVE_GROUP_SLOTS 文档)。
-            // 存档容器(.sd)读写尚未实装 ⇒ 只记录意图,不写假值。
-            evaluated.push((
-                254,
-                format!("全局组读取 {:?}(存档容器未实装)", groups),
-            ));
+            // btype=2 装载按子块自带 var 写回,与 LET 无关;组选择位本身
+            // 只是意图记录(与 SAVE 侧对称)。
+            evaluated.push((254, format!("全局组读取 {groups:?}")));
         }
-        if let (Some(fname), Some(dno_v), Some(lval)) = (file.clone(), dno, &target) {
+        if let (Some(fname), Some(dno_v)) = (file.clone(), dno) {
             if let Some(mem_v) = mem {
                 if mem_v != 0 {
                     return Err(self.halt_err(
                         self.pc,
-                        cmd::LOAD,
+                        g.command_type,
                         "LOAD MEM(内存源)路径未实现(语料未出现;不猜)",
                     ));
                 }
             }
-            if !lval.indices.is_empty() {
-                return Err(self.halt_err(
+            let target = match &target {
+                Some(lval) => {
+                    if !lval.indices.is_empty() {
+                        return Err(self.halt_err(
+                            self.pc,
+                            g.command_type,
+                            "LOAD 写回目标带下标(基点偏移语义未逆向;语料未出现)",
+                        ));
+                    }
+                    Some(lval.var.clone())
+                }
+                None => None,
+            };
+            let summary = self.load_yssd(&fname, dno_v, target.as_ref(), load_id.as_deref())?;
+            if std::env::var_os("YURIS_TRACE_LOAD").is_some() {
+                yuris_log::trace_forced!(
+                    "[load] s{} pc{} file={:?} dno={dno_v} target={:?} → {summary}",
+                    self.ctx.script_id,
                     self.pc,
-                    cmd::LOAD,
-                    "LOAD 写回目标带下标(基点偏移语义未逆向;语料未出现)",
-                ));
+                    String::from_utf8_lossy(&fname),
+                    target.as_ref().map(yuris_value::VarRef::display),
+                );
             }
-            self.load_yssd(&fname, dno_v, &lval.var)?;
+            evaluated.push((254, summary));
         }
         self.push_event(VmEvent::Load {
             pc: self.pc,
@@ -142,32 +163,33 @@ impl GroupVm {
         return Ok(Action::Keep);
     }
 
-    /// 处理 `Save`(从 `run_main` 拆出;语义逐行照搬)。
+    /// `SAVE` 预留/刷盘(v494 处理器 `0x44c2d8` 直译;2026-10-18 实装)。
+    ///
+    /// 引擎语义(手册 `file/save.html` + 反汇编):
+    /// - `SAVE[DNO=… SET=@v]` —— 把变量**当前值**序列化成 YSSD 块体,
+    ///   存进预留表(引擎 `0x44d5a7`:btype/strict/var 头 + compress2;
+    ///   整数组引用 = 全元素,手册示例[3] `SET=@HA()`);
+    /// - `SAVE[DNO=… G_INT2=1]` —— 12 自备槽 = 恢复组选择位,等价
+    ///   `SET=@G()`(SDK `es_GSD.yst` 双写实证)= **btype=2 多变量块**,
+    ///   子块 = 该 (类型,恢复组) 的全部 kind1 全局(引擎 `0x44d740` 形态);
+    /// - `SAVE[FILE=…]` —— 把预留表全部刷盘(容器 = 头 + 0x400 偏移表 +
+    ///   逐块 `dno + 块体`,引擎 `0x44cba7`),然后**清空预留**(手册例[6]);
+    /// - `SAVE[DNO=… ID=…]` —— 配置块(btype=1)预留,序列化的是引擎
+    ///   per-script 配置库(引擎 `0x44d9d0`)—— 本内核配置库未建模,显式
+    ///   留痕不写假块(铁律 2)。
+    ///
+    /// 槽位按游戏自身 YSCM 参数名解析(勘误 2026-10-18,成果 193);v494
+    /// 实测槽序 `FILE(0) DNO(1) SET(2) ID(3) IDNO(4) G_INT(5)…`。
     pub(crate) fn cmd_save(&mut self, g: CommandGroup, windows: &[CommandSlot]) -> Result<Action> {
-        // 引擎 CMDH_00451838(反编译逐分支,2026-09-04):
-        // DNO = 存档号;SET = 位图/变量引用;FILE = 文件名(无 FILE 时
-        // 只做「预留保存」,写出发生在带 FILE 的那一条)。
-        // a0 分支:按 SET 引用的描述符类型写位图 —
-        // INT(desc byte+1==1)→ desc+0x30 区 8B 槽 = SET 值 ?1:0;
-        // FLT(byte+1==2)→ desc+0x34 区 8B = SET 值 ?1.0:0.0;
-        // STR(==3)→ FUN_0045b9f8 显示层(无存储写入)。
-        // 语料 298 组:[DNO,SET]×284(=a0 分支置位/清零)、[FILE]×10、
-        // [SET]×2、[DNO,ID]×2。SET 引用是左值目标(提取后写值)。
-        //
-        // **槽位按参数名解析(勘误 2026-10-18)**:旧实现写死 v555 槽号
-        // (`2=DNO / 3=SET / 0=FILE`),而本作 v494 是 `FILE(0) DNO(1)
-        // SET(2) ID(3) IDNO(4) G_INT(5)…` ⇒ DNO 落到"未知槽"、G_INT2/
-        // G_STR2 等组选择位一律告警丢弃。实机日志 `SAVE 槽 1 = DNO`
-        // 与 `槽 6 = G_INT2` 即此。
         let cmd = g.command_type;
         let slot_of = |me: &Self, name: &str, fallback: u8| -> Option<u8> {
             me.param_slot(cmd, name, fallback)
         };
         let s_file = slot_of(self, "FILE", 0);
-        let s_dno = slot_of(self, "DNO", 2);
-        let s_set = slot_of(self, "SET", 3);
-        let s_id = slot_of(self, "ID", 4);
-        let s_idno = slot_of(self, "IDNO", 5);
+        let s_dno = slot_of(self, "DNO", 1);
+        let s_set = slot_of(self, "SET", 2);
+        let s_id = slot_of(self, "ID", 3);
+        let s_idno = slot_of(self, "IDNO", 4);
         let group_slots: Vec<(u8, &'static str)> = Self::SAVE_GROUP_SLOTS
             .iter()
             .filter_map(|n| slot_of(self, n, 255).map(|s| (s, *n)))
@@ -176,7 +198,8 @@ impl GroupVm {
         let mut dno: Option<i64> = None;
         let mut file: Option<Vec<u8>> = None;
         let mut set_ref: Option<Vec<u8>> = None;
-        let mut set_flag = false;
+        let mut set_summary: Option<String> = None;
+        let mut id_name: Option<String> = None;
         let mut groups: Vec<&'static str> = Vec::new();
         let mut evaluated: Vec<(u8, String)> = Vec::new();
         for w in windows {
@@ -185,9 +208,9 @@ impl GroupVm {
             }
             let slot = (w.tag & 0xff) as u8;
             if Some(slot) == s_set {
-                // SET 双形态:变量引用窗(首 op 0x48/0x56/0x76,
-                // 延迟求值 = SET 目标)/ 纯值窗(SET 置位标志)。
-                // 语料 298 组恒单 SET 窗;双窗形态仅合成测试。
+                // SET 双形态:变量引用窗(首 op 0x48/0x56/0x76 = 保存目标,
+                // 延迟取值)/ 纯值窗(组选择位的值)。勘误(成果 193):
+                // SET 是「保存する変数」,绝不回写。
                 let bytes = self
                     .ctx
                     .script
@@ -201,142 +224,218 @@ impl GroupVm {
                     })
                     .unwrap_or(false);
                 if is_ref {
+                    let target = extract_var_target(&bytes)?;
+                    // 无下标引用(0x76 裸引用)= 整数组保存(手册示例[3]
+                    // `SAVE[… SET=@HA()]`;s37 g50 亦证)。带下标 = 单元素。
+                    let (whole_array, var_ref) = match &target {
+                        VarTarget::Scalar(r) => (self.store.has_array(r), *r),
+                        VarTarget::Indexed(r, _) => (false, *r),
+                    };
+                    set_summary = Some(if whole_array {
+                        format!("{}()", target.summary())
+                    } else {
+                        target.summary()
+                    });
                     set_ref = Some(bytes);
-                } else if let Some(v) = self.eval_window_condition(Some(w))? {
-                    if let Value::Int(n) = &v {
-                        set_flag = *n != 0;
+                    if whole_array {
+                        evaluated.push((252, format!("整数组保存 {}", var_ref.display())));
                     }
+                } else if let Some(v) = self.eval_window_condition(Some(w))? {
                     evaluated.push((slot, value_summary(&v)));
                 }
-            } else {
-                // **勘误(2026-10-13,成果 120)**:引用形窗
-                // (左值,op `0x56`/`0x76`)是**脚本自备存档槽**
-                // (SAVE 按引用读 / LOAD 按引用写回),不是表达式。
-                // 旧实现一律送 `eval_window_condition` ⇒ 命中
-                // 「窗口以左值引用结尾」并**致命挂起**;实机
-                // `s12 g664 SAVE[1, @1113]`(0x76 窗)即此形态,
-                // 后果是标题流程走到存档初始化就整条停摆。
-                // 本内核无存档存储(`yuris-save` 空骨架)
-                // ⇒ 只记录引用、不写值、不猜。
-                let packed = self.ctx.script.window_bytes_pooled_copy(w);
-                let is_ref = packed
-                    .as_ref()
-                    .map(|b| {
-                        yuris_script::decode_window(b)
-                            .map(|ins| {
-                                ins.iter()
-                                    .any(|i| matches!(i.raw_op, 0x56 | 0x76))
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if is_ref {
-                    let sum = packed
-                        .as_ref()
-                        .and_then(|b| extract_var_target(b).ok())
-                        .map(|t| t.summary());
-                    evaluated.push((
-                        slot,
-                        format!(
-                            "引用槽(脚本自备存档槽){}",
-                            sum.unwrap_or_else(|| "?".into())
-                        ),
-                    ));
-                    continue;
-                }
-                let Some(v) = self.eval_window_condition(Some(w))? else {
-                    continue;
-                };
-                if Some(slot) == s_dno {
-                    if let Value::Int(n) = &v {
-                        dno = Some(*n);
-                    }
-                } else if Some(slot) == s_file {
-                    if let Value::Str(b) = &v {
-                        file = Some(b.clone());
-                    }
-                } else if Some(slot) == s_id || Some(slot) == s_idno {
-                    self.note_unknown_slot(cmd, slot, "SAVE 图层保存(ID/IDNO)未实装");
-                } else if let Some((_, gname)) = group_slots.iter().find(|(s, _)| *s == slot) {
-                    if matches!(&v, Value::Int(n) if *n != 0) {
-                        groups.push(gname);
-                    }
-                } else {
-                    // 参数名未建模(或该版本没有这个参数)⇒ 值被忽略。
-                    self.note_unknown_slot(cmd, slot, "SAVE 参数槽(参数名未建模)");
-                }
-                evaluated.push((slot, value_summary(&v)));
+                continue;
             }
-        }
-        if !groups.is_empty() {
-            // 组选择位:SAVE 时的语义 = 把该 (类型,恢复组) 的全部全局变量
-            // 写入存档(= `SET=@G()` 的等价写法;SDK `es_GSD.yst` 实证)。
-            let n = self.ysvr_group_len(groups.as_slice());
-            evaluated.push((
-                253,
-                format!("全局组保存 {:?}({n} 个变量;存档容器未实装)", groups),
-            ));
-        }
-        let mut set_target = None;
-        if let Some(bytes) = set_ref {
-            // **勘误(2026-10-18):SET 是「要保存的变量」,不是写回目标。**
-            //
-            // 官方手册 `file/save.html`:`SET = 変数名`(「保存する変数」);
-            // `LOAD` 才是 `LET = 変数名`(「読み出した値を格納する変数」)。
-            // 旧实现把 SET 引用当左值**写入** `set_flag ? 1 : 0` ——
-            // 那等于每存一次档就把被存的变量改成 0/1。v555 布局下该槽恰
-            // 不落在被执行的 SET 分支里(Long→`_`→is_ref→仅记录),所以
-            // 缺陷没显形;一旦按参数名解析到 v494 的 SET(槽 2),实机
-            // `SAVE[1, @1113]` 立刻炸:「array dimension mismatch: got 0
-            // indices, declared 2」—— @1113 是 INT[256,128] 数组,
-            // 而 `@arr` 无下标形式正是手册示例[3]的**整数组保存**。
-            //
-            // 本内核没有存档容器 ⇒ 只记录「要保存谁」,绝不回写。
-            let target = extract_var_target(&bytes)?;
-            // 无下标引用(0x76 裸引用)= 整数组保存(手册示例[3]
-            // `SAVE[… SET=@HA()]`;s37 g50 亦证)。带下标 = 单元素。
-            let (whole_array, var_ref) = match &target {
-                VarTarget::Scalar(r) => (self.store.has_array(r), *r),
-                VarTarget::Indexed(r, _) => (false, *r),
+            let Some(v) = self.eval_window_condition(Some(w))? else {
+                continue;
             };
-            set_target = Some(if whole_array {
-                format!("{}()", target.summary())
+            if Some(slot) == s_dno {
+                if let Value::Int(n) = &v {
+                    dno = Some(*n);
+                }
+            } else if Some(slot) == s_file {
+                if let Value::Str(b) = &v {
+                    file = Some(b.clone());
+                }
+            } else if Some(slot) == s_id {
+                if let Value::Str(b) = &v {
+                    id_name = Some(String::from_utf8_lossy(b).into_owned());
+                }
+            } else if Some(slot) == s_idno {
+                // IDNO = 图层文件序号(SAVE[ID+IDNO] 的落盘文件名后缀);
+                // 配置块写出未建模,值仅进 evaluated 记录。
+            } else if let Some((_, gname)) = group_slots.iter().find(|(s, _)| *s == slot) {
+                if matches!(&v, Value::Int(n) if *n != 0) {
+                    groups.push(gname);
+                }
             } else {
-                target.summary()
-            });
-            if whole_array {
-                evaluated.push((
-                    252,
-                    format!(
-                        "整数组保存 {} (存档容器未实装)",
-                        var_ref.display()
-                    ),
+                // 参数名未建模(或该版本没有这个参数)⇒ 值被忽略,留痕。
+                self.note_unknown_slot(cmd, slot, "SAVE 参数槽(参数名未建模)");
+            }
+            evaluated.push((slot, value_summary(&v)));
+        }
+
+        // ① 预留(引擎在 SAVE 命令处即时序列化 —— `0x44d5a7` 体)。
+        if let Some(dno_v) = dno {
+            if !(1..=1024).contains(&dno_v) {
+                return Err(self.halt_err(
+                    self.pc,
+                    g.command_type,
+                    format!("SAVE DNO={dno_v} 越界(手册 1~1024)"),
                 ));
             }
-            // `set_flag` 只在非引用形态出现(= 组选择位的值);引用形态下
-            // 它没有语义,不参与任何写入。
-            let _ = set_flag;
+            if let Some(bytes) = set_ref {
+                let body = self.save_body_from_ref(&bytes)?;
+                self.save_reserved.insert(dno_v as u32, body);
+            } else if !groups.is_empty() {
+                let body = self.save_body_from_groups(&groups)?;
+                self.save_reserved.insert(dno_v as u32, body);
+            }
+            if id_name.is_some() {
+                // 配置块(btype=1)写出需要 per-script 配置库(引擎 0x44d9d0
+                // 序列化的是配置子系统的变量)—— 未建模,显式留痕。
+                self.note_unknown_slot(
+                    cmd,
+                    s_id.unwrap_or(255),
+                    "SAVE ID= 配置块写出(配置子系统未建模)",
+                );
+            }
         }
+
+        // ② 刷盘(手册:FILE 关键字写出预留并自动清空;SAVEEND 同清)。
+        if let Some(fname) = file.clone() {
+            let mut b = yuris_format::yssd::YssdBuilder::default();
+            for (d, body) in &self.save_reserved {
+                b.set_block(*d, body.clone());
+            }
+            let blocks = b.block_count();
+            let bytes = b.build();
+            let mut name = String::from_utf8_lossy(&fname).into_owned();
+            if !name.contains('.') {
+                name.push_str(".sd");
+            }
+            let len = bytes.len();
+            self.saved_files.insert(name.clone(), bytes);
+            self.push_event(VmEvent::SaveFile {
+                pc: self.pc,
+                name: name.into_bytes(),
+                len,
+                blocks,
+            });
+            self.save_reserved.clear();
+        }
+
         self.push_event(VmEvent::Save {
             pc: self.pc,
             file,
             dno,
-            set_target,
+            set_target: set_summary,
             evaluated,
         });
         self.pc += 1;
         return Ok(Action::Keep);
     }
 
-    /// 处理 `SAVEEND`(官方手册 `file/saveend.html`):清空 `SAVE` 预留数据。
+    /// SET 引用 → YSSD 块体(压缩;strict=1 —— 引擎 SAVE 序列化恒写 1,
+    /// `0x44d5ac`/`0x44d745`)。标量/单元素 = dims 空载荷;整数组引用 =
+    /// 全元素扁平载荷(行主序,与 [`yuris_value::VariableStore::array_data`]
+    /// 同序,即引擎描述符 memcpy 序)。
+    fn save_body_from_ref(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+        let target = extract_var_target(bytes)?;
+        match target {
+            VarTarget::Scalar(r) => {
+                if self.store.has_array(&r) {
+                    let ty = elem_type_code(self.store.array_elem_type(&r).unwrap());
+                    let dims = self.store.array_dims(&r).unwrap_or_default();
+                    let values = self.store.array_data(&r).unwrap_or(&[]).to_vec();
+                    let payload = payload_from_values(ty, dims, &values)?;
+                    Ok(yuris_format::yssd::encode_block_body(0, 1, r.id, &payload, true))
+                } else {
+                    let (ty, v) = self.scalar_of(&r)?;
+                    let payload = payload_from_values(ty, Vec::new(), std::slice::from_ref(&v))?;
+                    Ok(yuris_format::yssd::encode_block_body(0, 1, r.id, &payload, true))
+                }
+            }
+            VarTarget::Indexed(r, idx_expr) => {
+                let ty = if self.store.has_array(&r) {
+                    elem_type_code(self.store.array_elem_type(&r).unwrap())
+                } else {
+                    self.scalar_ty(&r)?
+                };
+                let indices = self.eval_target_indices(&idx_expr)?;
+                let v = self.store.get_elem(&r, &indices)?.clone();
+                let payload = payload_from_values(ty, Vec::new(), std::slice::from_ref(&v))?;
+                Ok(yuris_format::yssd::encode_block_body(0, 1, r.id, &payload, true))
+            }
+        }
+    }
+
+    /// 恢复组选择位 → btype=2 多变量块体(引擎 `0x44d740` 形态:
+    /// 外层 var 头 = 0,子块自带 var;每子块 = 该组一个全局的整块载荷)。
+    fn save_body_from_groups(&mut self, groups: &[&str]) -> Result<Vec<u8>> {
+        let vars = self.ysvr_group_vars(groups);
+        if vars.is_empty() {
+            return Err(self.halt_err(
+                self.pc,
+                self.cur_cmd(),
+                format!("SAVE 恢复组 {groups:?} 无 kind1 全局(YSVR 未注入或组号错)"),
+            ));
+        }
+        let mut subs: Vec<(&u16, Vec<u8>)> = Vec::with_capacity(vars.len());
+        for (id, ty) in &vars {
+            let r = yuris_value::VarRef {
+                space: yuris_value::VarSpace::At,
+                id: *id,
+            };
+            let payload = if self.store.has_array(&r) {
+                let dims = self.store.array_dims(&r).unwrap_or_default();
+                let values = self.store.array_data(&r).unwrap_or(&[]).to_vec();
+                payload_from_values(*ty, dims, &values)?
+            } else {
+                // kind1 全局在引擎侧恒有描述符(零/初值);本 store 未触碰
+                // 时按类型取零值(与 YSVR 初值应用的零值分支一致)。
+                let v = zero_value(*ty);
+                payload_from_values(*ty, Vec::new(), std::slice::from_ref(&v))?
+            };
+            subs.push((id, payload));
+        }
+        let refs: Vec<(&u16, &[u8])> = subs.iter().map(|(id, p)| (*id, p.as_slice())).collect();
+        Ok(yuris_format::yssd::encode_multi_body(&refs))
+    }
+
+    /// 标量当前值与类型码(未初始化 → 类型零值;描述符语义,见上)。
+    fn scalar_of(&self, r: &yuris_value::VarRef) -> Result<(u8, Value)> {
+        match self.store.get_opt(r) {
+            Some(v) => {
+                let ty = match v {
+                    Value::Int(_) => 1u8,
+                    Value::Float(_) => 2,
+                    Value::Str(_) => 3,
+                };
+                Ok((ty, v.clone()))
+            }
+            None => {
+                let ty = self.scalar_ty(r)?;
+                Ok((ty, zero_value(ty)))
+            }
+        }
+    }
+
+    /// 标量声明类型码(Yaddock:YSVR 无此 id 时报未声明,不猜)。
+    fn scalar_ty(&self, r: &yuris_value::VarRef) -> Result<u8> {
+        self.ysvr_globals
+            .iter()
+            .find(|e| e.var_id == r.id)
+            .map(|e| e.ty)
+            .filter(|t| *t != 0)
+            .ok_or_else(|| {
+                Error::format(format!("SAVE 目标 {} 未声明(YSVR/声明命令无记录)", r.display()))
+            })
+    }
+
+    /// `SAVEEND`(官方手册 `file/saveend.html`):清空 `SAVE` 预留数据。
     ///
-    /// **成果 133**:片头/存档初始化链(`s12 g663`)调用它 —— 未实装时
-    /// strict 模式挂起、掐断后续流程(与 SOUNDEND 同一失效模式)。
-    ///
-    /// 语义:手册说明「把 `SAVE`(无 FILE)依次预留的数据清空;`SAVE[FILE=…]`
-    /// 写盘时会自动清空」。本内核的 `SAVE` 是**逐条即时事件化**
-    /// (不积累预留列表),故 SAVEEND 等价于"释放预留缓冲"——无缓冲可清,
-    /// 行为等价于空操作;事件化记录以保持对拍可见。
+    /// 本内核的预留表 = [`GroupVm::save_reserved`];`SAVE[FILE=…]` 刷盘
+    /// 时已自动清空(手册例[6]),SAVEEND = 无条件清空 + 事件化记录。
     pub(crate) fn cmd_saveend(&mut self, g: CommandGroup, windows: &[CommandSlot]) -> Result<Action> {
         let _ = g;
         let mut evaluated: Vec<(u8, String)> = Vec::new();
@@ -349,6 +448,11 @@ impl GroupVm {
                 evaluated.push((slot, value_summary(&v)));
             }
         }
+        let cleared = self.save_reserved.len();
+        self.save_reserved.clear();
+        if cleared > 0 {
+            evaluated.push((253, format!("清空预留 {cleared} 块")));
+        }
         self.push_event(VmEvent::SaveEnd {
             pc: self.pc,
             evaluated,
@@ -356,6 +460,7 @@ impl GroupVm {
         self.pc += 1;
         return Ok(Action::Keep);
     }
+
 
     /// `ERROR[NO=… COM_CG=… …]`:**错误输出级别配置**(不是错误触发)。
     ///
@@ -563,4 +668,51 @@ impl GroupVm {
         self.pc += 1;
         Ok(Action::Keep)
     }
+}
+
+/// 数组元素类型 → YSSD 载荷类型码(1=INT 2=FLT 3=STR)。
+fn elem_type_code(e: yuris_value::ElemType) -> u8 {
+    match e {
+        yuris_value::ElemType::Int => 1,
+        yuris_value::ElemType::Float => 2,
+        yuris_value::ElemType::Str => 3,
+    }
+}
+
+/// 声明类型码 → 零值(kind1 全局的描述符零值形态)。
+fn zero_value(ty: u8) -> Value {
+    match ty {
+        2 => Value::Float(0.0),
+        3 => Value::Str(Vec::new()),
+        _ => Value::Int(0),
+    }
+}
+
+/// 变量值序列 → YSSD 载荷(`ty + ndims + dims + dlen + 数据`;引擎
+/// SAVE 序列化 `0x44da71` 的产物形态,即 [`yuris_format::yssd::YssdPayload`])。
+/// 类型收敛与 LOAD 写回对称(Int→FLT 取 f64;FLT→INT 四舍五入)。
+fn payload_from_values(
+    ty: u8,
+    dims: Vec<u32>,
+    values: &[Value],
+) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    for v in values {
+        match (ty, v) {
+            (1, Value::Int(i)) => data.extend_from_slice(&i.to_le_bytes()),
+            (1, Value::Float(f)) => data.extend_from_slice(&(*f).round().to_le_bytes()),
+            (2, Value::Int(i)) => data.extend_from_slice(&(*i as f64).to_le_bytes()),
+            (2, Value::Float(f)) => data.extend_from_slice(&f.to_le_bytes()),
+            (3, Value::Str(s)) => {
+                data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                data.extend_from_slice(s);
+            }
+            _ => {
+                return Err(Error::format(format!(
+                    "SAVE 载荷类型 {ty} 与值 {v:?} 不符"
+                )))
+            }
+        }
+    }
+    Ok(yuris_format::yssd::YssdPayload { ty, dims, data }.to_bytes())
 }

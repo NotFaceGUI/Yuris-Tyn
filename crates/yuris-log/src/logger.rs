@@ -419,7 +419,13 @@ mod tests {
     /// 文件输出端：追加写、无颜色、flush 后内容可读。
     #[test]
     fn file_sink_appends_plain_lines() {
-        let dir = std::env::temp_dir().join(format!(
+        // TEMP 优先(本机沙箱系统 TEMP 不可写;实测 cargo 子进程的 TMP 会被
+        // 重写回系统值,TEMP 是唯一可靠入口 —— 与 vm 测试 skip_sample 同约定)。
+        let base = std::env::var_os("TEMP")
+            .or_else(|| std::env::var_os("TMP"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!(
             "yuris-log-file-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

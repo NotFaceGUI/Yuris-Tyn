@@ -28,8 +28,13 @@ pub mod audio;
 pub mod audio_probe;
 pub mod overlay;
 pub mod scenario;
+pub mod sysui;
 
 pub use scenario::{ScenarioHost, ScenarioPlayer, TitleMenuAction};
+// 兜底 UI 标定表集中收口于 `sysui`(播放器自造 id 空间 + 标定样本素材名/
+// 布局);此处 glob 再导出,保持既有公开路径(`UI_*`/`TITLE_*`/`ADV_BUTTONS`)
+// 与测试引用不变。
+pub use sysui::*;
 
 /// 去掉引擎声音层组前缀 `:/段/`（如 `:/S0/`）。
 ///
@@ -317,121 +322,6 @@ fn vm_ui_layer_allowed(path_lower: &str, allow_vm_ui: bool, builtin_title: bool)
     }
     norm.contains(r"cgsys\")
 }
-
-/// ADV 主按钮行(layout-fix-plan P2-2):参考图 1920×1080 模板匹配标定
-/// (相关系数 0.73~0.99;HOME 0.44 待实机复核)。
-/// 字段:(层 id, x, y, 宽, 高, 素材路径, 图集段数)。
-/// 素材 = `cgsys\main\button\type1\btn_*.png` 横排图集,首段 = OFF。
-pub const ADV_BUTTONS: &[(u64, f32, f32, u32, u32, &str, usize)] = &[
-    (
-        0x5C_9000_0001,
-        1048.0,
-        1040.0,
-        114,
-        39,
-        "cgsys/main/button/type1/btn_backlog_bt3",
-        3,
-    ),
-    (
-        0x5C_9000_0002,
-        1148.0,
-        1040.0,
-        114,
-        39,
-        "cgsys/main/button/type1/btn_auto_bt4",
-        4,
-    ),
-    (
-        0x5C_9000_0003,
-        1248.0,
-        1040.0,
-        114,
-        39,
-        "cgsys/main/button/type1/btn_skip_bt4n",
-        5,
-    ),
-    (
-        0x5C_9000_0004,
-        1348.0,
-        1040.0,
-        114,
-        39,
-        "cgsys/main/button/type1/btn_save_bt3n",
-        4,
-    ),
-    (
-        0x5C_9000_0005,
-        1448.0,
-        1040.0,
-        114,
-        39,
-        "cgsys/main/button/type1/btn_load_bt3n",
-        4,
-    ),
-    (
-        0x5C_9000_0006,
-        1548.0,
-        1040.0,
-        114,
-        39,
-        "cgsys/main/button/type1/btn_qsave_bt3n",
-        4,
-    ),
-    (
-        0x5C_9000_0007,
-        1648.0,
-        1040.0,
-        114,
-        39,
-        "cgsys/main/button/type1/btn_qload_bt3n",
-        4,
-    ),
-    (
-        0x5C_9000_0008,
-        1748.0,
-        1040.0,
-        69,
-        39,
-        "cgsys/main/button/type1/btn_volume_bt3",
-        3,
-    ),
-    (
-        0x5C_9000_0009,
-        1803.0,
-        1040.0,
-        69,
-        39,
-        "cgsys/main/button/type1/btn_config_bt3",
-        3,
-    ),
-    (
-        0x5C_9000_000A,
-        1856.0,
-        1040.0,
-        64,
-        39,
-        "cgsys/main/button/type1/btn_menulock_bt4",
-        4,
-    ),
-    (
-        0x5C_9000_000B,
-        1882.0,
-        952.0,
-        31,
-        31,
-        "cgsys/main/button/type1/btn_title_bt3",
-        3,
-    ),
-    (
-        0x5C_9000_000C,
-        1882.0,
-        989.0,
-        31,
-        31,
-        "cgsys/main/button/type1/btn_end_bt3",
-        3,
-    ),
-];
 
 /// CG 名 → 场景层基名(层 id = `fnv1a(基名)`)。
 ///
@@ -796,56 +686,6 @@ fn tachie_float_phase(id: u64) -> f32 {
     ((id % 997) as f32 / 997.0) * std::f32::consts::TAU
 }
 
-/// 标题按钮三态下标(素材后缀 `_off`/`_on`/`_over`;成果 78 图像实证)。
-pub const TITLE_BTN_OFF: usize = 0;
-/// 悬停/聚焦高亮态。
-pub const TITLE_BTN_ON: usize = 1;
-/// 按下态。
-pub const TITLE_BTN_OVER: usize = 2;
-
-/// 标题按钮悬停音(sysse/sse02)。es.BT.SE.SET 第一参数全语料 444 组恒定,
-/// 时长 0.086s 显著短促(其余 0.30~0.39s);成果 80。
-pub const TITLE_SE_HOVER: &str = "sse02";
-/// 标题按钮决定音(sysse/sse03)。es.BT.SE.SET 第二参数(普通按钮 316 组);
-/// BACK 型取消钮为 sse06(128 组)—— 参数 2 随按钮语境变化,标题六钮均普通型。
-pub const TITLE_SE_DECIDE: &str = "sse03";
-/// 取消/戻る音(sysse/sse06)。es.BT.SE.SET 第二参数的 BACK 型取值(成果 80)。
-pub const TITLE_SE_CANCEL: &str = "sse06";
-
-/// 子画面层 id 基(P3:LOAD / EXTRA / CG 鉴赏 / BGM 鉴赏 / END 确认;
-/// 与标题 0x5C_7000_* 与台词窗 SC_* 错开;z 在 50..=61 段)。
-pub const UI_LOAD_BASE: u64 = 0x5C_8000_0000;
-/// EXTRA(鉴赏入口)子画面层 id 基。
-pub const UI_EXTRA_BASE: u64 = 0x5C_9000_0000;
-/// EXTRA CG 鉴赏子画面层 id 基。
-pub const UI_CG_BASE: u64 = 0x5C_B000_0000;
-/// BGM 鉴赏子画面层 id 基。
-pub const UI_BGM_BASE: u64 = 0x5C_D000_0000;
-/// END 确认对话框层 id 基。
-pub const UI_CONFIRM_BASE: u64 = 0x5C_E000_0000;
-
-/// 子画面路由钮 id(常量而非算术 —— match 模式需要)。
-pub const UI_LOAD_BACK: u64 = UI_LOAD_BASE + 1;
-/// CG 鉴赏:返回。
-pub const UI_CG_BACK: u64 = UI_CG_BASE + 1;
-/// CG 鉴赏:上一页。
-pub const UI_CG_PREV: u64 = UI_CG_BASE + 0x90;
-/// CG 鉴赏:下一页。
-pub const UI_CG_NEXT: u64 = UI_CG_BASE + 0x91;
-/// CG 鉴赏:切到 BGM 页签。
-pub const UI_CG_TAB_BGM: u64 = UI_CG_BASE + 0xA1;
-/// BGM 鉴赏:返回。
-pub const UI_BGM_BACK: u64 = UI_BGM_BASE + 1;
-/// BGM 鉴赏:上一页。
-pub const UI_BGM_PREV: u64 = UI_BGM_BASE + 0x90;
-/// BGM 鉴赏:下一页。
-pub const UI_BGM_NEXT: u64 = UI_BGM_BASE + 0x91;
-/// BGM 鉴赏:切到 CG 页签。
-pub const UI_BGM_TAB_CG: u64 = UI_BGM_BASE + 0xA0;
-/// END 确认:是。
-pub const UI_CONFIRM_YES: u64 = UI_CONFIRM_BASE + 2;
-/// END 确认:否。
-pub const UI_CONFIRM_NO: u64 = UI_CONFIRM_BASE + 3;
 
 /// 播放器子画面状态(P3)。均在 `Wait::TitleMenu` 等待下叠加显示,
 /// 点击经 `poll_title_menu` 路由,scenario 播放器不感知。
@@ -1560,6 +1400,7 @@ impl PlayerCore {
                     y,
                     z,
                     a,
+                    a_op,
                     mode,
                     t,
                     tid,
@@ -1737,6 +1578,18 @@ impl PlayerCore {
                         slots,
                         fallback_z,
                     });
+                    // **A 槽运算码(成果 196 追记二)**:B3≠0 时 A 不是赋值
+                    // 而是 ±= 引擎 0x42bd50 语义(1=+≤256 / 2=−≥0),
+                    // 紧随 Layer 落位。=0 走 Slots.a 常规赋值。
+                    if *a_op != 0 {
+                        if let Some(av) = a {
+                            cmds.push(yuris_stage::Command::AlphaOp {
+                                dst: lid,
+                                op: *a_op,
+                                val: *av,
+                            });
+                        }
+                    }
                 }
                 yuris_vm::VmEvent::CgAct { id, effects, .. } => {
                     let Some(name) = id else { continue };
@@ -1852,6 +1705,31 @@ impl PlayerCore {
                             src: fnv1a(&src_base),
                             dst: fnv1a(&dst_base),
                             params,
+                        });
+                        continue;
+                    }
+                    // **`AKARUSA` 亮度族(2026-10-18 实装,成果 196 追记)**
+                    //
+                    // `CGACT[AKARUSA=1 SET=明暗值]`:SET/256 为亮度系数
+                    // (128=50% 变暗、256=原样、>256 提亮)。实机锚点 =
+                    // 存档屏每格 `_TMP_OF AKARUSA=1 SET=128` 把截图压暗一半
+                    // 再合成进格子 —— 旧实现落入「未识别效果」告警并丢弃,
+                    // 盖住的部分因此比官方「变浅」。与 RECTPAINT 同族:
+                    // Stage 侧逐像素改写位图,不可逆、换图后失效。
+                    let has_akarusa = effects.iter().any(|(_, n, v)| {
+                        n.eq_ignore_ascii_case("AKARUSA")
+                            && match v {
+                                yuris_vm::EffectValue::Int(x) => *x != 0,
+                                yuris_vm::EffectValue::Float(f) => *f != 0.0,
+                                yuris_vm::EffectValue::Str(s) => !s.is_empty(),
+                            }
+                    });
+                    if has_akarusa {
+                        let set = val_of("SET").unwrap_or(256);
+                        let (base, _) = vm_ui_base_prio(name.as_bytes());
+                        cmds.push(yuris_stage::Command::Akarusa {
+                            dst: fnv1a(&base),
+                            set,
                         });
                         continue;
                     }
@@ -2010,8 +1888,29 @@ impl PlayerCore {
         for ev in fresh_owned.iter() {
             self.apply_fileact_event(ev);
         }
+        // ===== SAVE[FILE]:VM 序列化的存档容器 → save/ 落盘(唯一 I/O 边界在此)=====
+        self.apply_savefile_events(&fresh_owned);
         // ===== M2 Stage 全量翻译(含精灵族;成果 158)=====
         let mut stage_cmds: Vec<yuris_stage::Command> = Vec::new();
+        // ===== LOAD[ID=] 存档缩略图:裸位图 → Stage 层(成果 196)=====
+        for ev in fresh_owned.iter() {
+            let yuris_vm::VmEvent::LayerBitmap { id, w, h, rgba, .. } = ev else {
+                continue;
+            };
+            let name = String::from_utf8_lossy(id).into_owned();
+            let lid = fnv1a(name.as_bytes());
+            let (w, h) = (*w, *h);
+            let rgba = rgba.clone();
+            let fid = name.clone();
+            stage_cmds.push(yuris_stage::Command::UploadRgba {
+                id: lid,
+                name: fid.into_bytes(),
+                w,
+                h,
+                rgba,
+                fallback_z: 0,
+            });
+        }
         self.translate_stage_frame(&fresh_owned, allow_vm_ui, builtin_title, &mut stage_cmds);
         // **统一文本通道**(成果 168):v49x 编译内联 `WORD`/`TEXT` 与 v555
         // 明文剧本共用 `yuris_vm::scenario::TextChannel`,不再按 `VmEvent::Text`
@@ -2646,6 +2545,67 @@ impl PlayerCore {
     /// - `CGCASH`/`SOUNDCASH` → 缓存登记（本内核按需装载，无缓存表可登记）。
     ///
     /// 未实装的分支**不静默**：按分支名去重告警（`alert_once`）。
+    /// `VmEvent::SaveFile` → `save/` 落盘(SAVE[FILE] 刷盘的消费侧)。
+    ///
+    /// 引擎 `0x44cba7` = fopen("wb") + fwrite;本内核 = VM 序列化容器
+    /// (`GroupVm::take_saved_files`)+ [`std::fs::write`]。VM 事件只带
+    /// 元数据,字节在本方法一次性取走(同帧多条 SaveFile 共用一份)。
+    /// 同会话 LOAD 由 VM 内 `saved_files` 覆盖直读,不经磁盘。
+    fn apply_savefile_events(&mut self, events: &[yuris_vm::VmEvent]) {
+        if !events
+            .iter()
+            .any(|e| matches!(e, yuris_vm::VmEvent::SaveFile { .. }))
+        {
+            return;
+        }
+        let files = self.vm.take_saved_files();
+        if files.is_empty() {
+            return;
+        }
+        let dir = self.game_dir.join("save");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            yuris_log::alert_once(
+                module_path!(),
+                "savefile:mkdir".to_string(),
+                format!("save/ 目录创建失败: {e}
+处置: 检查游戏目录写权限"),
+            );
+            return;
+        }
+        for ev in events {
+            let yuris_vm::VmEvent::SaveFile { name, len, blocks, .. } = ev else {
+                continue;
+            };
+            let key = String::from_utf8_lossy(name).into_owned();
+            let Some((_, bytes)) = files.iter().find(|(n, _)| *n == key) else {
+                continue;
+            };
+            // 名字应为 save/ 直下的 ASCII 名(gsd/kidoku/save00001 语料);
+            // 非 ASCII(SJIS)名经 lossy 会变形 —— 按引擎语义文件名不改写,
+            // 变形时拒绝写盘并告警,不产生错名文件。
+            if key.contains(char::is_control) || key.contains('�') {
+                yuris_log::alert_once(
+                    module_path!(),
+                    format!("savefile:name:{key}"),
+                    format!("SAVE[FILE] 名字非 UTF-8 可逆(SJIS 原文见事件流),拒绝落盘: {len}B"),
+                );
+                continue;
+            }
+            if key.contains('/') || key.contains('\\') || key.contains("..") {
+                yuris_log::alert_once(
+                    module_path!(),
+                    format!("savefile:path:{key}"),
+                    format!("SAVE[FILE] 名字带路径分隔符(引擎 save/ 固定,手册 β版仕样),拒绝落盘"),
+                );
+                continue;
+            }
+            match std::fs::write(dir.join(&key), bytes) {
+                Ok(()) => yuris_log::info!("[save] 写出 {key}({len}B,{blocks} 块)"),
+                Err(e) => yuris_log::error!("[save] 写出 {key} 失败: {e}"),
+            }
+        }
+    }
+
     fn apply_fileact_event(&mut self, ev: &yuris_vm::VmEvent) {
         let yuris_vm::VmEvent::FileAct {
             file,
@@ -2918,13 +2878,13 @@ impl PlayerCore {
     /// 图集裁剪方式未取证,布点为 Likely)。活动标签 = `_on` 单图,
     /// 非活动 = bt3n 图集第 0 段,悬停切 `_on`。
     fn open_tab_bar(&mut self, base: u64, active_cg: bool) {
-        let (x0, y, tw, th, pitch) = (531.0, 10.0, 237.0, 53.0, 247.0);
+        let (x0, y, tw, th, pitch) = sysui::TAB_BAR;
         // CG 标签
-        let cg_on = self.load_scenario_image("cgsys/extra/btn_tab_cgmode_on");
+        let cg_on = self.load_scenario_image(sysui::IMG_TAB_CG_ON);
         let cg_off = if active_cg {
             cg_on
         } else {
-            self.load_atlas_segment("cgsys/extra/btn_tab_cgmode_bt3n", 0, 4)
+            self.load_atlas_segment(sysui::IMG_TAB_CG_OFF, 0, 4)
                 .or(cg_on)
         };
         self.ui_button_rids(
@@ -2936,8 +2896,8 @@ impl PlayerCore {
         );
         // RP(SCENE)/MV:禁用展示(_na 暗段;不参与三态/点击)
         let rp = self
-            .load_atlas_segment("cgsys/extra/btn_tab_rpmode_bt3n", 3, 4)
-            .or_else(|| self.load_atlas_segment("cgsys/extra/btn_tab_rpmode_bt3n", 0, 4));
+            .load_atlas_segment(sysui::IMG_TAB_RP_OFF, 3, 4)
+            .or_else(|| self.load_atlas_segment(sysui::IMG_TAB_RP_OFF, 0, 4));
         self.ui_button_rids(
             base + 0xA2,
             [x0 + pitch, y, tw, th],
@@ -2946,8 +2906,8 @@ impl PlayerCore {
             false,
         );
         let mv = self
-            .load_atlas_segment("cgsys/extra/btn_tab_mvmode_bt3n", 3, 4)
-            .or_else(|| self.load_atlas_segment("cgsys/extra/btn_tab_mvmode_bt3n", 0, 4));
+            .load_atlas_segment(sysui::IMG_TAB_MV_OFF, 3, 4)
+            .or_else(|| self.load_atlas_segment(sysui::IMG_TAB_MV_OFF, 0, 4));
         self.ui_button_rids(
             base + 0xA3,
             [x0 + 2.0 * pitch, y, tw, th],
@@ -2956,9 +2916,9 @@ impl PlayerCore {
             false,
         );
         // BGM 标签
-        let bgm_on = self.load_scenario_image("cgsys/extra/btn_tab_bgmmode_on");
+        let bgm_on = self.load_scenario_image(sysui::IMG_TAB_BGM_ON);
         let bgm_off = if active_cg {
-            self.load_atlas_segment("cgsys/extra/btn_tab_bgmmode_bt3n", 0, 4)
+            self.load_atlas_segment(sysui::IMG_TAB_BGM_OFF, 0, 4)
                 .or(bgm_on)
         } else {
             bgm_on
@@ -2974,9 +2934,9 @@ impl PlayerCore {
 
     /// bt3 三态返回钮(蓝=常态/淡=悬停/橙=按下;图集裁剪)。
     fn open_back_button(&mut self, id: u64, rect: [f32; 4], z: i64) {
-        let s0 = self.load_atlas_segment("cgsys/extra/btn_back_bt3", 0, 3);
-        let s1 = self.load_atlas_segment("cgsys/extra/btn_back_bt3", 1, 3);
-        let s2 = self.load_atlas_segment("cgsys/extra/btn_back_bt3", 2, 3);
+        let s0 = self.load_atlas_segment(sysui::IMG_BACK_BT3, 0, 3);
+        let s1 = self.load_atlas_segment(sysui::IMG_BACK_BT3, 1, 3);
+        let s2 = self.load_atlas_segment(sysui::IMG_BACK_BT3, 2, 3);
         self.ui_button_rids(id, rect, [s0, s1, s2], z, true);
     }
 
@@ -3168,7 +3128,7 @@ impl PlayerCore {
     fn open_load(&mut self) {
         self.close_subui();
         self.subui = SubUi::Load;
-        if let Some(rid) = self.load_scenario_image(r"cgsys/saveload/back_load") {
+        if let Some(rid) = self.load_scenario_image(sysui::IMG_SAVELOAD_BACK) {
             // 铺满画布 = 画布尺寸 / 素材尺寸(**不是**画布 / 1920)。
             // 勘误(成果 124):此处原为 `LOGICAL_W / 1920.0`,在常量=1920 的
             // 年代恰好恒等于 1.0(「不缩放」);改成运行期 `logical_w()` 后
@@ -3202,15 +3162,15 @@ impl PlayerCore {
             self.ui_fill(UI_LOAD_BASE, [8, 8, 14, 255], 50);
         }
         self.scan_save_entries();
-        // 存档行(最多 8 行;半透明底板 + 白字 + 不可见命中钮)
+        // 存档行(最多 SAVE_ROW_MAX 行;半透明底板 + 白字 + 不可见命中钮)
         let row_labels: Vec<String> = self
             .save_entries
             .iter()
-            .take(8)
+            .take(sysui::SAVE_ROW_MAX)
             .map(|(_, l)| l.clone())
             .collect();
         for (i, label) in row_labels.iter().enumerate() {
-            let y = 200.0 + i as f32 * 92.0;
+            let y = sysui::SAVE_ROW_Y0 + i as f32 * sysui::SAVE_ROW_DY;
             // 2×1 半透明深色板(拉伸为行底)
             let px = [16u8, 14, 24, 170, 16, 14, 24, 170];
             let plate = ResourceId(0x5C_7000_0100 + i as u64);
@@ -3224,10 +3184,10 @@ impl PlayerCore {
                 id: UI_LOAD_BASE + 0x40 + i as u64,
                 z: 51,
                 visible: true,
-                x: 320.0,
+                x: sysui::SAVE_ROW_X,
                 y,
-                scale_x: 1280.0,
-                scale_y: 80.0,
+                scale_x: sysui::SAVE_ROW_W,
+                scale_y: sysui::SAVE_ROW_H,
                 alpha: 1.0,
                 rotation: 0.0,
                 resource: Some(plate),
@@ -3236,7 +3196,12 @@ impl PlayerCore {
             self.bridge.scene_mut().upsert_layer(plate_layer);
             self.ui_text(UI_LOAD_BASE + 0x10 + i as u64, label, 352.0, y + 18.0, 52);
             self.ui_buttons.push(TitleButton {
-                rect: [320.0, y, 1280.0, 80.0],
+                rect: [
+                    sysui::SAVE_ROW_X,
+                    y,
+                    sysui::SAVE_ROW_W,
+                    sysui::SAVE_ROW_H,
+                ],
                 id: UI_LOAD_BASE + 0x80 + i as u64,
                 rids: [None, None, None],
                 shown: TITLE_BTN_OFF,
@@ -3255,8 +3220,8 @@ impl PlayerCore {
         }
         self.ui_button(
             UI_LOAD_BASE + 1,
-            [1660.0, 940.0, 186.0, 87.0],
-            r"cgsys/saveload/btn_back",
+            sysui::LOAD_BACK_RECT,
+            sysui::IMG_SAVELOAD_BTN_BACK,
             ["_off", "_on", "_over"],
             53,
         );
@@ -3269,7 +3234,7 @@ impl PlayerCore {
         self.close_subui();
         self.subui = SubUi::ExtraCg;
         if self
-            .load_scenario_image(r"cgsys/extra/cgmode/back")
+            .load_scenario_image(sysui::IMG_CGMODE_BACK)
             .is_none()
         {
             self.ui_fill(UI_CG_BASE, [234, 244, 248, 255], 50);
@@ -3278,25 +3243,30 @@ impl PlayerCore {
         if self.ev_list.is_empty() {
             self.ev_list = self.list_ev_paths();
         }
-        const PER: usize = 9; // 原生画格 3×3(cgmode/back 白格)
-        let pages = self.ev_list.len().div_ceil(PER).max(1);
+        let pages = self.ev_list.len().div_ceil(sysui::CG_PER_PAGE).max(1);
         let page = page.min(pages - 1);
         self.cg_page = page;
         let page_items: Vec<String> = self
             .ev_list
             .iter()
-            .skip(page * PER)
-            .take(PER)
+            .skip(page * sysui::CG_PER_PAGE)
+            .take(sysui::CG_PER_PAGE)
             .cloned()
             .collect();
-        // 画格锚点(cgmode/back 白格实测:列 277/736/1192 起、行 141/435/733 起,
-        // 格 ~458×294;缩略图内缩 ~7px)
+        // 画格锚点 = cgmode/back 白格实测,见 `sysui::CG_GRID_*` 文档
         for (i, path) in page_items.iter().enumerate() {
-            let x = 284.0 + (i % 3) as f32 * 458.0;
-            let y = 148.0 + (i / 3) as f32 * 296.0;
-            self.load_thumb(UI_CG_BASE + 0x10 + i as u64, path, x, y, 445.0, 284.0);
+            let x = sysui::CG_GRID_X0 + (i % 3) as f32 * sysui::CG_GRID_DX;
+            let y = sysui::CG_GRID_Y0 + (i / 3) as f32 * sysui::CG_GRID_DY;
+            self.load_thumb(
+                UI_CG_BASE + 0x10 + i as u64,
+                path,
+                x,
+                y,
+                sysui::CG_THUMB_W,
+                sysui::CG_THUMB_H,
+            );
             self.ui_buttons.push(TitleButton {
-                rect: [x, y, 445.0, 284.0],
+                rect: [x, y, sysui::CG_THUMB_W, sysui::CG_THUMB_H],
                 id: UI_CG_BASE + 0x80 + i as u64,
                 rids: [None, None, None],
                 shown: TITLE_BTN_OFF,
@@ -3313,7 +3283,7 @@ impl PlayerCore {
         );
         if page > 0 {
             self.ui_buttons.push(TitleButton {
-                rect: [250.0, 950.0, 220.0, 100.0],
+                rect: sysui::PAGE_PREV_RECT,
                 id: UI_CG_PREV,
                 rids: [None, None, None],
                 shown: TITLE_BTN_OFF,
@@ -3324,7 +3294,7 @@ impl PlayerCore {
         }
         if page + 1 < pages {
             self.ui_buttons.push(TitleButton {
-                rect: [1350.0, 950.0, 220.0, 100.0],
+                rect: sysui::PAGE_NEXT_RECT,
                 id: UI_CG_NEXT,
                 rids: [None, None, None],
                 shown: TITLE_BTN_OFF,
@@ -3333,7 +3303,7 @@ impl PlayerCore {
             });
             self.ui_text(UI_CG_BASE + 0x52, "次", 1430.0, 985.0, 52);
         }
-        self.open_back_button(UI_CG_BACK, [1620.0, 930.0, 237.0, 80.0], 53);
+        self.open_back_button(UI_CG_BACK, sysui::SUBUI_BACK_RECT, 53);
         yuris_log::debug!(
             "[scenario] CG 鉴赏 {}/{}({} 件)",
             page + 1,
@@ -3348,33 +3318,32 @@ impl PlayerCore {
     }
 
     /// P3-2:BGM 鉴赏指定页(原生 extra/back = EXTRAS 双列列表底;曲目点播,
-    /// 戻る停止播放)。22 曲/页(2 列 × 11 行,对齐底图画线)。
+    /// 戻る停止播放)。布局/容量见 `sysui::BGM_*`。
     fn open_extra_bgm_page(&mut self, page: usize) {
         self.close_subui();
         self.subui = SubUi::ExtraBgm;
-        if self.load_scenario_image(r"cgsys/extra/back").is_none() {
+        if self.load_scenario_image(sysui::IMG_EXTRAS_BACK).is_none() {
             self.ui_fill(UI_BGM_BASE, [234, 244, 248, 255], 50);
         }
         self.open_tab_bar(UI_BGM_BASE, false);
         if self.bgm_tracks.is_empty() {
             self.bgm_tracks = self.list_bgm_tracks();
         }
-        const PER: usize = 22;
-        let pages = self.bgm_tracks.len().div_ceil(PER).max(1);
+        let pages = self.bgm_tracks.len().div_ceil(sysui::BGM_PER_PAGE).max(1);
         let page = page.min(pages - 1);
         self.bgm_page = page;
         let tracks: Vec<String> = self
             .bgm_tracks
             .iter()
-            .skip(page * PER)
-            .take(PER)
+            .skip(page * sysui::BGM_PER_PAGE)
+            .take(sysui::BGM_PER_PAGE)
             .cloned()
             .collect();
         for (i, t) in tracks.iter().enumerate() {
             let col = i / 11;
             let row = i % 11;
-            let x = 368.0 + col as f32 * 600.0;
-            let y = 250.0 + row as f32 * 56.0;
+            let x = sysui::BGM_X0 + col as f32 * sysui::BGM_DX;
+            let y = sysui::BGM_Y0 + row as f32 * sysui::BGM_DY;
             self.ui_text(UI_BGM_BASE + 0x10 + i as u64, t, x, y, 52);
             self.ui_buttons.push(TitleButton {
                 rect: [x - 16.0, y - 8.0, 560.0, 50.0],
@@ -3397,7 +3366,7 @@ impl PlayerCore {
         );
         if page > 0 {
             self.ui_buttons.push(TitleButton {
-                rect: [250.0, 950.0, 220.0, 100.0],
+                rect: sysui::PAGE_PREV_RECT,
                 id: UI_BGM_PREV,
                 rids: [None, None, None],
                 shown: TITLE_BTN_OFF,
@@ -3408,7 +3377,7 @@ impl PlayerCore {
         }
         if page + 1 < pages {
             self.ui_buttons.push(TitleButton {
-                rect: [1350.0, 950.0, 220.0, 100.0],
+                rect: sysui::PAGE_NEXT_RECT,
                 id: UI_BGM_NEXT,
                 rids: [None, None, None],
                 shown: TITLE_BTN_OFF,
@@ -3417,7 +3386,7 @@ impl PlayerCore {
             });
             self.ui_text(UI_BGM_BASE + 0x52, "次", 1430.0, 985.0, 52);
         }
-        self.open_back_button(UI_BGM_BACK, [1620.0, 930.0, 237.0, 80.0], 53);
+        self.open_back_button(UI_BGM_BACK, sysui::SUBUI_BACK_RECT, 53);
         yuris_log::debug!(
             "[scenario] BGM 鉴赏 {}/{}({} 曲)",
             page + 1,
@@ -3431,13 +3400,13 @@ impl PlayerCore {
         self.close_subui();
         self.subui = SubUi::ConfirmEnd;
         self.ui_fill(UI_CONFIRM_BASE, [0, 0, 0, 140], 50);
-        if let Some(rid) = self.load_scenario_image(r"cgsys/confirm/dialog_end") {
+        if let Some(rid) = self.load_scenario_image(sysui::IMG_DIALOG_END) {
             let layer = Layer {
                 id: UI_CONFIRM_BASE + 1,
                 z: 51,
                 visible: true,
-                x: 694.0,
-                y: 380.0,
+                x: sysui::CONFIRM_DIALOG_POS.0,
+                y: sysui::CONFIRM_DIALOG_POS.1,
                 scale_x: 1.0,
                 scale_y: 1.0,
                 alpha: 1.0,
@@ -3449,15 +3418,15 @@ impl PlayerCore {
         }
         self.ui_button(
             UI_CONFIRM_BASE + 2,
-            [740.0, 470.0, 146.0, 45.0],
-            r"cgsys/confirm/btn_yes",
+            sysui::CONFIRM_YES_RECT,
+            sysui::IMG_BTN_YES,
             ["_off", "_on", "_over"],
             52,
         );
         self.ui_button(
             UI_CONFIRM_BASE + 3,
-            [1040.0, 470.0, 146.0, 45.0],
-            r"cgsys/confirm/btn_no",
+            sysui::CONFIRM_NO_RECT,
+            sysui::IMG_BTN_NO,
             ["_off", "_on", "_over"],
             52,
         );
@@ -3668,8 +3637,8 @@ impl PlayerCore {
     /// 渲染台词窗底框(txspace 纹理 + 半透明底)到场景(z=80)。
     fn show_window_frame(&mut self) {
         let tex = self
-            .load_scenario_image("cgsys/main/button/type1/tip_meswindow_txspace")
-            .map(|r| (r, 1350u32, 200u32));
+            .load_scenario_image(sysui::IMG_MESWINDOW_TXSPACE)
+            .map(|r| (r, sysui::MESWINDOW_TEX_SIZE.0, sysui::MESWINDOW_TEX_SIZE.1));
         let (rid, sw, sh) = match tex {
             Some((r, w, h)) => (r, w, h),
             None => (ResourceId(0x5C_0000_0004), 2u32, 2u32),
@@ -4050,27 +4019,13 @@ impl ScenarioHost for PlayerCore {
         }
         self.adv_buttons.clear();
         self.title_seen = true;
-        // 全屏底层(path, x, y, id)→ 拉伸全屏
-        let layers: [(&str, i64, i64, u64); 5] = [
-            ("eyecatch/st/bg01a", 0, 0, 0x5C_7000_0000),
-            ("eyecatch/st/tet", 0, 0, 0x5C_7000_0001),
-            ("eyecatch/st/sir", -1058, 0, 0x5C_7000_0002),
-            ("eyecatch/st/han", -86, 0, 0x5C_7000_0003),
-            ("eyecatch/st/logo", 1046, -255, 0x5C_7000_0004),
-        ];
+        // 全屏底层(path, x, y, id)→ 拉伸全屏(表 = sysui 标定 profile)
+        let layers = &sysui::TITLE_ST_LAYERS;
         // 按钮列:三态素材 `cgsys/title/btn_{名}_{off,on,over}`(成果 78 图像
         // 实证);默认显示 `_off` 常态,悬停/按下由 update_title_buttons 切换。
-        // 坐标/绑定 = yst00259 es.BT.XY.SET/es.BT.SET 原生真值(成果 79):
-        // arasuji→BTN.START(2)、start→BTN.START(1)、extra(1314)/config(1477,
-        // 未实装)/end(1640) 同排 y=745。
-        let buttons: [(&str, i64, i64, u64); 6] = [
-            ("cgsys/title/btn_arasuji", 1393, 384, 0x5C_7000_000A),
-            ("cgsys/title/btn_start", 1393, 439, 0x5C_7000_0005),
-            ("cgsys/title/btn_load", 1393, 533, 0x5C_7000_0006),
-            ("cgsys/title/btn_lastload", 1393, 627, 0x5C_7000_0007),
-            ("cgsys/title/btn_extra", 1314, 745, 0x5C_7000_0008),
-            ("cgsys/title/btn_end", 1640, 745, 0x5C_7000_0009),
-        ];
+        // 坐标/绑定 = 原生系统剧本 es.BT.XY.SET/es.BT.SET 真值(成果 79;
+        // 表与证据说明见 `sysui::TITLE_BUTTONS`)。
+        let buttons = &sysui::TITLE_BUTTONS;
         // 无存档判定(P1-4):快存文件不存在 → CONTINUE 用 `_na` 灰化态且
         // 点击无效(原生 es.BT 按 save/*.sd 存在性条件注册 BTN.LLOAD vs
         // BTN.LLOAD.NA 两个同位按钮,成果 79;本实现以快存文件为判据)。
@@ -4103,7 +4058,7 @@ impl ScenarioHost for PlayerCore {
             let scene = self.bridge.scene_mut();
             scene.upsert_layer(bgw);
         }
-        for (path, x, y, id) in layers {
+        for &(path, x, y, id) in layers {
             let Some(rid) = self.load_scenario_image(path) else {
                 yuris_log::warn!("[scenario] 标题层未命中: {path}");
                 continue;
@@ -4129,7 +4084,7 @@ impl ScenarioHost for PlayerCore {
             let scene = self.bridge.scene_mut();
             scene.upsert_layer(layer);
         }
-        for (base, x, y, id) in buttons {
+        for &(base, x, y, id) in buttons {
             // CONTINUE 无存档 → `_na` 单素材灰化(无三态/点击无效,成果 79)。
             let na = !has_save && base.ends_with("btn_lastload");
             let mut rids: [Option<ResourceId>; 3] = [None, None, None];
@@ -5398,7 +5353,13 @@ mod subui_tests {
     }
 
     fn temp_game_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("yuris_p3_{}_{}", tag, std::process::id()));
+        // TEMP 优先(本机沙箱系统 TEMP 不可写;实测 cargo 子进程的 TMP 会被
+        // 重写回系统值,TEMP 是唯一可靠入口 —— 与 vm 测试 skip_sample 同约定)。
+        let base = std::env::var_os("TEMP")
+            .or_else(|| std::env::var_os("TMP"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("yuris_p3_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("save")).unwrap();
         dir

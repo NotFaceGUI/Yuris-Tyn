@@ -251,6 +251,19 @@ fn main() {
     let ypf_version = script_idx.header.version;
     let mut vm = booted.vm;
     vm.set_file_probe(index.clone());
+    // `yscfg.dat`(游戏运行期配置;存在性 Confirmed / 字段语义 Unknown)。
+    // 引擎启动即读(字符串 `\yscfg.dat`@v494 0x5d57d8);本内核结构解析
+    // + 日志留痕,不做行为门控(不猜)。
+    match yuris_format::yscfgdat::YscfgDat::from_file(&game_dir.join("yscfg.dat")) {
+        Ok(cfg) => yuris_log::info!(
+            "[yscfg.dat] 32 槽:{:02x?}",
+            cfg.slots.iter().map(|v| v.to_string()).collect::<Vec<_>>()
+        ),
+        Err(e) if e.to_string().contains("长度") => {
+            yuris_log::warn!("[yscfg.dat] 存在但结构异常: {e}")
+        }
+        Err(_) => yuris_log::debug!("[yscfg.dat] 不存在(引擎按缺省零值启动)"),
+    }
     // **运行时 = 严格模式 + 致命错误窗(2026-10-17 用户要求)**:
     // - strict(默认):任何未实现/未建模命令都**挂起**,不再「记录后继续」;
     // - fatal_reporting:挂起的同时登记 FatalReport,下一帧由

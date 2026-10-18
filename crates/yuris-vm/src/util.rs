@@ -367,9 +367,20 @@ pub fn consume_declarations_into(
             if !const_bound {
                 continue;
             }
-            if let Some(&max_idx) = stack.last() {
-                if max_idx >= 0 {
-                    let need = (max_idx + 1) as u32;
+            if let Some(&declared) = stack.last() {
+                if declared >= 0 {
+                    // **勘误(2026-10-18,存档链实机闭环定位)**:旧实现把声明
+                    // 括号值当「最大下标」做 `+1`(`need = max_idx + 1`)。
+                    // 引擎侧铁证(v494 写回 `0x447989` 反汇编 + 真实存档):
+                    // ① `0x1a63a` 要求 payload dims == desc dims **逐维相等**;
+                    // ② 真实存档块 save0000x DNO=4 = STR **[16]**(真引擎所写);
+                    // ③ 装它的脚本 s19 g470 声明字面量 = **16**(g522 把该块
+                    //    装进 $2189,引擎 $2189 描述符必为 [16] 否则引擎自己也
+                    //    过不了 0x1a63a)。⇒ 手册 `INT[@HA(34,5,6)]` 的括号值
+                    //    = **各维元素个数**,不加 1。运行期声明路径
+                    //    (`exec::misc` 成果 109)本来就是 `&[n]` 不加 1,
+                    //    两条路径自此一致。
+                    let need = declared as u32;
                     match store.array_dims(&base) {
                         None => {
                             store.declare_array(&base, elem, &[need]);

@@ -59,22 +59,23 @@
 | 28 | FPS | `LAB_00444b4c` | |
 | 29–42 | G_* | `LAB_004455e8` | G_FLT 起共 14 项(多命令同址) |
 | 43 | GO | `LAB_00445670` | |
-| 44 | IF | `LAB_00445804` | |
-| 45 | IFBLEND | `LAB_00446110` | |
-| 46 | IFBREAK | `LAB_00446208` | |
-| 47 | IFCONTINUE | `LAB_00446248` | |
-| 48 | IFEND | `LAB_004462d0` | |
-| 49 | INPUT | `LAB_00446358` | |
-| 50 | INT | `LAB_004463a4` | |
-| 51 | LABEL | `LAB_0044645c` | |
-| 52 | LABELINFO | `FUN_0044658c` | **stub** |
-| 53 | LET | `LAB_00446590` | |
-| 54 | LOAD | `LAB_00446724` | |
-| 55 | LOOP | `LAB_00446ed0` | |
-| 56 | LOOPBREAK | `LAB_00447d3c` | |
-| 57 | LOOPCONTINUE | `LAB_00447ed8` | |
-| 58 | LOOPEND | `LAB_00447f90` | |
-| 59 | MACRO | `LAB_00448024` | |
+| 44 | GOSUB | `LAB_00445804` | **勘误(2026-10-18)**:初版漏了此行,导致此后全部序号偏移 1 |
+| 45 | IF | `LAB_00445804` | 与 GOSUB 同址(共享处理器) |
+| 46 | IFBLEND | `LAB_00446110` | |
+| 47 | IFBREAK | `LAB_00446208` | |
+| 48 | IFCONTINUE | `LAB_00446248` | |
+| 49 | IFEND | `LAB_004462d0` | |
+| 50 | INPUT | `LAB_00446358` | |
+| 51 | INT | `LAB_004463a4` | |
+| 52 | LABEL | `FUN_0044658c` | **stub** |
+| 53 | LABELINFO | `LAB_00446590` | |
+| 54 | LET | `LAB_00446724` | **勘误(2026-10-18 三轮)**:重编号后地址列未同步 —— 初始化器伪代码逐项重对(`0x7aaf18`→idx54),且 `0x446724` 反汇编即「求值窗→写变量」语义(LET);`0x446ed0` 内含 YSSD 魔数(`cmp edx,0x44535359`@`0x447170`)只能是 LOAD |
+| 55 | LOAD | `LAB_00446ed0` | 同上 |
+| 56 | LOOP | `LAB_00447d3c` | 同上 |
+| 57 | LOOPBREAK | `LAB_00447ed8` | 同上 |
+| 58 | LOOPCONTINUE | `LAB_00447f90` | 同上 |
+| 59 | LOOPEND | `LAB_00448024` | 同上 |
+| 60 | MACRO | `FUN_0044658c` | **stub**(初始化器未显式写 idx60,落 memset 缺省;勘误:前版记 `LAB_00448024` 实为 LOOPEND) |
 | 61 | **MATH** | **`FUN_00448110`** | 运算派发(表达式表 `0x802ba0`) |
 | 62 | MATH3D | `FUN_0044874c` | |
 | 63 | MENU | `LAB_00449c44` | |
@@ -97,6 +98,7 @@
 | 80 | S_FLT | `FUN_0044658c` | **stub** |
 | 81 | S_INT | `FUN_0044658c` | **stub** |
 | 82 | S_STR | `FUN_0044658c` | **stub** |
+| 83 | S_VAR | `FUN_0044658c` | **stub** |
 | 84 | SAVE | `LAB_0044c2d8` | |
 | 85 | SAVEEND | `LAB_0044e034` | |
 | 86 | SAVEINFO | `LAB_0044e05c` | |

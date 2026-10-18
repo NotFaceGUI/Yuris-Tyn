@@ -202,6 +202,15 @@ impl GroupVm {
         if !state.present {
             for (field, _slot) in &want {
                 if *field == "EXIST" {
+                    if std::env::var_os("YURIS_TRACE_TASKINFO").is_some() {
+                        yuris_log::trace_forced!(
+                            "[taskinfo] s{} pc{} EXIST {:?} = 0 (未注册任务)",
+                            self.ctx.script_id,
+                            self.pc,
+                            name.as_deref()
+                                .map(|n| String::from_utf8_lossy(n).into_owned())
+                        );
+                    }
                     if let Some(t) = &target {
                         self.write_var_target(t, Value::Int(0))?;
                     }
@@ -238,6 +247,17 @@ impl GroupVm {
             match *field {
                 "EXIST" => {
                     let hit = state.exists;
+                    if std::env::var_os("YURIS_TRACE_TASKINFO").is_some() {
+                        yuris_log::trace_forced!(
+                            "[taskinfo] s{} pc{} EXIST {:?} = {} (present={})",
+                            self.ctx.script_id,
+                            self.pc,
+                            name.as_deref()
+                                .map(|n| String::from_utf8_lossy(n).into_owned()),
+                            hit as i64,
+                            state.present
+                        );
+                    }
                     if let Some(t) = &target {
                         self.write_var_target(t, Value::Int(hit as i64))?;
                     }

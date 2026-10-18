@@ -195,6 +195,8 @@ pub enum VmEvent {
         dxbuf: Option<i64>,
         /// **`DXDRAW` 槽 = 直接描画**(手册参数族;语义 Likely)。
         dxdraw: Option<i64>,
+        /// A 窗的运算码(窗 tag B3;0=赋值 1=+= 2=-=;成果 196 追记二,RE Confirmed)。
+        a_op: u8,
     },
     /// SOUND:音频操作（完整 14 参数，语义见官方手册 `sound/sound.html`）。
     ///
@@ -459,21 +461,54 @@ pub enum VmEvent {
         /// 已求值参数摘要。
         evaluated: Vec<(u8, String)>,
     },
-    /// SAVE:存档数据位图标记(DNO=存档号,SET=目标引用;引擎 CMDH_00451838)。
-    /// 语料 298 组形态 = [DNO, SET 引用](位图置位/清零)+ [FILE](仅记录);
-    /// 引擎按描述符类型把 INT 置 1/0、FLT 置 1.0/0.0。本实现按目标类型写值,
-    /// 不落盘(存档文件格式 Unknown)。
+    /// SAVE:存档预留(无 FILE = 序列化进预留表;引擎 `0x44cba7` 族)。
+    ///
+    /// SET = 「保存する変数」(手册 `file/save.html`);预留体 = 变量当前值
+    /// 的 YSSD 块体(引擎在 SAVE 即时序列化,不在 FILE 刷盘时重取)。
     Save {
         /// 组下标。
         pc: usize,
-        /// FILE 参数(若有;只记录)。
+        /// FILE 参数(若有;给出即触发刷盘)。
         file: Option<Vec<u8>>,
         /// DNO 存档号(若给定)。
         dno: Option<i64>,
-        /// SET 目标摘要(写位图的变量)。
+        /// SET 目标摘要(被保存的变量;引用形态)。
         set_target: Option<String>,
         /// 已求值参数摘要。
         evaluated: Vec<(u8, String)>,
+    },
+    /// SAVE[FILE]:预留数据刷盘(引擎 `0x44cba7` 写盘路径)。
+    ///
+    /// 事件只带元数据;**字节**经 `GroupVm::take_saved_files` 交给宿主
+    /// 落盘(不进 trace,避免大块 base64 污染事件流)。VM 侧同时持有
+    /// 会话内覆盖(同会话 LOAD 直接读回,等价引擎 fopen 语义)。
+    SaveFile {
+        /// 组下标。
+        pc: usize,
+        /// 文件名(SJIS 原文,无扩展名时已补 `.sd`)。
+        name: Vec<u8>,
+        /// 容器字节数。
+        len: usize,
+        /// 刷盘块数。
+        blocks: usize,
+    },
+    /// `LOAD[ID=…]` 命中 btype=1 存档截图块 → 裸位图装层(成果 196)。
+    ///
+    /// 引擎(v494 `0x4473bd` → `0x44760c`):段B 位图装入 ID 层、段A 恢复
+    /// 层参数。典型 = 存档屏缩略图(`LOAD[FILE DNO=3 ID="_TMP_OF"]` →
+    /// `CGACT[COPY]` 拷进格子 → `CGEND`)。字节序按内容判读为 RGBA
+    /// (段B 末行 `47 a9 61 ff` = 绿色系,判 BGR 会得橙色;实机颜色对照可验)。
+    LayerBitmap {
+        /// 组下标。
+        pc: usize,
+        /// 层名(ID 槽原文,SJIS)。
+        id: Vec<u8>,
+        /// 位图宽(段A u32[30])。
+        w: u32,
+        /// 位图高(段A u32[31])。
+        h: u32,
+        /// RGBA8 字节(段B 原样)。
+        rgba: Vec<u8>,
     },
     /// CGEND:CG 显示结束通知(ID 字符串;引擎 LAB_0043ad14)。
     /// 无图形后端 → 事件化记录,不触碰图形状态。
@@ -594,7 +629,7 @@ pub fn event_json(e: &VmEvent) -> String {
             )
         }
         VmEvent::Cg {
-            pc, script_id, id, position, param_count, file, e, x, y, z, a, mode, t, tid, ta, mid,
+            pc, script_id, id, position, param_count, file, e, x, y, z, a, a_op, mode, t, tid, ta, mid,
             sx, sy, tex, dxbuf, dxdraw,
         } => {
             let idj = id.clone()
@@ -871,6 +906,10 @@ pub fn event_json(e: &VmEvent) -> String {
             let ev = ev_arr(&evaluated);
             format!(r#"{{"ev":"varquery","pc":{pc},"cmd":{command},"ev_":{ev}}}"#)
         }
+        VmEvent::LayerBitmap { pc, id, w, h, .. } => {
+            let idj = json_escape(&String::from_utf8_lossy(id));
+            format!(r#"{{"ev":"layerbitmap","pc":{pc},"id":"{idj}","w":{w},"h":{h}}}"#)
+        }
         VmEvent::Save { pc, file, dno, set_target, evaluated } => {
             let fj = file.as_ref().map(|b| {
                 let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
@@ -883,6 +922,12 @@ pub fn event_json(e: &VmEvent) -> String {
             let ev = ev_arr(&evaluated);
             format!(
                 r#"{{"ev":"save","pc":{pc},"file":{fj},"dno":{dj},"set":{sj},"ev_":{ev}}}"#
+            )
+        }
+        VmEvent::SaveFile { pc, name, len, blocks } => {
+            let nj = json_escape(&String::from_utf8_lossy(name));
+            format!(
+                r#"{{"ev":"savefile","pc":{pc},"name":"{nj}","len":{len},"blocks":{blocks}}}"#
             )
         }
         VmEvent::CgEnd { pc, id, evaluated } => {

@@ -65,7 +65,13 @@ fn temp_create(name: &str) -> TempDirGuard {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!("{name}-{}-{}", std::process::id(), n));
+    // TEMP 优先(与 skip_sample 同约定):本机沙箱系统 TEMP 不可写,且
+    // 实测 cargo 子进程会把 TMP 重写回系统值,TEMP 是唯一可靠入口。
+    let base = std::env::var_os("TEMP")
+        .or_else(|| std::env::var_os("TMP"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let p = base.join(format!("{name}-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     TempDirGuard(p)

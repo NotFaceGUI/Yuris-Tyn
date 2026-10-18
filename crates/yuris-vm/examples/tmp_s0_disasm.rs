@@ -65,7 +65,7 @@ fn main() {
                 }
             })
             .collect();
-        println!("组{gi} {} n={}: {}", cmd_name(g.command_type), g.window_count, wins.join(" | "));
+        println!("组{gi} {} (ct={}) n={}: {}", cmd_name(g.command_type), g.command_type, g.window_count, wins.join(" | "));
     }
 }
 

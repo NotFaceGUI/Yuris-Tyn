@@ -1,9 +1,17 @@
-//! YSSD 系统数据 + SNP(snappy 变体)解码测试。
+//! YSSD 系统数据 + 压缩层（zlib / SNP 变体）解码/编码测试。
 //!
 //! - 合成流:varint / 字面量(+1 变体)/ copy1 / copy2 / copy4 逐形态;
-//! - 真实样本:`save/*.sd` 六文件全块结构断言(2026-09-05 实测,PROGRESS 成果 60)。
+//! - 编码器往返:snp_compress / compress_block_payload / YssdBuilder;
+//! - 真实样本:按 save 目录**自适应**两套语料 ——
+//!   * v555 标定样本(六文件全 SNP,2026-09-05 实测,PROGRESS 成果 60);
+//!   * v494 语料(全部 zlib;含 btype=0/1/2 三种块,2026-10-18 引擎反汇编 +
+//!     真实 save/ 实测,见 PROGRESS 成果「存档容器对齐」)。
 
-use yuris_format::yssd::{snp_uncompress, YssdFile, YssdPayload};
+use yuris_format::yssd::{
+    compress_block_payload, decompress_block_payload, encode_block_body, encode_config_payload,
+    encode_multi_body, parse_config_payload, parse_multi_payload, snp_compress, snp_uncompress,
+    YssdBuilder, YssdFile, YssdPayload,
+};
 
 /// 样本 save 目录(仓库内游戏目录;缺失则跳过)。
 fn sample_save_dir() -> Option<std::path::PathBuf> {
@@ -101,20 +109,114 @@ fn yssd_payload_parse() {
     assert_eq!(&p.data[..8], &1i64.to_le_bytes());
 }
 
-/// 真实样本:六 .sd 文件全部块的结构断言(引擎 oracle)。
+
+/// 真实样本自适应:save/ 目录含 gsd.sd ⇒ v494 语料(全 zlib,块类型 0/1/2);
+/// 否则 = v555 标定样本(六文件全 SNP,btype 恒 0)。
 #[test]
 fn yssd_real_sample_blocks() {
     let Some(dir) = sample_save_dir() else {
         eprintln!("样本 save/ 缺失,跳过");
         return;
     };
+    if dir.join("gsd.sd").exists() {
+        yssd_v494_corpus(&dir);
+    } else {
+        yssd_v555_corpus(&dir);
+    }
+}
+
+/// v494 语料断言(第二发行作品 save/ 六文件,2026-10-18 实测)。
+fn yssd_v494_corpus(dir: &std::path::Path) {
+    // btype=0 常规块:DNO → (var, ty, dims)
+    let plain: &[(&str, u32, u16, u8, &[u32])] = &[
+        ("extra.sd", 11, 2627, 3, &[8193]),
+        ("extra.sd", 12, 2628, 1, &[]),
+        ("extra.sd", 21, 2769, 3, &[8193]),
+        ("extra.sd", 22, 2770, 1, &[]),
+        ("extra.sd", 31, 2716, 1, &[501]),
+        ("extra.sd", 41, 2577, 1, &[501]),
+        ("gsd.sd", 1, 1113, 1, &[256, 128]),
+        ("gsd.sd", 2, 1112, 3, &[256]),
+        ("kidoku.sd", 1, 1116, 1, &[650, 160]),
+        ("seld.sd", 1, 2264, 1, &[2001]),
+        ("save00001.sd", 1, 2173, 1, &[]),
+        ("save00001.sd", 2, 1113, 1, &[]),
+        ("save00001.sd", 4, 2171, 3, &[16]),
+        ("save00001.sd", 7, 1115, 1, &[256, 128]),
+        ("save00001.sd", 8, 1114, 3, &[256]),
+        ("save00001.sd", 9, 1005, 3, &[]),
+    ];
+    for (fname, dno, var, ty, dims) in plain {
+        let data = std::fs::read(dir.join(fname)).unwrap();
+        let yssd = YssdFile::from_bytes(&data).unwrap();
+        let blk = yssd.block(*dno).unwrap_or_else(|| panic!("{fname}[{dno}] 缺块"));
+        assert_eq!(blk.var_id, *var, "{fname}[{dno}] var");
+        assert_eq!(blk.btype, 0, "{fname}[{dno}] btype");
+        assert_eq!(blk.strict, 1, "{fname}[{dno}] strict");
+        let raw = decompress_block_payload(&blk.compressed)
+            .unwrap_or_else(|e| panic!("{fname}[{dno}] 解压: {e}"));
+        let p = YssdPayload::from_bytes(&raw).unwrap();
+        assert_eq!(p.ty, *ty, "{fname}[{dno}] ty");
+        assert_eq!(&p.dims, dims, "{fname}[{dno}] dims");
+    }
+    // btype=2 多变量块:gsd DNO=3/4(单子块 var 1161/1162;与 LOAD 反汇编闭合)
+    for (fname, dno, var, ulen) in [
+        ("gsd.sd", 3u32, 1161u16, 65552usize),
+        ("gsd.sd", 4, 1162, 32784),
+    ] {
+        let data = std::fs::read(dir.join(fname)).unwrap();
+        let yssd = YssdFile::from_bytes(&data).unwrap();
+        let blk = yssd.block(dno).unwrap();
+        assert_eq!(blk.btype, 2, "{fname}[{dno}] btype");
+        assert_eq!(blk.var_id, 0, "{fname}[{dno}] 外层 var 恒 0");
+        let subs = parse_multi_payload(&blk.compressed).unwrap();
+        assert_eq!(subs.len(), 1, "{fname}[{dno}] 子块数");
+        assert_eq!(subs[0].var_id, var, "{fname}[{dno}] 子块 var");
+        assert_eq!(subs[0].ulen as usize, ulen, "{fname}[{dno}] 子块 ulen");
+        let raw = decompress_block_payload(&subs[0].compressed).unwrap();
+        assert_eq!(raw.len(), ulen, "{fname}[{dno}] 解压长闭合");
+        YssdPayload::from_bytes(&raw).unwrap();
+    }
+    // save00001.sd 的 btype=2 块(DNO=5/6)同构
+    {
+        let data = std::fs::read(dir.join("save00001.sd")).unwrap();
+        let yssd = YssdFile::from_bytes(&data).unwrap();
+        for dno in [5u32, 6] {
+            let blk = yssd.block(dno).unwrap();
+            assert_eq!(blk.btype, 2, "save00001[{dno}] btype");
+            let subs = parse_multi_payload(&blk.compressed).unwrap();
+            assert!(!subs.is_empty(), "save00001[{dno}] 子块非空");
+            for s in &subs {
+                let raw = decompress_block_payload(&s.compressed).unwrap();
+                assert_eq!(raw.len() as u32, s.ulen, "save00001[{dno}] 子块 ulen 闭合");
+            }
+        }
+    }
+    // btype=1 配置块(save00001 DNO=3):段A=0x640 / 段B=0x7530(8+A+B=31608 闭合)
+    {
+        let data = std::fs::read(dir.join("save00001.sd")).unwrap();
+        let yssd = YssdFile::from_bytes(&data).unwrap();
+        let blk = yssd.block(3).unwrap();
+        assert_eq!(blk.btype, 1);
+        assert_eq!(blk.var_id, 0, "配置块 var 头恒 0");
+        let raw = decompress_block_payload(&blk.compressed).unwrap();
+        let cfg = parse_config_payload(&raw).unwrap();
+        assert_eq!(cfg.section_a.len(), 0x640, "段A长 = 0x640(引擎硬编码值)");
+        assert_eq!(cfg.section_b.len(), 0x7530, "段B长 = 30000");
+        assert_eq!(8 + 0x640 + 0x7530, raw.len(), "载荷长闭合");
+    }
+}
+
+/// v555 标定样本断言(2026-09-05 实测;全 SNP → decompress_block_payload 自动分流)。
+fn yssd_v555_corpus(dir: &std::path::Path) {
     // (文件, 块数, [(DNO, var_id, 类型, 维数, 数据长)])
     let expect: &[(&str, usize, &[(u32, u16, u8, &[u32], usize)])] = &[
         ("seld.sd", 1, &[(1, 2337, 1, &[2001], 16008)]),
-        ("config.sd", 2, &[
-            (1, 1174, 1, &[256, 256], 524288),
-            (2, 1173, 3, &[256], 1067),
-        ]),
+        (
+            "config.sd",
+            2,
+            &[(1, 1174, 1, &[256, 256], 524288), (2, 1173, 3, &[256], 1067)],
+        ),
         (
             "global.sd",
             4,
@@ -167,10 +269,8 @@ fn yssd_real_sample_blocks() {
             ],
         ),
     ];
-    // 勘误(2026-09-05):.sd 是**可变环境数据** —— 真引擎运行/退出会改写
-    // (实测 kidoku.sd 出现第 5 块、config 边距值变化)。断言从
-    // 「精确快照」改为「模式鲁棒」:文件可解析、已知块(var_id)存在且
-    // 类型/维数/数据长符合 schema;块数 ≥ 已知数(引擎可追加)。
+    // 勘误(2026-09-05):.sd 是**可变环境数据** —— 真引擎运行/退出会改写。
+    // 断言保持「模式鲁棒」:可解析、已知块存在、类型/维数/数据长符合 schema。
     for (fname, nblk, blocks) in expect {
         let data = std::fs::read(dir.join(fname)).unwrap();
         let yssd = YssdFile::from_bytes(&data).unwrap();
@@ -182,19 +282,16 @@ fn yssd_real_sample_blocks() {
         );
         for (dno, var_id, ty, dims, _dlen) in blocks.iter() {
             let Some(blk) = yssd.block(*dno) else {
-                // 引擎可能改写 DNO 布局:按 var_id 兜底定位
                 eprintln!("{fname}: DNO {dno} 不在(引擎改写,跳过)");
                 continue;
             };
             assert_eq!(blk.var_id, *var_id, "{fname}[{dno}] var");
             assert_eq!(blk.btype, 0, "{fname}[{dno}] type");
             assert_eq!(blk.strict, 1, "{fname}[{dno}] strict");
-            let raw = snp_uncompress(&blk.compressed).unwrap();
+            let raw = decompress_block_payload(&blk.compressed).unwrap();
             let p = YssdPayload::from_bytes(&raw).unwrap();
             assert_eq!(p.ty, *ty, "{fname}[{dno}] ty");
             assert_eq!(&p.dims, dims, "{fname}[{dno}] dims");
-            // 数据长:INT/FLT 定长 8×元素;STR 含变长串字节,≥ 4×元素即可
-            // (引擎运行会改写字符串内容;快照值不再锚定)
             let product: usize = dims.iter().map(|d| *d as usize).product();
             let min_len = if *ty == 1 || *ty == 2 { 8 * product } else { 4 * product };
             assert!(
@@ -206,6 +303,99 @@ fn yssd_real_sample_blocks() {
     }
 }
 
+/// 编码器往返:snp_compress → snp_uncompress(含空/1B/60/61/长跑/重复)。
+#[test]
+fn snp_compress_roundtrip() {
+    let mut rng: u64 = 0x243f6a8885a308d3;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut cases: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        vec![0xff],
+        vec![b'x'; 60],
+        vec![b'x'; 61],
+        vec![b'x'; 0x100],
+        vec![b'x'; 0x10001],
+        (0..100_000u32).map(|i| (i as u8).wrapping_mul(7)).collect(),
+    ];
+    // 带重复段的伪随机(触发 copy 族)。
+    let mut rep: Vec<u8> = (0..40_000u32).map(|_| next() as u8).collect();
+    let head = rep[..5_000].to_vec();
+    rep.extend_from_slice(&head);
+    cases.push(rep);
+    for src in &cases {
+        let enc = snp_compress(src);
+        let dec = snp_uncompress(&enc).unwrap();
+        assert_eq!(&dec, src, "snp 往返失败(len {})", src.len());
+    }
+}
+
+/// zlib 块载荷压缩往返;且纯原数据(非 zlib 头)不得被 zlib 分支误收。
+#[test]
+fn zlib_block_payload_roundtrip() {
+    let raw: Vec<u8> = (0..50_000u32)
+        .map(|i| (i.wrapping_mul(2654435761u32) >> 24) as u8)
+        .collect();
+    let c = compress_block_payload(&raw);
+    assert_eq!(c[0] & 0x0f, 0x08, "zlib CMF");
+    assert_eq!(decompress_block_payload(&c).unwrap(), raw);
+}
+
+/// 块体/容器编码往返:encode_block_body + YssdBuilder → YssdFile 解回。
+#[test]
+fn builder_roundtrip() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&4u32.to_le_bytes());
+    payload.extend_from_slice(&32u32.to_le_bytes());
+    for v in [10i64, -20, 30, 40] {
+        payload.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut b = YssdBuilder::default();
+    b.set_block(1, encode_block_body(0, 1, 1113, &payload, true));
+    b.set_block(777, encode_block_body(0, 1, 2171, &payload, false));
+    b.set_block(1024, encode_multi_body(&[(&1161u16, &payload)]));
+    let bytes = b.build();
+    let f = YssdFile::from_bytes(&bytes).unwrap();
+    assert_eq!(f.block_count(), 3);
+    for dno in [1u32, 777, 1024] {
+        assert!(f.block(dno).is_some(), "DNO {dno}");
+    }
+    assert!(f.block(2).is_none(), "空 DNO 查无");
+    // btype0 压缩块解回
+    let blk = f.block(1).unwrap();
+    assert_eq!((blk.btype, blk.strict, blk.var_id), (0, 1, 1113));
+    let raw = decompress_block_payload(&blk.compressed).unwrap();
+    assert_eq!(YssdPayload::from_bytes(&raw).unwrap().data, &payload[16..]);
+    // btype0 非压缩块:clen == ulen == 载荷长
+    let blk = f.block(777).unwrap();
+    assert_eq!(blk.compressed, payload);
+    // btype2 多块解回
+    let blk = f.block(1024).unwrap();
+    let subs = parse_multi_payload(&blk.compressed).unwrap();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].var_id, 1161);
+    let raw = decompress_block_payload(&subs[0].compressed).unwrap();
+    assert_eq!(raw, payload);
+}
+
+/// 配置载荷编码往返。
+#[test]
+fn config_payload_roundtrip() {
+    let a = vec![1u8; 0x640];
+    let b = vec![2u8; 100];
+    let enc = encode_config_payload(&a, &b);
+    let p = parse_config_payload(&enc).unwrap();
+    assert_eq!(p.section_a, a);
+    assert_eq!(p.section_b, b);
+}
+
+
 /// 真实样本:config.sd 块 1(INT 256×256)的数据抽样
 ///(@1174[101][1] = 1920 屏宽、[101][2] = 1080 屏高、[101][5] = -10 边距)。
 #[test]
@@ -214,6 +404,11 @@ fn yssd_real_sample_config_values() {
         eprintln!("样本 save/ 缺失,跳过");
         return;
     };
+    // 本测试锚定 v555 标定样本的 config.sd;v494 语料无此文件。
+    if !dir.join("config.sd").exists() {
+        eprintln!("非 v555 语料(无 config.sd),跳过");
+        return;
+    }
     let data = std::fs::read(dir.join("config.sd")).unwrap();
     let yssd = YssdFile::from_bytes(&data).unwrap();
     let blk = yssd.block(1).unwrap();

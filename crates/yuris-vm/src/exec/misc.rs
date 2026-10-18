@@ -515,6 +515,15 @@ impl GroupVm {
                             CmdKind::DeclLocalStr => yuris_value::ElemType::Str,
                             _ => yuris_value::ElemType::Int,
                         };
+                        if std::env::var_os("YURIS_TRACE_DECL").is_some() {
+                            yuris_log::trace_forced!(
+                                "[decl] s{} pc{} {}[{}] bound={n}",
+                                self.ctx.script_id,
+                                self.pc,
+                                r.display(),
+                                et as u8,
+                            );
+                        }
                         self.store.declare_array(&r, et, &[n as u32]);
                         self.push_event(VmEvent::Declaration {
                             pc: self.pc,
@@ -573,6 +582,15 @@ impl GroupVm {
             if !array_form {
                 self.store.clear_arrays_for_id(r.id);
             }
+            if std::env::var_os("YURIS_TRACE_DECL").is_some() {
+                yuris_log::trace_forced!(
+                    "[decl] s{} pc{} scalar {} = {:?}",
+                    self.ctx.script_id,
+                    self.pc,
+                    r.display(),
+                    value_summary(&init)
+                );
+            }
             self.store.set(&r, init);
             self.push_event(VmEvent::Declaration {
                 pc: self.pc,
@@ -589,6 +607,36 @@ impl GroupVm {
         // 「按名切脚本」,不可靠;实测引擎 pc 顺序推进,已按上
         // 声明族实现。0x65 VAR(0x453158)语义未定性(Unknown)。
         if kind.is_declaration() {
+            // **勘误 2026-10-18:运行期 `INT`/`FLT`/`STR` 不是空操作。**
+            //
+            // 旧实现只记 `Declaration` 事件、`pc += 1`,**不求值也不写值**。
+            // 但语料里这三族在运行期出现的形态**恒为 2 窗口**
+            // (`s70` 单脚本实测:INT 73 处 / STR 35 处 / FLT 1 处,全部 n=2),
+            // 窗口内容 = 「左值引用 + 初值表达式」,与 `LET` 完全同构:
+            //
+            // ```text
+            // 组480 INT n=2: pushvar(@4369) | pushint(0)     ← 运行期重置!
+            // ```
+            //
+            // 官方 trace 实证 `s70 pc480`(handler `0x44645c` = 表 idx 51 = INT)
+            // 在 183 次 `es._strtocode` 调用中**执行 183 次**。跳过它 ⇒
+            // `@4369` 保留上一次调用的键码 ⇒ `es._strtocode` 返回残留值
+            // ⇒ 调用方 `s0 pc982 IF @60[1] > 0` 误判为真 ⇒ 相位机错位。
+            //
+            // 修法:2 窗口形态按 `LET` 语义处理(左值 ← 右值);
+            // 其它形态(仅声明/带下标)保持原「只记事件」行为,不臆造。
+            if g.window_count == 2 {
+                let decl = g;
+                let _ = decl;
+                let r = self.cmd_let(g, windows);
+                // LET 已推 `GroupExecuted`;补一条 Declaration 保留可观测性。
+                self.push_event(VmEvent::Declaration {
+                    pc: self.pc.saturating_sub(1),
+                    command: other,
+                    windows: g.window_count,
+                });
+                return r;
+            }
             self.push_event(VmEvent::Declaration {
                 pc: self.pc,
                 command: other,
@@ -653,6 +701,15 @@ impl GroupVm {
                         let target = extract_var_target(&bytes)?;
                         let hit = probe.exists(p);
                         self.write_var_target(&target, Value::Int(hit as i64))?;
+                        if std::env::var_os("YURIS_TRACE_FILEINFO").is_some() {
+                            yuris_log::trace_forced!(
+                                "[fileinfo] s{} pc{} EXIST {:?} = {}",
+                                self.ctx.script_id,
+                                self.pc,
+                                p,
+                                hit as i64
+                            );
+                        }
                         evaluated.push((
                             255u8,
                             format!("EXIST({p})={} → {}", hit as i64, target.summary()),

@@ -11,7 +11,7 @@ use yuris_value::{Value, VariableStore};
 
 use crate::event::{GoOutcome, JumpKind, VmEvent, VmState, VmSuspend};
 use crate::exec::Action;
-use crate::util::value_truthy;
+use crate::util::{value_summary, value_truthy};
 use crate::{GosubFrame, GroupVm, IfFrame, LoopFrame};
 impl GroupVm {
     /// 处理 `Go`(从 `run_main` 拆出;语义逐行照搬)。
@@ -200,6 +200,23 @@ impl GroupVm {
         g: CommandGroup,
         windows: &[CommandSlot],
     ) -> Result<Action> {
+        // 诊断(`YURIS_TRACE_DEPTH=1`):逐次打印 RETURN 处的帧深。
+        // 用于定位「基帧 RETURN 应结束任务、却继续顺延 pc」的分歧。
+        if std::env::var_os("YURIS_TRACE_DEPTH").is_some() {
+            let stack: Vec<String> = self
+                .frames
+                .iter()
+                .map(|f| format!("s{}pc{}", f.script_id, f.return_pc))
+                .collect();
+            yuris_log::trace_forced!(
+                "[depth] s{} pc{} RETURN depth={} retpc={:?} stack={:?}",
+                self.ctx.script_id,
+                self.pc,
+                self.frames.len(),
+                self.frames.last().map(|f| f.return_pc),
+                stack
+            );
+        }
         // 返回值虚拟族(P5 定性,成果 50):实参按 B0 槽号求值
         // (callee 上下文),写入调用者帧返回值区:
         //   B0 0x00/0x01-0x0f → INT  ret[@60][max(1,B0)]
@@ -250,6 +267,14 @@ impl GroupVm {
                 continue; // 区段外
             }
             if let Some(v) = self.eval_window_condition(Some(w))? {
+                if std::env::var_os("YURIS_TRACE_RET").is_some() {
+                    yuris_log::trace_forced!(
+                        "[ret] s{} pc{} B0={b0:#04x} v={:?}",
+                        self.ctx.script_id,
+                        self.pc,
+                        value_summary(&v)
+                    );
+                }
                 ret_vals.push((b0, v));
             }
         }

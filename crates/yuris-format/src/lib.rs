@@ -29,6 +29,7 @@ pub mod scriptpos;
 pub mod ystb;
 pub mod ysvr;
 pub mod yssd;
+pub mod yscfgdat;
 
 /// crate 版本（与 workspace 同步）
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

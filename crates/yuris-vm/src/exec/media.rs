@@ -168,6 +168,7 @@ impl GroupVm {
         // A(不透明度 0〜256)/ MODE(描画模式 0〜18):手册关键字,
         // 逐槽独立带出给渲染侧(成果 122)。
         let mut ca: Option<i64> = None;
+        let mut ca_op: Option<u8> = None;
         let mut cmode: Option<i64> = None;
         // 过渡三件套 `T`/`TID`/`TA` + 遮罩 `MID`(手册 `cg/cg.html`;
         // 本作槽 37/38/40/35 —— 从 YSCM 参数表按名取,不写死)。
@@ -223,8 +224,14 @@ impl GroupVm {
                     }
                 } else if self.slot_is(cmd, slot, "A", 3) {
                     // A = 不透明度 0〜256(手册;256 = 全不透明)。
+                    // **运算码(2026-10-18,成果 196 追记二)**:窗 tag B3 =
+                    // 槽级运算码(0=赋值 1=+= 2=-=,引擎 0x42bd50 RE)。
+                    // 语料锚点:s20 配置页 `LOOP 32× CG[SYSBLACK A=8]`
+                    // tag=0x02010003(B3=2)= 每帧 −8 渐入;旧实现丢 B3
+                    // ⇒ 恒绝对赋值,黑幕停在 α=8,「盖住变浅」。
                     if let Value::Int(n) = &v {
                         ca = Some(*n);
+                        ca_op = Some((w.tag >> 24) as u8);
                     }
                 } else if self.slot_is(cmd, slot, "MODE", 41) {
                     // MODE = 描画模式 0〜18(手册)。
@@ -435,6 +442,7 @@ impl GroupVm {
             // 图层组尺寸(手册:「レイヤセットに対してのみ有効」;成果 134)。
             sx: csx,
             sy: csy,
+            a_op: ca_op.unwrap_or(0),
         });
         self.pc += 1;
         return Ok(Action::Keep);

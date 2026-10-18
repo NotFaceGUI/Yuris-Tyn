@@ -69,8 +69,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// ⚠️ 本模块**不参与分派**：运行期分派一律走 [`CommandDispatch`]，序号来自
 /// 游戏自身的 YSCM（见 [`crate::commands`] 与 `docs/cross-version-commands.md`）。
-/// 这里保留常量只为：(a) 构造[`yuris_core::CommandProfile::v555`]兜底 profile；
-/// (b) 既有测试/工具按名取号。**新代码不得用它做 `match`**。
+/// 这里保留常量只为：(a) 构造[`yuris_core::CommandProfile::v555`]内置 profile；
+/// (b) 既有测试/工具按名取号。**新代码不得用它做 `match`**;
+/// (c) **运行期零引用**(2026-10-18 起 `halt` 族诊断传真实下标,见
+/// [`GroupVm::cur_cmd`])—— 出现在运行期代码里即为回归。
 pub mod cmd {
     /// GO。
     pub const GO: u8 = 0x2a;
@@ -548,6 +550,20 @@ pub struct GroupVm {
     epoch: std::time::Instant,
     /// 游戏虚拟 FS 存在性索引(FILEINFO EXIST;见 `host::PacFileIndex`)。
     file_probe: Option<std::sync::Arc<crate::host::PacFileIndex>>,
+    /// **SAVE 预留表**(DNO → 序列化块体)。
+    ///
+    /// 引擎等价物 = 两张 BSS 表(体指针 `0x7fbffc[dno]` + 体长
+    /// `0x7fd0fc[dno]`,v494 SAVE 刷盘循环 `0x44cc5d` 逐项读取)。
+    /// `SAVE[DNO=… SET/G_*=…]` 即时序列化进此表(引擎在 SAVE 命令处
+    /// 序列化,不在 FILE 刷盘时重取 —— `0x44d5a7` 体);`SAVE[FILE=…]`
+    /// 刷盘后清空(手册 `file/save.html` 例[6]);`SAVEEND[]` 亦清空。
+    save_reserved: std::collections::BTreeMap<u32, Vec<u8>>,
+    /// **会话内已写存档**(文件名 → 容器字节)。
+    ///
+    /// SAVE[FILE] 产出在此登记并经 [`VmEvent::SaveFile`] 通知宿主落盘;
+    /// 同会话 LOAD 直接读回(等价引擎 fopen 语义 —— 引擎读写都走磁盘,
+    /// 本内核把「本次会话刚写的」与「磁盘已有的」在 VM 内合流)。
+    saved_files: std::collections::BTreeMap<String, Vec<u8>>,
     /// **音频状态查询通道**（`SOUNDINFO`；由宿主注入，VM 不依赖音频层）。
     audio_probe: Option<std::sync::Arc<dyn crate::audio_probe::SoundStateProbe>>,
     /// **官方任务调度器**(单一扁平链;主线也是链中一员)。
@@ -689,6 +705,10 @@ pub struct GroupVm {
     ///
     /// 统一诊断改读本字段(`Some` = 分派期,`None` = 分派外),并把调用方传的
     /// 常量仅在**与真实值不一致**时作为附加信息附上。
+    ///
+    /// **2026-10-18 清理**:全部 `halt` 族调用点已改为传真实下标
+    /// (`g.command_type` / [`Self::cur_cmd()`]),`cmd::*` 常量在运行期
+    /// **零引用**(仅测试/工具留存);本字段仍是唯一真值源。
     cur_command: Option<u8>,
     /// 「无参数表 → v555 槽号回落」的累计次数(T3;`Cell` 便于 `&self` 的
     /// `slot_is` 族登记)。生产 profile(四张内置表 + 游戏 YSCM)恒为 0;
@@ -914,6 +934,8 @@ impl GroupVm {
             ysvr_kind2_applied: std::collections::HashSet::new(),
             epoch: std::time::Instant::now(),
             file_probe: None,
+            save_reserved: std::collections::BTreeMap::new(),
+            saved_files: std::collections::BTreeMap::new(),
             audio_probe: None,
             scheduler: Some({
                 let mut sch = crate::task::TaskScheduler::from_env();
@@ -1558,6 +1580,12 @@ impl GroupVm {
     /// `es_GSD.yst` 的 `SAVE[DNO=03 G_INT2=1]` 紧邻注释掉的
     /// `SAVE[DNO=03 SET=@G()]` —— 两者等价 ⇒ `G_*` = **按恢复组保存**。
     pub fn ysvr_group_len(&self, group_names: &[&str]) -> usize {
+        self.ysvr_group_vars(group_names).len()
+    }
+
+    /// [`Self::ysvr_group_len`] 的**带 id 形态**:返回该组覆盖的
+    /// `(var_id, 类型码)` 列表(SAVE 恢复组 = btype2 子块集合,按此序列化)。
+    pub fn ysvr_group_vars(&self, group_names: &[&str]) -> Vec<(u16, u8)> {
         let want: Vec<(u8, u8)> = group_names
             .iter()
             .filter_map(|name| {
@@ -1587,7 +1615,8 @@ impl GroupVm {
             .filter(|e| {
                 e.kind == 1 && want.iter().any(|(ty, cat)| e.ty == *ty && e.category == *cat)
             })
-            .count()
+            .map(|e| (e.var_id, e.ty))
+            .collect()
     }
 
     /// 应用 YSVR 变量定义表(启动链 FUN_0046b63c 的「应用初值」步)。
@@ -1975,7 +2004,7 @@ impl GroupVm {
         let Some(w) = windows.first() else {
             return Ok(GoOutcome::Halted(self.halted(
                 self.pc,
-                cmd::GO,
+                self.cur_cmd(),
                 "GO 无窗口",
             )));
         };
@@ -1984,14 +2013,14 @@ impl GroupVm {
         if w.len & 0xF000_0000 != 0 {
             return Ok(GoOutcome::Halted(self.halted(
                 self.pc,
-                cmd::GO,
+                self.cur_cmd(),
                 "GO len 域带载入期解析标记(0x10000000)——文件形态不应出现;不猜",
             )));
         }
         let Some(bytes) = self.ctx.script.window_bytes_pooled_copy(w) else {
             return Ok(GoOutcome::Halted(self.halted(
                 self.pc,
-                cmd::GO,
+                self.cur_cmd(),
                 "GO 窗口越过池尾",
             )));
         };
@@ -2015,7 +2044,7 @@ impl GroupVm {
                     if self.host.is_none() {
                         return Ok(GoOutcome::Halted(self.halted(
                             self.pc,
-                            cmd::GO,
+                            self.cur_cmd(),
                             format!("跨脚本 GO 到 script {script_id} 但未绑定 ScriptHost"),
                         )));
                     }
@@ -2660,6 +2689,13 @@ impl GroupVm {
         Ok(arc)
     }
 
+    /// 当前分派中的命令下标(分派外 = 0)。**仅作诊断传参**,不得参与语义判断:
+    /// 分派内的唯一真值源是 [`Self::cur_command`],处理器的 `halt` 族调用
+    /// 一律经本助手(或 `g.command_type`)传入真实下标。
+    fn cur_cmd(&self) -> u8 {
+        self.cur_command.unwrap_or(0)
+    }
+
     /// strict 挂起的 `Result` 形态:记录 Unsupported 事件 + 返回 Err。
     fn halt_err(&mut self, pc: usize, command: u8, reason: impl Into<String>) -> Error {
         Error::format(self.halted(pc, command, reason))
@@ -2676,65 +2712,204 @@ impl GroupVm {
         reason
     }
 
-    /// LOAD/YSSD 装载(引擎 FUN_00444648 文件分支 + FUN_0044564d 写回)。
+    /// LOAD/YSSD 装载(v494 引擎 LOAD 处理器 `0x446ed0` 直译;2026-10-18 重写)。
     ///
-    /// `fname` = 脚本槽 0 求值串(无扩展名 → 补 `.sd`,引擎 FUN_004409dc
-    /// 分支);`dno` = 块号(1 基);`target` = 槽 3 延迟引用(块头 var_id
-    /// 与之恒一致,语料 26 组实证)。装载路径 = 松散文件(save/ VFS 根)。
-    fn load_yssd(&mut self, fname: &[u8], dno: i64, target: &yuris_value::VarRef) -> Result<()> {
-        if dno < 1 {
+    /// 参数:`fname` = FILE 槽求值串(无扩展名 → 补 `.sd`,'/'→'\\',与引擎
+    /// `0x446fec` 逐字节分支一致);`dno` = DNO 槽(1 基,偏移表寻址
+    /// `DNO*4+0xC` ≡ `0x10+(DNO-1)*4`);`target` = LET 槽延迟引用
+    /// (btype=0 写回目标;btype=2 按子块自带的 var 写回,与 LET 无关;
+    /// btype=1 无变量写回)。
+    ///
+    /// 块类型(引擎 `0x447274` 起,2026-10-18 反汇编 + 语料闭合):
+    /// - **0** 单变量:zlib/SNP 载荷 → [`Self::yssd_writeback`];
+    /// - **1** 配置块(`0x44760c`):段A/段B 结构解析后**记录不写回**
+    ///   (引擎把它写入 per-script 配置库,本内核该子系统未建模 —— 显式
+    ///   留痕,不猜字段语义);
+    /// - **2** 多变量:子块表(无计数,循环消费)逐个解压写回。
+    ///
+    /// 文件来源:会话内覆盖(SAVE[FILE] 刚写的)优先,否则
+    /// `PacFileIndex::read_loose`(save/ VFS 根)。
+    ///
+    /// 返回一行结果摘要(调用方并入 `VmEvent::Load` 的 evaluated)。
+    fn load_yssd(
+        &mut self,
+        fname: &[u8],
+        dno: i64,
+        target: Option<&yuris_value::VarRef>,
+        layer_id: Option<&[u8]>,
+    ) -> Result<String> {
+        if dno < 1 || dno > 1024 {
             return Err(self.halt_err(
                 self.pc,
-                cmd::LOAD,
-                format!("LOAD DNO={dno} 越界(YSSD 偏移表 1 基)"),
+                self.cur_cmd(),
+                format!("LOAD DNO={dno} 越界(手册 1~1024)"),
             ));
         }
         let mut name = String::from_utf8_lossy(fname).into_owned();
         if !name.contains('.') {
             name.push_str(".sd");
         }
-        let Some(probe) = &self.file_probe else {
-            return Err(self.halt_err(
-                self.pc,
-                cmd::LOAD,
-                "LOAD 需要文件源(PacFileIndex 未注入;引擎 VFS 语义)",
-            ));
-        };
-        let Some(bytes) = probe.read_loose(&name) else {
-            return Err(self.halt_err(
-                self.pc,
-                cmd::LOAD,
-                format!("LOAD 文件不存在: {name}(引擎 0x18ed4 错误框同族)"),
-            ));
+        let bytes = match self.saved_files.get(&name) {
+            Some(b) => b.clone(),
+            None => {
+                let Some(probe) = &self.file_probe else {
+                    return Err(self.halt_err(
+                        self.pc,
+                        self.cur_cmd(),
+                        "LOAD 需要文件源(PacFileIndex 未注入;引擎 VFS 语义)",
+                    ));
+                };
+                let Some(bytes) = probe.read_loose(&name) else {
+                    return Err(self.halt_err(
+                        self.pc,
+                        self.cur_cmd(),
+                        format!("LOAD 文件不存在: {name}(引擎 0x18ed4 错误框同族)"),
+                    ));
+                };
+                bytes
+            }
         };
         let yssd = yuris_format::yssd::YssdFile::from_bytes(&bytes)
             .map_err(|e| Error::format(format!("LOAD {name}: {e}")))?;
         let Some(block) = yssd.block(dno as u32) else {
             return Err(self.halt_err(
                 self.pc,
-                cmd::LOAD,
+                self.cur_cmd(),
                 format!("LOAD {name} 无块 {dno}(偏移表空项;引擎 0x18ede)"),
             ));
         };
-        if block.btype == 1 {
-            return Err(self.halt_err(
+        match block.btype {
+            0 => {
+                // btype=0 须配 LET(引擎对 btype=1 无 ID 才报 0x1a612;
+                // btype=0 无 LET 的落点语料未出现,不猜)。
+                let Some(target) = target else {
+                    return Err(self.halt_err(
+                        self.pc,
+                        self.cur_cmd(),
+                        format!("LOAD {name}[{dno}] btype=0 缺 LET 槽(语料未出现;不猜)"),
+                    ));
+                };
+                let raw = yuris_format::yssd::decompress_block_payload(&block.compressed)
+                    .map_err(|e| Error::format(format!("LOAD {name}[{dno}]: {e}")))?;
+                self.yssd_writeback(&raw, target, block.strict)?;
+                Ok(format!(
+                    "btype0 {}[{}] → {}({}B)",
+                    name,
+                    dno,
+                    target.display(),
+                    raw.len()
+                ))
+            }
+            1 => {
+                let raw = yuris_format::yssd::decompress_block_payload(&block.compressed)
+                    .map_err(|e| Error::format(format!("LOAD {name}[{dno}]: {e}")))?;
+                let cfg = yuris_format::yssd::parse_config_payload(&raw)
+                    .map_err(|e| Error::format(format!("LOAD {name}[{dno}]: {e}")))?;
+                // 引擎(v494 `0x4473bd` → `0x44760c`):带 ID 时把段B 位图装入
+                // ID 层。段A u32[30]/[31] = 宽/高(实测 100×75,
+                // 100*75*4 = 30000 = 段B 长精确闭合;字节序按内容判读为 RGBA,
+                // 见 `VmEvent::LayerBitmap` 文档)。
+                let bitmap = match layer_id {
+                    Some(id) if cfg.section_a.len() >= 128 => {
+                        let w = u32::from_le_bytes(cfg.section_a[120..124].try_into().unwrap());
+                        let h = u32::from_le_bytes(cfg.section_a[124..128].try_into().unwrap());
+                        if w > 0 && h > 0 && cfg.section_b.len() == (w as usize) * (h as usize) * 4 {
+                            Some((w, h))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                // **字节序勘误(2026-10-19,双渲染目检)**:段B 是 **BGRA** 不是
+                // RGBA —— 引擎为 D3D9,`D3DFMT_A8R8G8B8` 锁定后内存序 =
+                // B,G,R,A,截图 memcpy 进存档即此序。目检裁决(100×75 校园
+                // 场景):按 RGBA 渲染 = 橙天紫路(R/B 互换伪色);按 BGRA =
+                // 蓝天白云白楼绿草,完全自然。装层前交换 R/B。
+                if let Some((w, h)) = bitmap {
+                    let mut rgba = cfg.section_b.clone();
+                    for px in rgba.chunks_exact_mut(4) {
+                        px.swap(0, 2);
+                    }
+                    if let Some(id) = layer_id {
+                        self.push_event(VmEvent::LayerBitmap {
+                            pc: self.pc,
+                            id: id.to_vec(),
+                            w,
+                            h,
+                            rgba,
+                        });
+                        Ok(format!(
+                            "btype1 {}[{}] → 层 {:?} 位图 {w}×{h}({}B)",
+                            name,
+                            dno,
+                            String::from_utf8_lossy(id),
+                            w as usize * h as usize * 4
+                        ))
+                    } else {
+                        Ok(format!(
+                            "btype1 {}[{}] 位图 {w}×{h} 装载但无 ID 层名(仅记录)",
+                            name, dno
+                        ))
+                    }
+                } else {
+                    Ok(format!(
+                        "btype1 配置块 {}[{}] 段A={}B 段B={}B(无 ID/尺寸不符,仅记录)",
+                        name,
+                        dno,
+                        cfg.section_a.len(),
+                        cfg.section_b.len()
+                    ))
+                }
+            }
+            2 => {
+                let subs = yuris_format::yssd::parse_multi_payload(&block.compressed)
+                    .map_err(|e| Error::format(format!("LOAD {name}[{dno}]: {e}")))?;
+                let mut names = Vec::with_capacity(subs.len());
+                for sub in &subs {
+                    let raw = yuris_format::yssd::decompress_block_payload(&sub.compressed)
+                        .map_err(|e| Error::format(format!("LOAD {name}[{dno}]: {e}")))?;
+                    if raw.len() as u32 != sub.ulen {
+                        return Err(Error::format(format!(
+                            "LOAD {name}[{dno}] 子块 var={} ulen {} != 实解压 {}",
+                            sub.var_id, sub.ulen, raw.len()
+                        )));
+                    }
+                    let target = yuris_value::VarRef {
+                        space: yuris_value::VarSpace::At,
+                        id: sub.var_id,
+                    };
+                    self.yssd_writeback(&raw, &target, block.strict)?;
+                    names.push(sub.var_id.to_string());
+                }
+                Ok(format!(
+                    "btype2 {}[{}] → var[{}]",
+                    name,
+                    dno,
+                    names.join(",")
+                ))
+            }
+            other => Err(self.halt_err(
                 self.pc,
-                cmd::LOAD,
-                "LOAD 块类型 1(0x690 配置)须配 ID 模式(引擎 0x1a612;不猜)",
-            ));
+                self.cur_cmd(),
+                format!("LOAD {name}[{dno}] 块类型 {other} 未实现(语料未出现)"),
+            )),
         }
-        if block.btype != 0 {
-            return Err(self.halt_err(
-                self.pc,
-                cmd::LOAD,
-                format!("LOAD 块类型 {} 未实现(多子块族;语料未出现)", block.btype),
-            ));
-        }
-        let raw = yuris_format::yssd::snp_uncompress(&block.compressed)
-            .map_err(|e| Error::format(format!("LOAD {name} 块{dno}: {e}")))?;
-        let payload = yuris_format::yssd::YssdPayload::from_bytes(&raw)
-            .map_err(|e| Error::format(format!("LOAD {name} 块{dno}: {e}")))?;
+    }
 
+    /// YSSD 载荷写回(引擎 `0x447989` 等价物;类型一致 + 严格维数)。
+    ///
+    /// v494 写回入口 = `0x447989`(LOAD 主分支与 btype2 子块共用);
+    /// 类型/维数检查在其内部(错误号 0x18ee8/0x1a63a/0x1a630 同族)。
+    /// `strict` = 块头的严格维数标志(1 = 载荷维数须与声明一致)。
+    fn yssd_writeback(
+        &mut self,
+        raw: &[u8],
+        target: &yuris_value::VarRef,
+        strict: u8,
+    ) -> Result<()> {
+        let payload = yuris_format::yssd::YssdPayload::from_bytes(raw)
+            .map_err(|e| Error::format(format!("LOAD 载荷: {e}")))?;
         // 类型一致(引擎 0x18ee8)+ 严格维数匹配(引擎 0x1a63a/0x1a630)。
         if self.store.has_array(target) {
             let elem = self.store.array_elem_type(target).unwrap();
@@ -2747,7 +2922,7 @@ impl GroupVm {
             if !ok {
                 return Err(self.halt_err(
                     self.pc,
-                    cmd::LOAD,
+                    self.cur_cmd(),
                     format!(
                         "LOAD 载荷类型 {} 与 {} 声明不符(引擎 0x18ee8)",
                         payload.ty,
@@ -2756,10 +2931,10 @@ impl GroupVm {
                 ));
             }
             let bounds = self.store.array_dims(target).unwrap();
-            if block.strict == 1 && bounds != payload.dims {
+            if strict == 1 && bounds != payload.dims {
                 return Err(self.halt_err(
                     self.pc,
-                    cmd::LOAD,
+                    self.cur_cmd(),
                     format!(
                         "LOAD 载荷维数 {:?} 与 {} 声明 {bounds:?} 不符(引擎 0x1a63a)",
                         payload.dims,
@@ -2767,10 +2942,10 @@ impl GroupVm {
                     ),
                 ));
             }
-            if block.strict == 0 && !payload.dims.is_empty() {
+            if strict == 0 && !payload.dims.is_empty() {
                 return Err(self.halt_err(
                     self.pc,
-                    cmd::LOAD,
+                    self.cur_cmd(),
                     format!("LOAD 非 strict 载荷须标量(引擎 0x1a630)"),
                 ));
             }
@@ -2782,7 +2957,7 @@ impl GroupVm {
             if cur_ty != payload.ty {
                 return Err(self.halt_err(
                     self.pc,
-                    cmd::LOAD,
+                    self.cur_cmd(),
                     format!(
                         "LOAD 载荷类型 {} 与标量 {} 类型不符(引擎 0x18ee8)",
                         payload.ty,
@@ -2793,7 +2968,7 @@ impl GroupVm {
             if !payload.dims.is_empty() {
                 return Err(self.halt_err(
                     self.pc,
-                    cmd::LOAD,
+                    self.cur_cmd(),
                     format!(
                         "LOAD 标量目标 {} 收到数组载荷(引擎 0x1a630)",
                         target.display()
@@ -2803,12 +2978,12 @@ impl GroupVm {
         } else {
             return Err(self.halt_err(
                 self.pc,
-                cmd::LOAD,
+                self.cur_cmd(),
                 format!("LOAD 目标 {} 未声明(引擎 0x1a5ea 同族)", target.display()),
             ));
         }
 
-        // 写回(FUN_0044564d:INT/FLT = 8B/元素 memcpy;STR = 逐 {len,bytes})。
+        // 写回(引擎:INT/FLT = 8B/元素 memcpy;STR = 逐 {len,bytes})。
         let elem_count: usize = payload.dims.iter().map(|&d| d as usize).product();
         let values: Vec<Value> = match payload.ty {
             1 => payload
@@ -2828,7 +3003,7 @@ impl GroupVm {
                     if p + 4 > payload.data.len() {
                         return Err(self.halt_err(
                             self.pc,
-                            cmd::LOAD,
+                            self.cur_cmd(),
                             format!("LOAD {} 载荷字符串记录截断", target.display()),
                         ));
                     }
@@ -2838,7 +3013,7 @@ impl GroupVm {
                     if p + len > payload.data.len() {
                         return Err(self.halt_err(
                             self.pc,
-                            cmd::LOAD,
+                            self.cur_cmd(),
                             format!("LOAD {} 载荷字符串记录截断", target.display()),
                         ));
                     }
@@ -2859,7 +3034,7 @@ impl GroupVm {
                 None => {
                     return Err(self.halt_err(
                         self.pc,
-                        cmd::LOAD,
+                        self.cur_cmd(),
                         format!("LOAD 标量载荷为空({})", target.display()),
                     ))
                 }
@@ -2867,6 +3042,22 @@ impl GroupVm {
         }
         Ok(())
     }
+
+    /// 取走本会话 SAVE[FILE] 产出的存档容器(宿主落盘用;VM 内覆盖保留)。
+    ///
+    /// 每次 SAVE[FILE] 都会推 [`VmEvent::SaveFile`];宿主按事件提醒来取,
+    /// 也可每帧轮询。取走后 VM 内 `saved_files` 覆盖仍在(同会话 LOAD 直读)。
+    pub fn take_saved_files(&mut self) -> Vec<(String, Vec<u8>)> {
+        let names: Vec<String> = self.saved_files.keys().cloned().collect();
+        names
+            .into_iter()
+            .map(|k| {
+                let v = self.saved_files.remove(&k).expect("key from keys()");
+                (k, v)
+            })
+            .collect()
+    }
+
 
     /// 变量读取(P5,成果 50):**帧局部优先** —— 当前 GOSUB 帧 locals 含
     /// 同键数组(如 @53/@54/$55 帧局部族)时读帧,否则读全局
@@ -3086,8 +3277,12 @@ impl GroupVm {
     /// `run_main` 的「VM 处于 Error 态」挡回消息携带 —— 2026-10-17 之前
     /// 该消息不带任何原因,实机排障只能全量翻事件流)。
     ///
-    /// **`command` 参数只是处理器声明的取值**(习惯性 `cmd::*` v555 留存
-    /// 常量);事件写入的恒为分派期真实下标(T2 修复,同 [`Self::halted`])。
+    /// **`command` 参数 = 调用方传入的命令下标**(2026-10-18 清理后恒为
+    /// **真实分派下标**:分派内 `g.command_type`,无 `g` 的助手经
+    /// [`Self::cur_cmd`];分派外的声明消费路径传自身命令号)。历史上调用方
+    /// 习惯性传 `cmd::*` v555 留存常量,在别的版本上指向别的命令(T2 勘误,
+    /// 见 [`Self::cur_command`] 字段文档);现 `relic` 分支仅作回归防护 ——
+    /// 传入值与真实下标不一致时才附加标注。
     fn note_unsupported(&mut self, pc: usize, command: u8, reason: impl Into<String>) -> String {
         let reason = reason.into();
         let actual = self.cur_command.unwrap_or(command);

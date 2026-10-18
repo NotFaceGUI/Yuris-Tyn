@@ -212,6 +212,56 @@ pub enum Command {
         /// `SET` 原值(`RECTPAINT3` = 0xAARRGGBB)。
         color: i64,
     },
+    /// **裸位图装层**(`LOAD[ID=…]` + btype1 存档截图块;2026-10-18 成果 196)。
+    ///
+    /// 引擎:`LOAD[FILE=… DNO=… ID=层名]` 命中 btype=1 块时,把段B 位图
+    /// (实测 100×75 RGBA,尺寸在段A u32[30]/[31])装入 ID 层、段A 恢复层
+    /// 参数(v494 `0x4473bd` → `0x44760c`)。典型用法 = 存档屏缩略图
+    /// (`_TMP_OF` 临时层 → `CGACT[COPY]` 拷进格子 → `CGEND`)。
+    /// 段A 其余参数(混合/坐标)未逐字段取证,本命令只装像素。
+    UploadRgba {
+        /// 层 id(调用方按层名 fnv1a,与 [`Command::Layer`] 同约定)。
+        id: LayerId,
+        /// 层名原文。
+        name: Vec<u8>,
+        /// 位图宽(像素)。
+        w: u32,
+        /// 位图高(像素)。
+        h: u32,
+        /// RGBA8 字节(行主序,`w*h*4`)。
+        rgba: Vec<u8>,
+        /// 新建层的兜底 z(与 [`Command::Layer`] 同义)。
+        fallback_z: i64,
+    },
+    /// `CGACT[AKARUSA=1 SET=明暗值]` = 亮度调整(成果 196 追记:存档屏压暗)。
+    ///
+    /// 引擎语义(实机 trace + 手册「明るさ」):`SET/256` 为亮度系数,
+    /// 128 = 50%(变暗)、256 = 原亮度、>256 提亮。与 RECTPAINT 同族:
+    /// **逐像素改写层位图、不可逆**,换图后失效。
+    /// 实机锚点:存档屏每格 `_TMP_OF AKARUSA=1 SET=128` 把截图压暗一半
+    /// 再 MERGE 进格子 —— 旧实现丢弃该效果 ⇒ 盖住的部分比官方「变浅」。
+    Akarusa {
+        /// 目标层(引擎 `ID`)。
+        dst: LayerId,
+        /// 亮度分子(分母恒 256;引擎 SET 槽)。
+        set: i64,
+    },
+    /// `CG[A=…]` 的**运算码变体**(窗 tag B3;成果 196 追记二,RE Confirmed)。
+    ///
+    /// 引擎 v494 `0x42a952`-`0x42a98a`:A 窗求值后经 `0x42bd50` 以
+    /// `op(cur, val, 256)` 计算**α 目标**,帧级步进器(`0x42c390`,读 +0x8c
+    /// 逼近 +0x80)逐帧落位。op 表(0x42be69/0x42be45/0x42be1d):
+    /// **0=SET val;1=cur+val(上限 256);2=cur−val(下限 0)**——与 LET
+    /// 复合赋值码同族(0=赋值 1=+= 2=-=)。语料锚点:存档/設定页
+    /// `LOOP 32× CG[SYSBLACK A=8](B3=2)` = 黑幕每帧 −8 渐出。
+    AlphaOp {
+        /// 目标层。
+        dst: LayerId,
+        /// 运算码(窗 tag B3;0/1/2 已证,其余告警不猜)。
+        op: u8,
+        /// A 值(0..256 标度)。
+        val: i64,
+    },
     /// 消息窗开合(I9)。
     MessageWindow(bool),
     /// TEXT:窗开才进景(位置/字号由宿主 Assets 与 plug 层定;Stage 记层与纹理)。
@@ -549,6 +599,16 @@ impl Stage {
                     params,
                     ..
                 } => self.apply_blit(*src, *dst, *params, assets),
+                Command::UploadRgba {
+                    id,
+                    name,
+                    w,
+                    h,
+                    rgba,
+                    fallback_z,
+                } => self.apply_upload_rgba(*id, name, *w, *h, rgba, *fallback_z, assets),
+                Command::Akarusa { dst, set } => self.apply_akarusa(*dst, *set, assets),
+                Command::AlphaOp { dst, op, val } => self.apply_alpha_op(*dst, *op, *val),
                 Command::SnapshotTo(dst) => {
                     // **引擎同步表语义(I6)**:截屏取"此刻"的合成画面 =
                     // 批起始景 + 本批**已执行**命令的投影 —— 脚本在 COPY2
@@ -780,6 +840,181 @@ impl Stage {
         }
     }
 
+    /// [`Command::UploadRgba`] 处理:建/补层并直接装位图像素。
+    ///
+    /// 与 [`Self::apply_layer`] 同一套「存在则 patch」语义;像素通道 =
+    /// `assets.upload_rgba`(与 `apply_paint` 的改写上传同一条),并把
+    /// 字节留在 `ent.pixels`(供后续 `CGACT[COPY*]`/`RECTPAINT*` 读改)。
+    fn apply_upload_rgba(
+        &mut self,
+        id: LayerId,
+        name: &[u8],
+        w: u32,
+        h: u32,
+        rgba: &[u8],
+        fallback_z: i64,
+        assets: &mut dyn Assets,
+    ) {
+        let expected = w as usize * h as usize * 4;
+        if rgba.len() != expected || w == 0 || h == 0 {
+            yuris_log::alert_once(
+                module_path!(),
+                format!("upload-rgba-size:{id:#x}"),
+                format!(
+                    "LOAD 位图装层字节不符
+层: {} id={id:#x}
+期待 {expected}B(w={w} h={h}),实得 {}B;该层像素未更新",
+                    rgba.len(),
+                    String::from_utf8_lossy(name)
+                ),
+            );
+            return;
+        }
+        let existed = self.entities.contains_key(&id);
+        let ent = if existed {
+            self.entities.get_mut(&id).expect("刚刚探测存在")
+        } else {
+            let seq = self.take_seq();
+            self.entities
+                .entry(id)
+                .or_insert_with(|| Entity::new(name.to_vec(), fallback_z, seq))
+        };
+        if !existed && !name.is_empty() {
+            ent.name = name.to_vec();
+        }
+        match assets.upload_rgba(rgba, w, h) {
+            Some(tex) => {
+                ent.pixel = Some(Pixel::Product(tex));
+                ent.pixel_gen += 1;
+                ent.pixels = Some((rgba.to_vec(), w, h));
+            }
+            None => {
+                yuris_log::alert_once(
+                    module_path!(),
+                    format!("upload-rgba-fail:{id:#x}"),
+                    format!(
+                        "LOAD 位图上传失败
+层: {} id={id:#x}({w}×{h})",
+                        String::from_utf8_lossy(name)
+                    ),
+                );
+            }
+        }
+    }
+
+    /// [`Command::Akarusa`] 处理:整层 RGB 乘 `set/256`(α 不动)。
+    ///
+    /// 像素源优先级与 `apply_paint` 一致:`ent.pixels`(截屏/上传产物字节)
+    /// → `assets.decode_rgba(ent.file)`(真实图片层)。Solid(1×1 黑)无可
+    /// 调整;Alias(合成视图)不改源层,跳过并留痕。
+    /// [`Command::AlphaOp`] 处理:对层 α(0..256 标度)按引擎运算码应用。
+    ///
+    /// 引擎把结果写入 **α 目标**(+0x8c)并由帧级步进器逼近 +0x80;本内核
+    /// 无目标/当前双缓冲,直接落位(单帧到位 = 渐变时序差异,不影响稳态)。
+    fn apply_alpha_op(&mut self, dst: LayerId, op: u8, val: i64) {
+        let Some(ent) = self.entities.get_mut(&dst) else {
+            return; // 无实体 = 错误路径(引擎同,见 apply_layer I5)
+        };
+        let cur = (ent.alpha.clamp(0.0, 1.0) * 256.0).round() as i64;
+        let next = match op {
+            0 => val,
+            1 => (cur + val).min(256),
+            2 => (cur - val).max(0),
+            other => {
+                yuris_log::alert_once(
+                    module_path!(),
+                    format!("alpha-op-unknown:{dst:#x}:{other}"),
+                    format!(
+                        "CG A 槽运算码 {other} 未证(B3 全表 0-8 中仅 0/1/2 已 RE)
+层: {} id={dst:#x}
+处置: 本次不应用,保持 α={cur}",
+                        String::from_utf8_lossy(&ent.name)
+                    ),
+                );
+                return;
+            }
+        }
+        .clamp(0, 256);
+        ent.alpha = opacity(next);
+    }
+
+    fn apply_akarusa(&mut self, dst: LayerId, set: i64, assets: &mut dyn Assets) {
+        if set < 0 {
+            yuris_log::alert_once(
+                module_path!(),
+                format!("akarusa-neg:{dst:#x}"),
+                format!("CGACT AKARUSA SET={set} < 0(负亮度,语义 Unknown;不猜,跳过)"),
+            );
+            return;
+        }
+        let Some(ent) = self.entities.get_mut(&dst) else {
+            // 引擎:无实体 = 错误路径(见 apply_layer 的 I5 补强),静默跳过同款。
+            return;
+        };
+        // 取源字节
+        let src: Vec<u8> = if let Some((bytes, _, _)) = &ent.pixels {
+            bytes.clone()
+        } else if let Some(f) = ent.file.clone() {
+            match assets.decode_rgba(&f) {
+                Some((b, _, _)) => b,
+                None => {
+                    let nm = String::from_utf8_lossy(&ent.name).into_owned();
+                    yuris_log::alert_once(
+                        module_path!(),
+                        format!("akarusa-nopix:{dst:#x}"),
+                        format!(
+                            "CGACT AKARUSA 无可改写字节(层无产物/FILE 解码失败)
+层: {nm} id={dst:#x};该层保持原亮度"
+                        ),
+                    );
+                    return;
+                }
+            }
+        } else {
+            // Solid/Alias:黑层与合成视图,跳过(不猜)。
+            return;
+        };
+        // RGB × set/256(α 不动);i32 中间量防溢出,set ≤ 0x7FFFFFFF/256 安全
+        let num = set.min(0xFFFF);
+        let mut rgba = src;
+        for px in rgba.chunks_exact_mut(4) {
+            for c in &mut px[..3] {
+                *c = ((*c as i32) * num as i32 / 256).clamp(0, 255) as u8;
+            }
+        }
+        let (w, h) = ent
+            .pixels
+            .as_ref()
+            .map(|(_, w, h)| (*w, *h))
+            .unwrap_or((0, 0));
+        let (w, h) = if w > 0 && h > 0 {
+            (w, h)
+        } else {
+            // FILE 解码路径:尺寸由 decode_rgba 得出;这里重新解码拿尺寸
+            match ent.file.as_deref().map(|f| assets.decode_rgba(f)) {
+                Some(Some((_, w, h))) => (w, h),
+                _ => return,
+            }
+        };
+        match assets.upload_rgba(&rgba, w, h) {
+            Some(tex) => {
+                let ent = self.entities.get_mut(&dst).expect("前面刚取过");
+                ent.pixel = Some(Pixel::Product(tex));
+                ent.pixel_gen += 1;
+                ent.pixels = Some((rgba, w, h));
+            }
+            None => {
+                let nm = String::from_utf8_lossy(&ent.name).into_owned();
+                yuris_log::alert_once(
+                    module_path!(),
+                    format!("akarusa-upload-fail:{dst:#x}"),
+                    format!("CGACT AKARUSA 改写后上传失败
+层: {nm} id={dst:#x}"),
+                );
+            }
+        }
+    }
+
     fn apply_blit(
         &mut self,
         src_lid: LayerId,
@@ -950,6 +1185,41 @@ impl Stage {
             Some(v) => Some(v),
             None => assets.snapshot(view, dst).map(|t| (t, Vec::new(), 0, 0)),
         };
+        // **取样内容取证**(`YURIS_TRACE_SNAPVIEW=1` 门控,缺省静默):
+        // 层清单只说"视图里有哪些层",回答不了"截到的像素是不是全黑"。
+        // 这里直接对截屏返回的 RGBA 采样:均值亮度 + 5 点。**只读诊断**。
+        if std::env::var_os("YURIS_TRACE_SNAPVIEW").is_some() {
+            if let Some((_, rgba, w, h)) = shot.as_ref() {
+                if !rgba.is_empty() && *w > 0 && *h > 0 {
+                    let px = |x: u32, y: u32| -> (u8, u8, u8) {
+                        let i = ((y * *w + x) * 4) as usize;
+                        (rgba[i], rgba[i + 1], rgba[i + 2])
+                    };
+                    let mut sum = 0u64;
+                    let mut lit = 0u64;
+                    for c in rgba.chunks_exact(4) {
+                        let l = (c[0] as u64 + c[1] as u64 + c[2] as u64) / 3;
+                        sum += l;
+                        if l > 8 {
+                            lit += 1;
+                        }
+                    }
+                    let n = (rgba.len() / 4) as u64;
+                    let (cx, cy) = (*w / 2, *h / 2);
+                    yuris_log::trace_forced!(
+                        "[snapview] captured dst={dst:#x} {w}x{h} mean={:.1} lit={}/{} p00={:?} pc={:?} p14={:?} p34={:?} pend={:?}",
+                        sum as f64 / n as f64,
+                        lit,
+                        n,
+                        px(0, 0),
+                        px(cx, cy),
+                        px(*w / 4, *h / 4),
+                        px(*w * 3 / 4, *h * 3 / 4),
+                        px(*w - 1, *h - 1),
+                    );
+                }
+            }
+        }
         match shot {
             Some((tex, rgba, w, h)) => match self.entities.get_mut(&dst) {
                 Some(e) => {

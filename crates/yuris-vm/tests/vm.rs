@@ -1456,3 +1456,130 @@ fn cgend_emits_event_with_id() {
     assert!(hit, "应有 CgEnd 事件且 ID 含 BT.OFF");
     let _ = Value::Int(0);
 }
+
+/// SAVE 预留 → SAVE[FILE] 落盘 → 新 VM 从 save/ 磁盘 LOAD 读回。
+///
+/// 全链 = v494 引擎存档语义的端到端最小化(2026-10-18):
+/// - `SAVE[DNO SET]` 即时序列化进预留表(引擎 `0x44d5a7`;整数组引用 =
+///   全元素,标量 = 单值);
+/// - `SAVE[FILE]` 产出容器(引擎 `0x44cba7`)+ 清空预留(手册例[6]);
+/// - 宿主落盘(player-core `apply_savefile_events` 的等价动作);
+/// - `LOAD[FILE DNO LET]` 经 `PacFileIndex::read_loose` 读盘,btype=0
+///   按类型/维数检查写回。
+///
+/// 写回证明:LOAD 前把全局改成 99/77,末态必须 = 快照值。容器字节另经
+/// `yuris_format::yssd` 解回逐字段断言。纯标量 LET 落帧局部(引擎语义),
+/// 故改写由测试侧直改 store,不借 LET。
+#[test]
+fn save_flush_load_roundtrip_in_session() {
+    use yuris_value::{ElemType, VarRef, VarSpace, Value};
+    let key = [0x2b, 0x90, 0x4f, 0x93];
+    let arr = VarRef { space: VarSpace::At, id: 6002 };
+    let scl = VarRef { space: VarSpace::At, id: 6003 };
+    let w_file: &[u8] = &[0x4d, 9, 0, b'"', b't', b'e', b's', b't', b'_', b'r', b't', b'"'];
+    let w_dno1: &[u8] = &[0x42, 1, 0, 1];
+    let w_dno2: &[u8] = &[0x42, 1, 0, 2];
+    let w_set_arr: &[u8] = &[0x76, 3, 0, 0x40, 0x72, 0x17]; // @6002 整数组裸引用
+    let w_set_scl: &[u8] = &[0x76, 3, 0, 0x40, 0x73, 0x17]; // @6003 标量
+    // 脚本 A:SAVE@6002() → SAVE@6003 → SAVE[FILE="test_rt"](刷盘 + 清预留)
+    let groups_a: &[(u8, u8, u16)] = &[
+        (cmd::SAVE, 2, 0),
+        (cmd::SAVE, 2, 0),
+        (cmd::SAVE, 1, 0),
+        (cmd::RETURN, 0, 0),
+    ];
+    let win_a = &[
+        ([0x02, 0, 0, 0], w_dno1.len() as u32, 0, w_dno1),
+        ([0x03, 0, 0, 0], w_set_arr.len() as u32, 0, w_set_arr),
+        ([0x02, 0, 0, 0], w_dno2.len() as u32, 0, w_dno2),
+        ([0x03, 0, 0, 0], w_set_scl.len() as u32, 0, w_set_scl),
+        ([0x00, 0, 0, 0], w_file.len() as u32, 0, w_file),
+    ];
+    // 脚本 B:LOAD(FILE,DNO=1,LET=@6002()) → LOAD(FILE,DNO=2,LET=@6003) → RETURN
+    // (FILE 每条都给 —— 手册所有 LOAD 示例均带 FILE;无 FILE 的 LOAD 守护为不做。)
+    let groups_b: &[(u8, u8, u16)] = &[
+        (cmd::LOAD, 3, 0),
+        (cmd::LOAD, 3, 0),
+        (cmd::RETURN, 0, 0),
+    ];
+    let win_b = &[
+        ([0x00, 0, 0, 0], w_file.len() as u32, 0, w_file),
+        ([0x02, 0, 0, 0], w_dno1.len() as u32, 0, w_dno1),
+        ([0x03, 0, 0, 0], w_set_arr.len() as u32, 0, w_set_arr),
+        ([0x00, 0, 0, 0], w_file.len() as u32, 0, w_file),
+        ([0x02, 0, 0, 0], w_dno2.len() as u32, 0, w_dno2),
+        ([0x03, 0, 0, 0], w_set_scl.len() as u32, 0, w_set_scl),
+    ];
+    let script_a = YstbFile::from_bytes(&make_ystb(key, groups_a, win_a), key).unwrap();
+    let script_b = YstbFile::from_bytes(&make_ystb(key, groups_b, win_b), key).unwrap();
+
+    // ===== 段 A:SAVE =====
+    let mut vm = GroupVm::load(script_a).unwrap();
+    vm.store_mut().declare_array(&arr, ElemType::Int, &[4]);
+    for (i, v) in [1i64, 2, 3, 4].into_iter().enumerate() {
+        vm.store_mut().set_elem(&arr, &[i as i64], Value::Int(v)).unwrap();
+    }
+    vm.store_mut().set(&scl, Value::Int(5));
+    let s = vm.run(100).unwrap();
+    assert_main_script_yields(&s);
+
+    // ① SAVE[FILE] 产出容器(事件 + take_saved_files 双通道)。
+    assert!(vm.events().iter().any(|e| matches!(
+        e,
+        VmEvent::SaveFile { blocks: 2, .. }
+    )));
+    let files = vm.take_saved_files();
+    assert_eq!(files.len(), 1, "take 一次取净");
+    assert_eq!(files[0].0, "test_rt.sd");
+    let yssd = yuris_format::yssd::YssdFile::from_bytes(&files[0].1).unwrap();
+    let b1 = yssd.block(1).unwrap();
+    assert_eq!((b1.btype, b1.strict, b1.var_id), (0, 1, 6002));
+    let raw1 = yuris_format::yssd::decompress_block_payload(&b1.compressed).unwrap();
+    let p1 = yuris_format::yssd::YssdPayload::from_bytes(&raw1).unwrap();
+    assert_eq!((p1.ty, p1.dims.clone()), (1, vec![4]));
+    for (i, v) in [1i64, 2, 3, 4].into_iter().enumerate() {
+        assert_eq!(
+            i64::from_le_bytes(p1.data[i * 8..i * 8 + 8].try_into().unwrap()),
+            v,
+            "数组元素 {i}"
+        );
+    }
+    let b2 = yssd.block(2).unwrap();
+    assert_eq!((b2.btype, b2.var_id), (0, 6003));
+    let raw2 = yuris_format::yssd::decompress_block_payload(&b2.compressed).unwrap();
+    let p2 = yuris_format::yssd::YssdPayload::from_bytes(&raw2).unwrap();
+    assert_eq!((p2.ty, p2.dims.len()), (1, 0));
+
+    // ② 宿主落盘(= player-core apply_savefile_events 的等价动作)。
+    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let game_dir = tmp.join(format!("yuris-rt-{}", std::process::id()));
+    // scan_game_dir 以「pac/ 存在」判定游戏根;不建 pac/ 会上溯父级,save 根错位。
+    std::fs::create_dir_all(game_dir.join("pac")).unwrap();
+    let save_dir = game_dir.join("save");
+    std::fs::create_dir_all(&save_dir).unwrap();
+    std::fs::write(save_dir.join("test_rt.sd"), &files[0].1).unwrap();
+
+    // ===== 段 B:新 VM 从磁盘 LOAD =====
+    let mut vm2 = GroupVm::load(script_b).unwrap();
+    vm2.set_file_probe(std::sync::Arc::new(
+        yuris_vm::host::PacFileIndex::scan_game_dir(&game_dir, 0xC9).unwrap(),
+    ));
+    vm2.store_mut().declare_array(&arr, ElemType::Int, &[4]);
+    // 预置「已被后续游戏推进污染」的值:LOAD 必须把它们覆盖回快照。
+    vm2.store_mut().set_elem(&arr, &[0], Value::Int(99)).unwrap();
+    vm2.store_mut().set(&scl, Value::Int(77));
+    let s = vm2.run(100).unwrap();
+    assert_main_script_yields(&s);
+
+    // ③ LOAD 写回 = 快照值复原(若 LOAD 未写回,末态停在 99 / 77)。
+    for (i, v) in [1i64, 2, 3, 4].into_iter().enumerate() {
+        assert_eq!(
+            vm2.store().get_elem(&arr, &[i as i64]).unwrap(),
+            &Value::Int(v),
+            "LOAD 后数组元素 {i}"
+        );
+    }
+    assert_eq!(vm2.store().get(&scl).unwrap(), &Value::Int(5), "LOAD 后标量");
+
+    let _ = std::fs::remove_dir_all(&game_dir);
+}

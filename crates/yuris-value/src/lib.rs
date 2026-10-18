@@ -810,6 +810,12 @@ impl VariableStore {
         self.arrays.get(&self.array_key(r)).map(|a| a.elem)
     }
 
+    /// 数组扁平数据只读视图(SAVE 序列化用;行主序,与
+    /// [`Self::load_array_data`] 的填充顺序一致)。
+    pub fn array_data(&self, r: &VarRef) -> Option<&[Value]> {
+        self.arrays.get(&self.array_key(r)).map(|a| a.data.as_slice())
+    }
+
     /// 调整数组为 `new_bounds`(保留原有元素,新增元素清零;
     /// 引擎 FUN_00454710 realloc 的保留行为 **Likely**)。
     /// 维数必须与原数组一致(引擎 VARACT DIMSIZE 要求维数==1,0x18cb4 族)。

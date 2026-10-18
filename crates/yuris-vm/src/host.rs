@@ -354,13 +354,50 @@ impl PacFileIndex {
     /// 与 [`Self::scan_game_dir`] 的差别仅在"每包用哪个 key"—— 后者要求调用方
     /// 提供一个全局 key(样本专用),本函数让格式层按数据侧判据决定。
     pub fn scan_game_dir_auto(dir: &std::path::Path) -> Result<Self> {
+        // **游戏根判定(勘误 2026-10-18)**。
+        //
+        // 旧实现只认 `<dir>/pac/` 一种布局:没有 `pac/` 子目录时一律把
+        // `dir` 当 pac 目录、取 `dir.parent()` 作游戏根。这对「.ypf 直接
+        // 放在游戏根下」的作品(`<game>/data.ypf`,无 `pac/`)是错的 ——
+        // `roots` 会被推到**上一级目录**,于是 `save/` 解析成
+        // `<games>/save`(不存在),`FILEINFO EXIST "gsd.sd"` 恒 0
+        // ⇒ 存档存在性分支全走假 ⇒ 启动相位机错位(成果 195)。
+        //
+        // 新判据(**与作品无关**):看目录里有没有游戏根标志物 ——
+        // `save/` 子目录、`yscfg.dat`、或顶层 `.exe`。
+        // - `<dir>/pac/*.ypf`      → dir 是根,pac 是子目录(原行为)
+        // - `<dir>/*.ypf` + 有标志物 → dir 是根(本次修正)
+        // - 传的是 `<game>/pac` 本身(pac 无标志物、父目录有)→ 父目录是根
+        let looks_like_game_root = |p: &std::path::Path| -> bool {
+            if p.join("save").is_dir() || p.join("yscfg.dat").is_file() {
+                return true;
+            }
+            std::fs::read_dir(p)
+                .map(|rd| {
+                    rd.flatten().any(|e| {
+                        e.path()
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|x| x.eq_ignore_ascii_case("exe"))
+                    })
+                })
+                .unwrap_or(false)
+        };
         let (game_root, pac_dir) = if dir.join("pac").is_dir() {
             (dir.to_path_buf(), dir.join("pac"))
-        } else {
+        } else if !looks_like_game_root(dir)
+            && dir
+                .parent()
+                .is_some_and(looks_like_game_root)
+        {
+            // 传入的是 pac 目录本身:父目录才是游戏根。
             (
                 dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| dir.to_path_buf()),
                 dir.to_path_buf(),
             )
+        } else {
+            // `.ypf` 直接在 dir 下 ⇒ dir 就是游戏根(不再上推)。
+            (dir.to_path_buf(), dir.to_path_buf())
         };
         let mut idx = Self::default();
         let t_scan = std::time::Instant::now();
@@ -454,7 +491,19 @@ impl PacFileIndex {
             return true;
         }
         let rel = key.display().replace('\\', "/");
-        self.roots.iter().any(|r| r.join(&rel).exists())
+        let hit = self.roots.iter().any(|r| r.join(&rel).exists());
+        if std::env::var_os("YURIS_TRACE_FILEINFO").is_some() {
+            let tried: Vec<String> = self
+                .roots
+                .iter()
+                .map(|r| r.join(&rel).display().to_string())
+                .collect();
+            yuris_log::trace_forced!(
+                "[fileinfo] probe.exists {path:?} → rel={rel:?} hit={} tried={tried:?}",
+                hit as i64
+            );
+        }
+        hit
     }
 
     /// 读松散文件内容(LOAD/YSSD 装载用)。
@@ -984,5 +1033,41 @@ mod jpeg_dims_tests {
     fn non_jpeg_is_none() {
         assert_eq!(jpeg_dims(b"not an image"), None);
         assert_eq!(jpeg_dims(&[]), None);
+    }
+
+    /// **游戏根判定(2026-10-18 勘误)**：`.ypf` 直接在游戏根下(无 `pac/`
+    /// 子目录)时,不得把根推到上一级。
+    ///
+    /// 旧实现只在 `<dir>/pac/` 存在时认 `dir` 为根,否则一律 `dir.parent()`
+    /// ⇒ `<game>/data.ypf` 这种布局被误判成"传进来的是 pac 目录",
+    /// `roots` 变成 `<games>/`、`save/` 变成 `<games>/save`(不存在)
+    /// ⇒ `FILEINFO EXIST "*.sd"` 恒 0 ⇒ 启动相位机错位(成果 195)。
+    #[test]
+    fn game_root_without_pac_dir_stays_put() {
+        // TEMP 优先(沙箱系统 TEMP 不可写;cargo 子进程 TMP 会被重写,同 p5_load 约定)
+        let base = std::env::var_os("TEMP")
+            .or_else(|| std::env::var_os("TMP"))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let tmp = base.join(format!("ytn-root-{}", std::process::id()));
+        let game = tmp.join("game");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(game.join("save")).unwrap();
+        std::fs::write(game.join("data.ypf"), b"YPF ").unwrap();
+
+        let idx = super::PacFileIndex::scan_game_dir_auto(&game).expect("扫描");
+        // 存档目录必须解析到 <game>/save,而不是 <game 的父目录>/save。
+        assert!(
+            idx.roots.iter().any(|r| r == &game.join("save")),
+            "roots 应含 <game>/save,实际 {:?}",
+            idx.roots
+        );
+        assert!(
+            !idx.roots.iter().any(|r| r == &tmp.join("save")),
+            "roots 不得把游戏根推到上一级,实际 {:?}",
+            idx.roots
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
